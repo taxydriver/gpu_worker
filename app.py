@@ -79,6 +79,10 @@ _ETA_WINDOW = 12
 _ACTIVE_JOBS_LOCK = threading.Lock()
 _ACTIVE_JOBS: int = 0  # count of jobs currently executing
 
+# ── Warmed asset groups tracking ─────────────────────────────────────────────────
+_WARMED_GROUPS_LOCK = threading.Lock()
+_WARMED_GROUPS: set[str] = set()  # asset groups that have been successfully downloaded
+
 
 def _declared_capabilities() -> list[str]:
     """Return capabilities exactly as declared by WORKER_CAPABILITIES."""
@@ -186,6 +190,9 @@ def _broker_worker_payload() -> dict[str, object]:
     capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
     public_url = settings.resolved_worker_public_url()
 
+    with _WARMED_GROUPS_LOCK:
+        warmed = sorted(_WARMED_GROUPS)
+
     return {
         "worker_id": settings.resolved_worker_id(),
         "worker_name": settings.resolved_worker_name(),
@@ -196,7 +203,7 @@ def _broker_worker_payload() -> dict[str, object]:
         "status": "online",
         "supported_asset_groups": capabilities,
         "capabilities": capabilities,
-        "warmed_asset_groups": [],
+        "warmed_asset_groups": warmed,
         "free_vram_mb": free_vram_mb,
         "vram_gb": settings.worker_vram_gb,
         "used_vram_mb": None,
@@ -281,6 +288,9 @@ def _preflight_download_all() -> None:
                 )
             else:
                 LOGGER.info("[preflight] %s — already cached (%.2fs check)", group, result.asset_check_sec)
+            # Mark this asset group as warmed
+            with _WARMED_GROUPS_LOCK:
+                _WARMED_GROUPS.add(group)
         except Exception as exc:
             LOGGER.error("[preflight] failed to ensure group=%s: %s", group, exc)
 

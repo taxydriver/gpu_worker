@@ -608,13 +608,13 @@ async def deploy_status(job_id: str):
 
 
 @app.get("/api/remote-logs/{source}/stream")
-async def stream_remote_log(source: str):
+async def stream_remote_log(source: str, ssh: str | None = None):
     if source != "downloads" and source not in REMOTE_LOG_SOURCES:
         raise HTTPException(404, "Unknown log source")
     label, paths = REMOTE_LOG_SOURCES.get(source, ("Downloads", ()))
 
     async def generate() -> AsyncGenerator[str, None]:
-        ssh_command = _last_ssh_command()
+        ssh_command = ssh or _last_ssh_command()
         if not ssh_command:
             yield f"data: {json.dumps('[remote-log] No saved SSH destination yet. Run a deploy first.')}\n\n"
             yield "data: __DONE__\n\n"
@@ -755,6 +755,15 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 .ltab{padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer;background:none;border:none;color:#475569;transition:all .15s}
 .ltab:hover{color:#94a3b8}
 .ltab.active{background:#252a38;color:#e2e8f0}
+.tab-close{margin-left:5px;opacity:.5;font-size:12px;line-height:1;vertical-align:middle;transition:opacity .15s}
+.tab-close:hover{opacity:1;color:#f87171}
+
+/* Config grid */
+.cfg-grid{display:grid;grid-template-columns:120px 1fr;gap:8px 10px;align-items:center;margin-bottom:8px}
+.cfg-label{font-size:10px;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.06em}
+.cfg-custom{grid-column:2;margin-top:-4px;margin-bottom:8px}
+.cfg-custom-input{width:100%;padding:7px 10px;background:#0c0f16;border:1px solid #2d3148;border-radius:5px;color:#e2e8f0;font-size:12px;font-family:inherit;transition:border-color .15s}
+.cfg-custom-input:focus{outline:none;border-color:#7c3aed}
 #sbar{font-size:11px;padding:3px 10px;border-radius:4px;display:none;margin-left:auto}
 #sbar.running{background:#0f2744;color:#93c5fd;display:inline-block}
 #sbar.done{background:#0d2b1e;color:#6ee7b7;display:inline-block}
@@ -889,8 +898,11 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-let evtSrc = null;
+const deployEvtSrcs = new Map();
+const deploySshCommands = new Map();  // Map src → SSH command for context-aware logs
+let deployTabCount = 0;
 let currentLogSrc = 'deploy';
+let currentDeploySrc = 'deploy';  // Currently active deployment tab for remote logs
 const logBuffers = { deploy: [] };
 const MAX_LOG_LINES = 2000;
 
@@ -978,8 +990,21 @@ async function destroyInst(id) {
 // ── Deploy to a running instance ──────────────────────────────────────────────
 async function deployToInst(ssh) {
   if (!ssh) { alert('No SSH command available for this instance.'); return; }
-  selectLog('deploy');
-  clearLog();
+
+  // Validation: warn if deploying to remote but Backend URL is "Local"
+  const backendSel = document.getElementById('cfg-backend');
+  const isRemoteSSH = ssh && !ssh.includes('localhost') && !ssh.includes('127.0.0.1');
+  if (isRemoteSSH && backendSel && backendSel.value === 'local') {
+    if (!confirm('⚠ Backend URL is set to "Local" but deploying to a remote instance.\nThis will cause worker registration to fail.\n\nChange to "Fly.io" or "Custom" before deploying.\n\nContinue anyway?')) {
+      return;
+    }
+  }
+
+  const src = `deploy-${++deployTabCount}`;
+  const label = `Deploy #${deployTabCount}`;
+  createDeployTab(src, label, ssh);
+  selectLog(src);
+  clearLog('', src);
   setStatus('running', '⟳ Deploying…');
   disableActions(true);
 
@@ -995,9 +1020,9 @@ async function deployToInst(ssh) {
       }),
     });
     const {job_id} = await res.json();
-    streamJob(job_id, false);
+    streamJob(job_id, false, src);
   } catch (e) {
-    appendLog(`[deploy] ERROR: ${e}`);
+    appendLog(`[deploy] ERROR: ${e}`, src);
     setStatus('failed', '✗ Failed');
     disableActions(false);
   }
@@ -1005,8 +1030,11 @@ async function deployToInst(ssh) {
 
 // ── Create & Deploy (auto-provision) ─────────────────────────────────────────
 async function quickDeploy() {
-  selectLog('deploy');
-  clearLog();
+  const src = `deploy-${++deployTabCount}`;
+  const label = `Deploy #${deployTabCount}`;
+  createDeployTab(src, label, '');  // SSH will be captured from .last_ssh_dest during provision
+  selectLog(src);
+  clearLog('', src);
   setStatus('running', '⟳ Provisioning + deploying…');
   disableActions(true);
 
@@ -1031,30 +1059,30 @@ async function quickDeploy() {
       }),
     });
     const {job_id} = await res.json();
-    streamJob(job_id, true);
+    streamJob(job_id, true, src);
   } catch (e) {
-    appendLog(`[vast] ERROR: ${e}`);
+    appendLog(`[vast] ERROR: ${e}`, src);
     setStatus('failed', '✗ Failed');
     disableActions(false);
   }
 }
 
 // ── Job streaming ─────────────────────────────────────────────────────────────
-function streamJob(jobId, isProvision) {
-  if (evtSrc) { evtSrc.close(); evtSrc = null; }
-  evtSrc = new EventSource(`/api/deploy/${jobId}/stream`);
-  evtSrc.onmessage = e => {
+function streamJob(jobId, isProvision, src = 'deploy') {
+  const es = new EventSource(`/api/deploy/${jobId}/stream`);
+  deployEvtSrcs.set(src, es);
+  es.onmessage = e => {
     if (e.data === '__DONE__') {
-      evtSrc.close(); evtSrc = null;
-      onJobDone(jobId, isProvision);
+      es.close(); deployEvtSrcs.delete(src);
+      onJobDone(jobId, isProvision, src);
       return;
     }
-    appendLog(JSON.parse(e.data), 'deploy');
+    appendLog(JSON.parse(e.data), src);
   };
-  evtSrc.onerror = () => { evtSrc.close(); evtSrc = null; onJobDone(jobId, isProvision); };
+  es.onerror = () => { es.close(); deployEvtSrcs.delete(src); onJobDone(jobId, isProvision, src); };
 }
 
-async function onJobDone(jobId, isProvision) {
+async function onJobDone(jobId, isProvision, src) {
   disableActions(false);
   const d = await fetch(`/api/deploy/${jobId}`).then(r => r.json());
   if (d.status === 'done') {
@@ -1108,14 +1136,42 @@ function timeAgo(iso) {
 // ── Log ───────────────────────────────────────────────────────────────────────
 let remoteEvt = null;
 
+function createDeployTab(src, label, sshCommand = '') {
+  const tabs = document.querySelector('.log-tabs');
+  const btn = document.createElement('button');
+  btn.className = 'ltab';
+  btn.dataset.src = src;
+  btn.innerHTML = `${esc(label)} <span class="tab-close" onclick="closeDeployTab('${src}',event)">×</span>`;
+  btn.onclick = () => {
+    currentDeploySrc = src;  // Set this as the active deployment for remote logs
+    selectLog(src);
+  };
+  tabs.appendChild(btn);
+  if (sshCommand) deploySshCommands.set(src, sshCommand);
+}
+
+function closeDeployTab(src, e) {
+  e.stopPropagation();
+  const es = deployEvtSrcs.get(src);
+  if (es) { es.close(); deployEvtSrcs.delete(src); }
+  delete logBuffers[src];
+  document.querySelector(`.ltab[data-src="${src}"]`)?.remove();
+  if (currentLogSrc === src) selectLog('deploy');
+}
+
 function selectLog(src) {
   currentLogSrc = src;
   document.querySelectorAll('.ltab').forEach(b => b.classList.toggle('active', b.dataset.src === src));
   if (remoteEvt) { remoteEvt.close(); remoteEvt = null; }
   renderLog(src);
-  if (src === 'deploy') return;
+  if (src === 'deploy' || src.startsWith('deploy-')) return;
   clearLog(`Connecting to ${LOG_LABELS[src] || src}…`, src);
-  remoteEvt = new EventSource(`/api/remote-logs/${src}/stream`);
+
+  // Get SSH command for the currently active deployment
+  const sshCmd = deploySshCommands.get(currentDeploySrc) || '';
+  const sshParam = sshCmd ? `?ssh=${encodeURIComponent(sshCmd)}` : '';
+
+  remoteEvt = new EventSource(`/api/remote-logs/${src}/stream${sshParam}`);
   remoteEvt.onmessage = e => {
     if (e.data === '__DONE__') { remoteEvt.close(); remoteEvt = null; return; }
     appendLog(JSON.parse(e.data), src);
@@ -1173,20 +1229,115 @@ function setStatus(type, msg) {
 }
 
 // ── Env vars ──────────────────────────────────────────────────────────────────
-const ENV_DEFAULTS = [
-  ['FILMFORGE_BACKEND_URL', ''],
-  ['WORKER_PROVIDER', 'dedicated_worker'],
-  ['WORKER_MAX_CONCURRENT_JOBS', '1'],
-  ['WORKER_HEARTBEAT_SECONDS', '60'],
-  ['WORKER_CAPABILITIES', ''],
-  ['WORKER_REGISTRATION_TOKEN', ''],
-  ['WORKER_NAME', ''],
-  ['WORKER_GPU_NAME', ''],
-  ['RENDER_BROKER_BASE_URL', ''],
-  ['RENDER_BROKER_WORKER_TOKEN', ''],
+const CONFIG_FIELDS = [
+  {key: 'FILMFORGE_BACKEND_URL', label: 'Backend URL (Local=dev, Fly=remote)', type: 'select', selectId: 'cfg-backend', inputId: 'cfg-backend-custom', defaultValue: 'fly', options: [
+    {value: 'local', label: 'Local (http://localhost:8000) — local testing only'},
+    {value: 'fly', label: 'Fly.io (https://filmforgepythonbackend.fly.dev) — production'},
+    {value: '__custom__', label: 'Custom'},
+  ]},
+  {key: 'RENDER_BROKER_BASE_URL', label: 'Broker URL (must match Backend)', type: 'select', selectId: 'cfg-broker', inputId: 'cfg-broker-custom', defaultValue: 'fly', options: [
+    {value: 'local', label: 'Local (http://localhost:8000) — local testing only'},
+    {value: 'fly', label: 'Fly.io (https://filmforgepythonbackend.fly.dev) — production'},
+    {value: '__custom__', label: 'Custom'},
+  ]},
+  {key: 'WORKER_PROVIDER', label: 'Provider', type: 'select', selectId: 'cfg-provider', defaultValue: 'dedicated_worker', options: [
+    {value: 'dedicated_worker', label: 'Dedicated Worker'},
+  ]},
+  {key: 'WORKER_MAX_CONCURRENT_JOBS', label: 'Max Concurrent Jobs', type: 'select', selectId: 'cfg-max-jobs', defaultValue: '1', options: [
+    {value: '1', label: '1'},
+    {value: '2', label: '2'},
+    {value: '4', label: '4'},
+  ]},
+  {key: 'WORKER_HEARTBEAT_SECONDS', label: 'Heartbeat (sec)', type: 'select', selectId: 'cfg-heartbeat', defaultValue: '60', options: [
+    {value: '30', label: '30s'},
+    {value: '60', label: '60s'},
+    {value: '120', label: '120s'},
+    {value: '300', label: '300s'},
+  ]},
+  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v', options: [
+    {value: 'flux2_stills', label: 'Flux (stills only)'},
+    {value: 'wan_i2v', label: 'WAN (video)'},
+    {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
+    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio'},
+  ]},
+  {key: 'WORKER_NAME', label: 'Worker Name', type: 'text', inputId: 'cfg-worker-name', placeholder: 'auto (hostname)'},
+  {key: 'WORKER_GPU_NAME', label: 'GPU Type', type: 'select', selectId: 'cfg-gpu-name', inputId: 'cfg-gpu-custom', defaultValue: 'RTX 4090', options: [
+    {value: 'RTX 4090', label: 'RTX 4090'},
+    {value: 'L40S', label: 'L40S'},
+    {value: 'A100 SXM', label: 'A100 SXM'},
+    {value: 'A100 PCIe', label: 'A100 PCIe'},
+    {value: 'H100 SXM', label: 'H100 SXM'},
+    {value: 'H100 PCIe', label: 'H100 PCIe'},
+    {value: 'A6000', label: 'A6000'},
+    {value: 'RTX 6000 Ada', label: 'RTX 6000 Ada'},
+    {value: '__custom__', label: 'Custom'},
+  ]},
+  {key: 'WORKER_REGISTRATION_TOKEN', label: 'Registration Token', type: 'password', inputId: 'cfg-reg-token', placeholder: 'paste token or Load .env'},
+  {key: 'RENDER_BROKER_WORKER_TOKEN', label: 'Worker Token', type: 'password', inputId: 'cfg-broker-token', placeholder: 'paste token or Load .env'},
 ];
 
-function initEnv() { ENV_DEFAULTS.forEach(([k, v]) => addEnvRow(k, v)); }
+function renderConfigPanel() {
+  const container = document.getElementById('env-table');
+  container.innerHTML = '';
+
+  for (const field of CONFIG_FIELDS) {
+    const row = document.createElement('div');
+    row.className = 'cfg-grid';
+
+    const label = document.createElement('div');
+    label.className = 'cfg-label';
+    label.textContent = field.label;
+
+    let input;
+    if (field.type === 'select') {
+      input = document.createElement('select');
+      input.id = field.selectId;
+      input.value = field.defaultValue || '';
+      field.options.forEach(opt => {
+        const option = document.createElement('option');
+        option.value = opt.value;
+        option.textContent = opt.label;
+        input.appendChild(option);
+      });
+      if (field.options.some(o => o.value === '__custom__')) {
+        input.addEventListener('change', () => {
+          const custom = document.getElementById(field.inputId);
+          if (custom) custom.style.display = input.value === '__custom__' ? 'block' : 'none';
+        });
+      }
+    } else {
+      input = document.createElement('input');
+      input.id = field.inputId;
+      input.type = field.type || 'text';
+      input.placeholder = field.placeholder || '';
+      input.value = field.defaultValue || '';
+    }
+
+    row.appendChild(label);
+    row.appendChild(input);
+    container.appendChild(row);
+
+    // Custom text input for select fields (hidden by default)
+    if (field.type === 'select' && field.inputId) {
+      const customRow = document.createElement('div');
+      customRow.id = field.inputId;
+      customRow.className = 'cfg-custom';
+      customRow.style.display = 'none';
+      customRow.style.gridColumn = '2';
+      customRow.style.marginBottom = '6px';
+      const customInput = document.createElement('input');
+      customInput.type = 'text';
+      customInput.placeholder = 'enter custom value';
+      customInput.className = 'cfg-custom-input';
+      customRow.appendChild(customInput);
+      container.appendChild(customRow);
+    }
+  }
+}
+
+function initEnv() {
+  renderConfigPanel();
+}
 
 function addEnvRow(k = '', v = '') {
   const t = document.getElementById('env-table');
@@ -1200,23 +1351,93 @@ function addEnvRow(k = '', v = '') {
 
 function getEnv() {
   const o = {};
+
+  // Collect from config fields
+  for (const field of CONFIG_FIELDS) {
+    let value = '';
+    if (field.type === 'select') {
+      const sel = document.getElementById(field.selectId);
+      if (sel) {
+        const selected = sel.value;
+        if (selected === '__custom__') {
+          // Get custom value from hidden input's nested input
+          const customDiv = document.getElementById(field.inputId);
+          if (customDiv) {
+            const customInput = customDiv.querySelector('.cfg-custom-input');
+            value = (customInput ? customInput.value : '').trim();
+          }
+        } else if (selected === 'local') {
+          value = field.key === 'FILMFORGE_BACKEND_URL' || field.key === 'RENDER_BROKER_BASE_URL'
+            ? 'http://localhost:8000' : '';
+        } else if (selected === 'fly') {
+          value = 'https://filmforgepythonbackend.fly.dev';
+        } else {
+          value = selected;
+        }
+      }
+    } else {
+      const inp = document.getElementById(field.inputId);
+      if (inp) value = inp.value.trim();
+    }
+    if (field.key && value) o[field.key] = value;
+  }
+
+  // Collect from custom rows
   document.querySelectorAll('.env-row').forEach(r => {
     const k = r.querySelector('.ek').value.trim();
     const v = r.querySelector('.ev').value.trim();
     if (k && v) o[k] = v;
   });
+
   return o;
 }
 
 async function loadEnvFromBackend() {
   const data = await fetch('/api/backend-env').then(r => r.json()).catch(() => ({}));
-  document.querySelectorAll('.env-row').forEach(row => {
-    const k = row.querySelector('.ek').value.trim();
-    if (data[k] !== undefined) row.querySelector('.ev').value = data[k];
-  });
+
+  // Populate config fields
+  for (const field of CONFIG_FIELDS) {
+    if (data[field.key] !== undefined) {
+      const val = data[field.key];
+      if (field.type === 'select') {
+        const sel = document.getElementById(field.selectId);
+        if (sel) {
+          // Check if value matches a known option
+          const opt = field.options.find(o => o.value === val || o.value.replace(/https?:\/\//, '') === val);
+          if (opt) {
+            sel.value = opt.value;
+            // Hide custom input if not selected
+            if (field.inputId) {
+              const customDiv = document.getElementById(field.inputId);
+              if (customDiv) customDiv.style.display = 'none';
+            }
+          } else {
+            // Unknown value — set to custom and populate custom input
+            sel.value = '__custom__';
+            if (field.inputId) {
+              const customDiv = document.getElementById(field.inputId);
+              if (customDiv) {
+                const customInput = customDiv.querySelector('.cfg-custom-input');
+                if (customInput) customInput.value = val;
+                customDiv.style.display = 'block';
+              }
+            }
+          }
+        }
+      } else {
+        const inp = document.getElementById(field.inputId);
+        if (inp) inp.value = val;
+      }
+    }
+  }
+
+  // Populate custom rows (for keys not in CONFIG_FIELDS)
+  const configKeys = new Set(CONFIG_FIELDS.map(f => f.key));
   Object.entries(data).forEach(([k, v]) => {
-    const exists = [...document.querySelectorAll('.ek')].some(i => i.value.trim() === k);
-    if (!exists && v) addEnvRow(k, v);
+    if (!configKeys.has(k)) {
+      const exists = [...document.querySelectorAll('.ek')].some(i => i.value.trim() === k);
+      if (!exists && v) addEnvRow(k, v);
+    }
   });
 }
 
