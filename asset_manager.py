@@ -309,6 +309,28 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
         raise
 
 
+def is_asset_group_warm(asset_group: str) -> bool:
+    """Return True when every asset for a group has a non-empty file on disk.
+
+    Used at startup to recover warm state without redownloading: if a group's
+    files are present locally, ComfyUI can load them on demand and the worker
+    should advertise the group as warm to the broker.
+
+    Returns False for unknown asset groups or any missing/empty asset file.
+    """
+    try:
+        assets = get_asset_group(asset_group)
+    except ValueError:
+        return False
+    if not assets:
+        return False
+    for asset in assets:
+        path = Path(asset["path"]).expanduser()
+        if not is_non_empty_file(path):
+            return False
+    return True
+
+
 def ensure_asset_group(asset_group: str) -> EnsureAssetsResult:
     """Ensure all assets for a named group exist locally."""
 

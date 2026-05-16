@@ -14,7 +14,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.responses import FileResponse
 import requests
 
-from gpu_worker.asset_manager import ensure_asset_group
+from gpu_worker.asset_canonical import canonical_asset_group, canonicalize_groups
+from gpu_worker.asset_manager import ensure_asset_group, is_asset_group_warm
 from gpu_worker.asset_registry import (
     ASSET_REGISTRY,
     asset_group_supported_by_capabilities,
@@ -91,9 +92,17 @@ def _declared_capabilities() -> list[str]:
 
 
 def _preload_asset_groups() -> list[str]:
-    """Return only the asset groups this worker should download at startup."""
+    """Asset groups this worker should preload at startup.
 
-    return asset_groups_for_capabilities(_declared_capabilities())
+    When WORKER_CAPABILITIES is unset, default to every known group — the
+    homogeneous worker model assumes every worker can serve every group.
+    Explicit WORKER_CAPABILITIES still narrows coverage when intentionally set.
+    """
+
+    declared = _declared_capabilities()
+    if not declared:
+        return sorted(ASSET_REGISTRY)
+    return asset_groups_for_capabilities(declared)
 
 
 def _asset_group_allowed(asset_group: str) -> bool:
@@ -187,11 +196,12 @@ def _broker_worker_payload() -> dict[str, object]:
     if settings.worker_vram_gb is not None:
         free_vram_mb = int(settings.worker_vram_gb * 1024)
 
-    capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
+    raw_capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
+    capabilities = canonicalize_groups(raw_capabilities)
     public_url = settings.resolved_worker_public_url()
 
     with _WARMED_GROUPS_LOCK:
-        warmed = sorted(_WARMED_GROUPS)
+        warmed = canonicalize_groups(sorted(_WARMED_GROUPS))
 
     return {
         "worker_id": settings.resolved_worker_id(),
@@ -256,6 +266,24 @@ def _broker_heartbeat_loop() -> None:
             LOGGER.warning("[broker] heartbeat failed for worker_id=%s: %s", worker_id, exc)
 
 
+def _recover_warm_state_from_disk() -> None:
+    """Repopulate _WARMED_GROUPS at startup based on which asset groups are
+    fully present on local disk. Without this, every worker restart blanks
+    the in-memory warm set and the broker thinks a fully-provisioned box is
+    cold until preflight finishes downloading anything missing."""
+    recovered: list[str] = []
+    for group in sorted(ASSET_REGISTRY):
+        if is_asset_group_warm(group):
+            with _WARMED_GROUPS_LOCK:
+                _WARMED_GROUPS.add(group)
+            recovered.append(group)
+    if recovered:
+        LOGGER.info("[warm-recovery] disk-warm groups: %s", recovered)
+    else:
+        LOGGER.info("[warm-recovery] no asset groups fully present on disk")
+
+
+_recover_warm_state_from_disk()
 _register_with_broker()
 threading.Thread(
     target=_broker_heartbeat_loop,
@@ -558,6 +586,8 @@ def ensure_assets(
         ensure_result = ensure_asset_group(asset_group)
         if ensure_result.downloaded_assets:
             downloaded_any = True
+        with _WARMED_GROUPS_LOCK:
+            _WARMED_GROUPS.add(asset_group)
         results.append(
             EnsureAssetGroupResult(
                 asset_group=asset_group,
@@ -649,6 +679,8 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         downloaded_assets = ensure_result.downloaded_assets
         timings.asset_check_sec = ensure_result.asset_check_sec
         timings.download_sec = ensure_result.download_sec
+        with _WARMED_GROUPS_LOCK:
+            _WARMED_GROUPS.add(request.asset_group)
 
         if downloaded_assets:
             timings.restart_sec = restart_comfy()

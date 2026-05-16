@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-import socket
+import uuid
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,10 +29,30 @@ class Settings(BaseSettings):
     log_prompts_only: bool = Field(default=False, alias="LOG_PROMPTS_ONLY")
     render_broker_base_url: str | None = Field(default=None, alias="RENDER_BROKER_BASE_URL")
     render_broker_worker_token: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_TOKEN")
-    render_broker_worker_id: str = Field(
-        default_factory=lambda: f"{socket.gethostname()}-gpu-worker",
-        alias="RENDER_BROKER_WORKER_ID",
+    render_broker_worker_id: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_ID")
+    worker_id_file: str = Field(
+        default="/workspace/.filmforge_worker_id", alias="WORKER_ID_FILE"
     )
+
+    @field_validator("render_broker_worker_id")
+    @classmethod
+    def _validate_worker_id_uuid(cls, v: str | None) -> str | None:
+        """If RENDER_BROKER_WORKER_ID is explicitly set, it must be a UUID.
+        Empty/unset means: generate or read from WORKER_ID_FILE at resolve time.
+        Hostname-shaped strings are rejected so misconfig fails loudly."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            return None
+        try:
+            uuid.UUID(stripped)
+        except (ValueError, AttributeError):
+            raise ValueError(
+                f"RENDER_BROKER_WORKER_ID, if set, must be a UUID. Got {stripped!r}. "
+                "Leave unset to auto-persist a generated UUID at WORKER_ID_FILE."
+            )
+        return stripped
     render_broker_worker_name: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_NAME")
     render_broker_worker_public_url: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_PUBLIC_URL")
     render_broker_heartbeat_sec: int = Field(default=30, alias="RENDER_BROKER_HEARTBEAT_SEC")
@@ -69,12 +89,35 @@ class Settings(BaseSettings):
         return self.filmforge_backend_url or self.render_broker_base_url
 
     def resolved_worker_id(self) -> str:
-        """Resolve worker ID: use RENDER_BROKER_WORKER_ID as unique identifier."""
-        return self.render_broker_worker_id
+        """Return a stable, persistent UUID for this worker.
+
+        Resolution order:
+          1. RENDER_BROKER_WORKER_ID env var (validated UUID)
+          2. WORKER_ID_FILE on disk (any valid UUID found there)
+          3. Generate a fresh UUID, persist it to WORKER_ID_FILE, return it
+
+        This avoids two failure modes: (a) ephemeral IDs that orphan a broker
+        row on every restart, and (b) collisions when multiple workers share
+        a single ID from app/.env.
+        """
+        if self.render_broker_worker_id:
+            return self.render_broker_worker_id
+        path = Path(self.worker_id_file).expanduser()
+        if path.exists():
+            existing = path.read_text().strip()
+            try:
+                return str(uuid.UUID(existing))
+            except (ValueError, AttributeError):
+                # Corrupted file content — fall through to regenerate.
+                pass
+        new_id = str(uuid.uuid4())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_id)
+        return new_id
 
     def resolved_worker_name(self) -> str:
         """Resolve worker name: Phase 1 (WORKER_NAME) or legacy (RENDER_BROKER_WORKER_NAME) or worker_id."""
-        return self.worker_name or self.render_broker_worker_name or self.render_broker_worker_id
+        return self.worker_name or self.render_broker_worker_name or self.resolved_worker_id()
 
     def resolved_worker_public_url(self) -> str | None:
         """Resolve public URL: Phase 1 (WORKER_PUBLIC_URL) or legacy (RENDER_BROKER_WORKER_PUBLIC_URL)."""
