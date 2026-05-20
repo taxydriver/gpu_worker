@@ -31,12 +31,29 @@ DEFAULT_VAST_MAX_PRICE = 0.75
 DEFAULT_VAST_MIN_VRAM_GB = 24
 DEFAULT_VAST_LIMIT = 25
 DEFAULT_VAST_BOOT_TIMEOUT = 900
+DEFAULT_VERDA_CLI = Path.home() / ".verda" / "bin" / "verda"
+DEFAULT_VERDA_LOCATION = "FIN-01"
+DEFAULT_VERDA_INSTANCE_TYPE = "2A100.44V"
+DEFAULT_VERDA_OS_IMAGE = "ubuntu-24.04-cuda-12.8-open-docker"
+DEFAULT_VERDA_OS_VOLUME_ID = "34ec939d-a8c1-4ee2-9637-533e324dfe39"
+DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
+DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
+DEFAULT_VERDA_HOSTNAME = "filmforge-verda-worker"
+DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
+DEFAULT_VERDA_FRESH_STORAGE_SIZE = 250
+DEFAULT_VERDA_CONTRACT = "pay_as_go"
+DEFAULT_WORKER_REPO_URL = "https://github.com/taxydriver/gpu_worker.git"
+DEFAULT_COMFY_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
+DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1"]
 
 # Ordered list of candidate identity files to try when none is specified
 _CANDIDATE_IDENTITIES = [
     DEFAULT_SSH_IDENTITY,
     DEFAULT_SSH_IDENTITY_RUNPOD,
     Path.home() / ".ssh" / "runpod",  # common alternative name
+    Path.home() / ".ssh" / "id_ed25519",  # default key used when provisioning RunPod
+    Path.home() / ".ssh" / "id_rsa",
 ]
 
 
@@ -214,11 +231,14 @@ def add_default_identity(cmd: list[str], override: Path | None = None) -> list[s
     # Use an explicitly provided identity (via --ssh-identity) if given
     if override is not None:
         return [cmd[0], "-i", str(override), *cmd[1:]]
-    # Otherwise fall back through candidate key files in order
+    # Otherwise pass every existing candidate so SSH can try each one
+    identity_args: list[str] = []
     for candidate in _CANDIDATE_IDENTITIES:
         if candidate.exists():
-            return [cmd[0], "-i", str(candidate), *cmd[1:]]
-    return cmd
+            identity_args.extend(["-i", str(candidate)])
+    if not identity_args:
+        return cmd
+    return [cmd[0], *identity_args, *cmd[1:]]
 
 
 def stage_worker_tree(source_dir: Path) -> tempfile.TemporaryDirectory[str]:
@@ -446,6 +466,12 @@ if test -x /opt/instance-tools/bin/cloudflared; then
   fi
 else
   echo "cloudflared not found at /opt/instance-tools/bin/cloudflared; no public tunnel created." >&2
+fi
+
+# ── RunPod proxy fallback (when no cloudflared) ─────────────────────────────
+if test -z "$WORKER_URL" && test -n "${{RUNPOD_POD_ID:-}}"; then
+  WORKER_URL="https://${{RUNPOD_POD_ID}}-${{WORKER_PORT}}.proxy.runpod.net"
+  echo "Using RunPod proxy URL: $WORKER_URL" >&2
 fi
 
 # ── Restart worker with public URL injected (so it can self-register) ─────────
@@ -737,12 +763,762 @@ def register_worker_with_backend(backend_url: str, worker_name: str, worker_publ
         return False
 
 
+# ── Verda automation ─────────────────────────────────────────────────────────
+
+def _verda_cmd(args: argparse.Namespace, *parts: str) -> list[str]:
+    return [str(args.verda_cli.expanduser()), "--agent", *parts]
+
+
+def _verda_json(args: argparse.Namespace, *parts: str, timeout: int = 60) -> object:
+    result = subprocess.run(
+        _verda_cmd(args, *parts),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        raise RuntimeError(stderr or stdout or f"verda exited with {result.returncode}")
+    if not stdout:
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"verda returned non-JSON output for {' '.join(parts)}: {stdout[:500]}") from exc
+
+
+def _verda_check(args: argparse.Namespace, *parts: str, timeout: int = 60) -> str:
+    result = subprocess.run(
+        _verda_cmd(args, *parts),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise RuntimeError(output or f"verda exited with {result.returncode}")
+    return output
+
+
+def _verda_find_volume(volumes: object, volume_id: str) -> dict:
+    if not isinstance(volumes, list):
+        raise RuntimeError(f"Unexpected Verda volume list response: {volumes!r}")
+    for volume in volumes:
+        if isinstance(volume, dict) and volume.get("id") == volume_id:
+            return volume
+    raise RuntimeError(f"Verda volume not found: {volume_id}")
+
+
+def _verda_preflight(args: argparse.Namespace) -> None:
+    cli = args.verda_cli.expanduser()
+    if not cli.exists():
+        raise RuntimeError(f"Verda CLI not found at {cli}")
+
+    log("Checking Verda auth...")
+    _verda_check(args, "auth", "show", timeout=30)
+
+    log("Checking Verda volumes...")
+    volumes = _verda_json(args, "volume", "list", timeout=60)
+    os_volume = _verda_find_volume(volumes, args.verda_os_volume_id)
+    data_volume = _verda_find_volume(volumes, args.verda_data_volume_id)
+    for label, volume in (("OS", os_volume), ("data", data_volume)):
+        status = str(volume.get("status") or "").lower()
+        location = str(volume.get("location") or "")
+        if status != "detached":
+            raise RuntimeError(f"Verda {label} volume must be detached before deploy: id={volume.get('id')} status={status}")
+        if location != args.verda_location:
+            raise RuntimeError(
+                f"Verda {label} volume is in {location}, but deploy location is {args.verda_location}"
+            )
+
+    log("Checking Verda GPU availability...")
+    availability = _verda_json(args, "availability", "--location", args.verda_location, timeout=60)
+    available_types: set[str] = set()
+    if isinstance(availability, list):
+        for row in availability:
+            if isinstance(row, dict):
+                available_types.update(str(item) for item in (row.get("instance_types") or []))
+    if args.verda_instance_type not in available_types:
+        types = ", ".join(sorted(available_types)) or "(none)"
+        raise RuntimeError(
+            f"Verda instance type {args.verda_instance_type!r} is not currently available in "
+            f"{args.verda_location}. Available: {types}"
+        )
+
+
+def _verda_fresh_preflight(args: argparse.Namespace) -> None:
+    cli = args.verda_cli.expanduser()
+    if not cli.exists():
+        raise RuntimeError(f"Verda CLI not found at {cli}")
+
+    log("Checking Verda auth...")
+    _verda_check(args, "auth", "show", timeout=30)
+
+    log("Checking Verda GPU availability...")
+    availability = _verda_json(args, "availability", "--location", args.verda_location, timeout=60)
+    available_types: set[str] = set()
+    if isinstance(availability, list):
+        for row in availability:
+            if isinstance(row, dict):
+                available_types.update(str(item) for item in (row.get("instance_types") or []))
+    if args.verda_instance_type not in available_types:
+        types = ", ".join(sorted(available_types)) or "(none)"
+        raise RuntimeError(
+            f"Verda instance type {args.verda_instance_type!r} is not currently available in "
+            f"{args.verda_location}. Available: {types}"
+        )
+
+
+def _verda_instance_by_hostname(args: argparse.Namespace, hostname: str) -> dict | None:
+    instances = _verda_json(args, "vm", "list", timeout=60)
+    if not isinstance(instances, list):
+        return None
+    candidates = [
+        item for item in instances
+        if isinstance(item, dict) and item.get("hostname") == hostname
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return candidates[0]
+
+
+def _wait_for_verda_instance_ip(args: argparse.Namespace, hostname: str) -> tuple[str, str]:
+    deadline = time.time() + args.verda_ssh_timeout
+    while time.time() < deadline:
+        instance = _verda_instance_by_hostname(args, hostname)
+        if instance:
+            ip = str(instance.get("ip") or "").strip()
+            instance_id = str(instance.get("id") or "").strip()
+            status = str(instance.get("status") or "").strip()
+            if ip and instance_id and status.lower() == "running":
+                return ip, instance_id
+            log(f"  Waiting for Verda instance status/ip... status={status or '?'} ip={ip or '?'}")
+        else:
+            log("  Waiting for Verda instance to appear in vm list...")
+        time.sleep(10)
+    raise RuntimeError(f"Timed out waiting for Verda instance {hostname!r} to become running with an IP")
+
+
+def _wait_for_verda_ssh(ip: str, identity: Path, timeout_sec: int) -> None:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "ConnectTimeout=8",
+                "-o", "BatchMode=yes",
+                "-i", str(identity),
+                f"root@{ip}",
+                "echo ok",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "no response"
+        log(f"  SSH not ready on {ip} ({reason}), retrying...")
+        time.sleep(10)
+    raise RuntimeError(f"Timed out waiting for SSH on Verda instance {ip}")
+
+
+def verda_rehydrate_script(
+    *,
+    public_ip: str,
+    worker_port: int,
+    comfy_port: int,
+    worker_count: int,
+    remote_root: str,
+) -> str:
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+PUBLIC_IP={shlex.quote(public_ip)}
+WORKER_PORT_BASE={worker_port}
+COMFY_PORT_BASE={comfy_port}
+WORKER_COUNT_REQUESTED={worker_count}
+REMOTE_ROOT={shlex.quote(remote_root)}
+COMFY_ROOT="/workspace/ComfyUI"
+WORKER_ROOT="/opt/filmforge_gpu_worker"
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "nvidia-smi not found; GPU drivers are not ready" >&2
+  exit 1
+fi
+
+GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -lt "$GPU_COUNT"; then
+  GPU_COUNT="$WORKER_COUNT_REQUESTED"
+fi
+if test "$GPU_COUNT" -lt 1; then
+  echo "No GPUs detected" >&2
+  exit 1
+fi
+
+mkdir -p /mnt/data
+if ! mountpoint -q /mnt/data; then
+  mount /dev/vdb /mnt/data
+fi
+
+for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 'comfyui-gpu*.service' 2>/dev/null | awk '{{print $1}}'); do
+  systemctl stop "$unit" || true
+done
+
+mkdir -p /mnt/data/ComfyUI/models /mnt/data/ComfyUI/input /mnt/data/ComfyUI/output /mnt/data/ComfyUI/temp
+mkdir -p "$COMFY_ROOT"
+
+bind_comfy_dir() {{
+  src="$1"
+  dst="$2"
+  mkdir -p "$src"
+  if mountpoint -q "$dst"; then
+    return
+  fi
+  if test -L "$dst"; then
+    rm "$dst"
+  elif test -e "$dst" && ! test -d "$dst"; then
+    rm -rf "$dst"
+  fi
+  mkdir -p "$dst"
+  mount --bind "$src" "$dst"
+}}
+
+for dir in models input output temp; do
+  bind_comfy_dir "/mnt/data/ComfyUI/$dir" "$COMFY_ROOT/$dir"
+done
+
+if ! test -f "$COMFY_ROOT/main.py"; then
+  echo "ComfyUI not found at $COMFY_ROOT/main.py; OS volume is not worker-ready" >&2
+  exit 1
+fi
+if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
+  echo "ComfyUI venv not found at $COMFY_ROOT/.venv/bin/python" >&2
+  exit 1
+fi
+WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
+if test -f "$WORKER_ROOT/app.py"; then
+  mkdir -p "$WORKER_MODULE_DIR"
+  ln -sfn "$WORKER_ROOT" "$WORKER_MODULE_DIR/gpu_worker"
+elif test -f "$WORKER_ROOT/gpu_worker/app.py"; then
+  WORKER_MODULE_DIR="$WORKER_ROOT"
+elif test -f "$REMOTE_ROOT/app.py"; then
+  WORKER_ROOT="$REMOTE_ROOT"
+  WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
+  ln -sfn "$WORKER_ROOT" "$WORKER_MODULE_DIR/gpu_worker"
+elif test -f "$REMOTE_ROOT/gpu_worker/app.py"; then
+    WORKER_ROOT="$REMOTE_ROOT"
+    WORKER_MODULE_DIR="$WORKER_ROOT"
+else
+  echo "gpu_worker code not found at /opt/filmforge_gpu_worker or $REMOTE_ROOT" >&2
+  exit 1
+fi
+if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
+  echo "gpu_worker venv not found at $WORKER_ROOT/.venv/bin/python" >&2
+  exit 1
+fi
+
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  comfy_port=$((COMFY_PORT_BASE + idx))
+  worker_port=$((WORKER_PORT_BASE + idx))
+  comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+  mkdir -p "$comfy_user_dir" "$COMFY_ROOT/temp/gpu${{idx}}"
+
+  cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
+[Unit]
+Description=ComfyUI GPU ${{idx}}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$COMFY_ROOT
+Environment=CUDA_VISIBLE_DEVICES=${{idx}}
+ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory ${{comfy_user_dir}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  cat > "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
+[Unit]
+Description=FilmForge GPU Worker API GPU ${{idx}}
+After=network-online.target comfyui-gpu${{idx}}.service
+Wants=network-online.target comfyui-gpu${{idx}}.service
+
+[Service]
+Type=simple
+WorkingDirectory=$WORKER_MODULE_DIR
+Environment=CUDA_VISIBLE_DEVICES=${{idx}}
+Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
+Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
+Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
+Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
+Environment=WORKER_HOST=0.0.0.0
+Environment=WORKER_PORT=${{worker_port}}
+Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}
+Environment=WORKER_PROVIDER=verda
+Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
+Environment=WORKER_VRAM_GB=${{VRAM_GB}}
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio}}"
+Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
+Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
+Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
+Environment=COMFY_HEALTH_TIMEOUT_SEC=180
+Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
+Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
+Environment=WORKER_MAX_CONCURRENT_JOBS=1
+Environment=WORKER_HEARTBEAT_SECONDS=30
+Environment=RENDER_BROKER_HEARTBEAT_SEC=30
+UNIT
+
+  if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
+    echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
+    echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}"; then
+    echo "Environment=RENDER_BROKER_WORKER_TOKEN=${{RENDER_BROKER_WORKER_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_API_TOKEN:-}}"; then
+    echo "Environment=WORKER_API_TOKEN=${{WORKER_API_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+
+  cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
+ExecStart=$WORKER_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+done
+
+systemctl daemon-reload
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  systemctl enable --now "comfyui-gpu${{idx}}.service"
+done
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  port=$((COMFY_PORT_BASE + idx))
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+done
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  systemctl enable --now "filmforge-worker-gpu${{idx}}.service"
+done
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  port=$((WORKER_PORT_BASE + idx))
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${{port}}/health" >/tmp/filmforge_worker_gpu${{idx}}_health.json 2>/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  if ! test -s "/tmp/filmforge_worker_gpu${{idx}}_health.json"; then
+    echo "Worker gpu${{idx}} failed health check" >&2
+    journalctl -u "filmforge-worker-gpu${{idx}}.service" -n 100 --no-pager >&2 || true
+    exit 1
+  fi
+  echo "WORKER_URL=http://${{PUBLIC_IP}}:${{port}}"
+  echo "WORKER_HEALTH_GPU${{idx}}=$(cat /tmp/filmforge_worker_gpu${{idx}}_health.json)"
+done
+
+echo "GPU_COUNT=${{GPU_COUNT}}"
+df -h /mnt/data
+"""
+
+
+def verda_fresh_install_script(
+    *,
+    worker_repo_url: str,
+    comfy_repo_url: str,
+    pytorch_index_url: str,
+    remote_root: str,
+) -> str:
+    """Install ComfyUI and gpu_worker onto a fresh Verda base image."""
+
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+REMOTE_ROOT={shlex.quote(remote_root)}
+WORKER_ROOT="/opt/filmforge_gpu_worker"
+COMFY_ROOT="/workspace/ComfyUI"
+WORKER_REPO_URL={shlex.quote(worker_repo_url)}
+COMFY_REPO_URL={shlex.quote(comfy_repo_url)}
+PYTORCH_INDEX_URL={shlex.quote(pytorch_index_url)}
+
+apt-get update
+apt-get install -y --no-install-recommends \\
+  ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv \\
+  build-essential e2fsprogs ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+
+mkdir -p /opt /workspace "$REMOTE_ROOT"
+
+if test -b /dev/vdb && ! blkid /dev/vdb >/dev/null 2>&1; then
+  mkfs.ext4 -F /dev/vdb
+fi
+
+if test -d "$WORKER_ROOT/.git"; then
+  git -C "$WORKER_ROOT" pull --ff-only || true
+else
+  rm -rf "$WORKER_ROOT"
+  GIT_TERMINAL_PROMPT=0 git clone "$WORKER_REPO_URL" "$WORKER_ROOT"
+fi
+ln -sfn "$WORKER_ROOT" /opt/gpu_worker
+
+if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
+  python3 -m venv "$WORKER_ROOT/.venv"
+fi
+"$WORKER_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools
+"$WORKER_ROOT/.venv/bin/python" -m pip install -r "$WORKER_ROOT/requirements.txt"
+
+if test -d "$COMFY_ROOT/.git"; then
+  git -C "$COMFY_ROOT" pull --ff-only || true
+else
+  rm -rf "$COMFY_ROOT"
+  GIT_TERMINAL_PROMPT=0 git clone "$COMFY_REPO_URL" "$COMFY_ROOT"
+fi
+
+if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
+  python3 -m venv "$COMFY_ROOT/.venv"
+fi
+"$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools
+"$COMFY_ROOT/.venv/bin/python" -m pip install torch torchvision torchaudio --index-url "$PYTORCH_INDEX_URL"
+"$COMFY_ROOT/.venv/bin/python" -m pip install -r "$COMFY_ROOT/requirements.txt"
+
+mkdir -p "$COMFY_ROOT/custom_nodes"
+if ! test -d "$COMFY_ROOT/custom_nodes/ComfyUI-VideoHelperSuite"; then
+  GIT_TERMINAL_PROMPT=0 git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git "$COMFY_ROOT/custom_nodes/ComfyUI-VideoHelperSuite" || true
+fi
+if ! test -d "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus"; then
+  GIT_TERMINAL_PROMPT=0 git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus.git "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus" || true
+fi
+
+for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
+  if test -f "$req"; then
+    "$COMFY_ROOT/.venv/bin/python" -m pip install -r "$req" || true
+  fi
+done
+
+echo "FRESH_INSTALL_DONE=1"
+"""
+
+
+def extract_worker_urls(remote_output: str) -> list[str]:
+    urls: list[str] = []
+    for line in remote_output.splitlines():
+        if line.startswith("WORKER_URLS="):
+            for url in line.split("=", 1)[1].split(","):
+                url = url.strip()
+                if url and url not in urls:
+                    urls.append(url)
+        if line.startswith("WORKER_URL="):
+            url = line.split("=", 1)[1].strip()
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _verda_env_vars(args: argparse.Namespace) -> list[str]:
+    env_vars = list(getattr(args, "env_vars", []) or [])
+    existing_keys = {item.split("=", 1)[0] for item in env_vars if "=" in item}
+    for key in ("WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_TOKEN", "WORKER_API_TOKEN"):
+        if key not in existing_keys:
+            value = _read_env_value(args.backend_env, key)
+            if value:
+                env_vars.append(f"{key}={value}")
+                existing_keys.add(key)
+                log(f"Auto-injected {key} from backend .env")
+    has_registration_token = bool(
+        {"WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_TOKEN"} & existing_keys
+    )
+    if has_registration_token and "FILMFORGE_BACKEND_URL" not in existing_keys:
+        value = _read_env_value(args.backend_env, "FILMFORGE_BACKEND_URL")
+        if value:
+            env_vars.append(f"FILMFORGE_BACKEND_URL={value}")
+            log("Auto-injected FILMFORGE_BACKEND_URL from backend .env")
+    return env_vars
+
+
+def _verda_contract(args: argparse.Namespace) -> str:
+    value = str(getattr(args, "verda_contract", DEFAULT_VERDA_CONTRACT) or DEFAULT_VERDA_CONTRACT).lower()
+    aliases = {
+        "on_demand": "pay_as_go",
+        "ondemand": "pay_as_go",
+        "pay_as_you_go": "pay_as_go",
+        "payg": "pay_as_go",
+    }
+    value = aliases.get(value, value)
+    if value not in {"pay_as_go", "spot"}:
+        raise RuntimeError(f"Unsupported Verda contract {value!r}; expected pay_as_go or spot")
+    return value
+
+
+def _verda_billing_flags(args: argparse.Namespace, *, fresh: bool) -> list[str]:
+    contract = _verda_contract(args)
+    flags = ["--contract", contract, "--pricing", "FIXED_PRICE"]
+    if contract == "spot":
+        flags.append("--is-spot")
+        if fresh:
+            flags.extend([
+                "--os-volume-on-spot-discontinue",
+                "keep_detached",
+                "--storage-on-spot-discontinue",
+                "keep_detached",
+            ])
+    return flags
+
+
+def verda_deploy(args: argparse.Namespace) -> int:
+    identity = (args.ssh_identity or Path.home() / ".ssh" / "id_ed25519").expanduser()
+    if not identity.exists():
+        raise RuntimeError(f"SSH private key not found at {identity}")
+
+    _verda_preflight(args)
+
+    hostname = args.verda_hostname
+    log(
+        "Creating Verda VM "
+        f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
+        f"os_volume={args.verda_os_volume_id} data_volume={args.verda_data_volume_id} "
+        f"contract={_verda_contract(args)}"
+    )
+    create_cmd = [
+        "vm",
+        "create",
+        "--kind",
+        "gpu",
+        "--instance-type",
+        args.verda_instance_type,
+        "--location",
+        args.verda_location,
+        "--os",
+        args.verda_os_volume_id,
+        "--hostname",
+        hostname,
+        "--ssh-key",
+        args.verda_ssh_key_id,
+        "--existing-volume",
+        args.verda_data_volume_id,
+        "--wait",
+        "--wait-timeout",
+        args.verda_wait_timeout,
+    ]
+    create_cmd.extend(_verda_billing_flags(args, fresh=False))
+    create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
+    if create_output:
+        print(create_output)
+
+    ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
+    log(f"Verda instance running: id={instance_id} ip={ip}")
+
+    _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
+    ssh_command = f"ssh -i {identity} root@{ip}"
+    ssh_cmd, _, _ = parse_ssh_command(ssh_command)
+    ssh_cmd = add_default_host_key_policy(ssh_cmd)
+
+    env_vars = _verda_env_vars(args)
+
+    script = verda_rehydrate_script(
+        public_ip=ip,
+        worker_port=args.worker_port,
+        comfy_port=args.verda_comfy_port,
+        worker_count=args.verda_worker_count,
+        remote_root=args.remote_root,
+    )
+    env_exports = build_env_exports(env_vars)
+    if env_exports:
+        script = f"{env_exports}\n\n{script}"
+
+    log("Running Verda post-boot worker fixup...")
+    try:
+        remote_result = run([*ssh_cmd, "bash", "-s"], input_text=script, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, file=sys.stderr, end="")
+        raise
+    if remote_result.stdout:
+        print(remote_result.stdout, end="")
+    if remote_result.stderr:
+        print(remote_result.stderr, file=sys.stderr, end="")
+
+    worker_urls = extract_worker_urls(remote_result.stdout)
+    if worker_urls:
+        log("Verda worker URLs:")
+        for url in worker_urls:
+            log(f"  {url}")
+        print(f"WORKER_URLS={','.join(worker_urls)}")
+    else:
+        log("No Verda worker URLs found in post-boot output.")
+
+    (SCRIPT_DIR / ".last_ssh_dest").write_text(f"-i {identity} root@{ip}\n")
+
+    if worker_urls and args.warm_asset_groups and not args.skip_warmup:
+        for url in worker_urls:
+            _run_worker_warmup(args, url)
+
+    return 0
+
+
+def verda_fresh_deploy(args: argparse.Namespace) -> int:
+    identity = (args.ssh_identity or Path.home() / ".ssh" / "id_ed25519").expanduser()
+    if not identity.exists():
+        raise RuntimeError(f"SSH private key not found at {identity}")
+
+    _verda_fresh_preflight(args)
+
+    hostname = args.verda_hostname
+    os_volume_name = args.verda_fresh_os_volume_name or f"{hostname}-os"
+    storage_name = args.verda_fresh_storage_name or f"{hostname}-models"
+    log(
+        "Creating fresh Verda VM "
+        f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
+        f"os={args.verda_fresh_os_image} os_size={args.verda_fresh_os_volume_size} "
+        f"storage={storage_name}:{args.verda_fresh_storage_size}GB "
+        f"contract={_verda_contract(args)}"
+    )
+    create_cmd = [
+        "vm",
+        "create",
+        "--kind",
+        "gpu",
+        "--instance-type",
+        args.verda_instance_type,
+        "--location",
+        args.verda_location,
+        "--os",
+        args.verda_fresh_os_image,
+        "--os-volume-size",
+        str(args.verda_fresh_os_volume_size),
+        "--os-volume-name",
+        os_volume_name,
+        "--storage-size",
+        str(args.verda_fresh_storage_size),
+        "--storage-name",
+        storage_name,
+        "--storage-type",
+        args.verda_fresh_storage_type,
+        "--hostname",
+        hostname,
+        "--ssh-key",
+        args.verda_ssh_key_id,
+        "--wait",
+        "--wait-timeout",
+        args.verda_wait_timeout,
+    ]
+    create_cmd.extend(_verda_billing_flags(args, fresh=True))
+    create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
+    if create_output:
+        print(create_output)
+
+    ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
+    log(f"Fresh Verda instance running: id={instance_id} ip={ip}")
+
+    _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
+    ssh_command = f"ssh -i {identity} root@{ip}"
+    ssh_cmd, _, _ = parse_ssh_command(ssh_command)
+    ssh_cmd = add_default_host_key_policy(ssh_cmd)
+
+    install_script = verda_fresh_install_script(
+        worker_repo_url=args.verda_worker_repo_url,
+        comfy_repo_url=args.verda_comfy_repo_url,
+        pytorch_index_url=args.verda_pytorch_index_url,
+        remote_root=args.remote_root,
+    )
+    log("Installing worker stack on fresh Verda OS volume...")
+    try:
+        install_result = run([*ssh_cmd, "bash", "-s"], input_text=install_script, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, file=sys.stderr, end="")
+        raise
+    if install_result.stdout:
+        print(install_result.stdout, end="")
+    if install_result.stderr:
+        print(install_result.stderr, file=sys.stderr, end="")
+
+    env_vars = _verda_env_vars(args)
+    script = verda_rehydrate_script(
+        public_ip=ip,
+        worker_port=args.worker_port,
+        comfy_port=args.verda_comfy_port,
+        worker_count=args.verda_worker_count,
+        remote_root=args.remote_root,
+    )
+    env_exports = build_env_exports(env_vars)
+    if env_exports:
+        script = f"{env_exports}\n\n{script}"
+
+    log("Starting workers on fresh Verda VM...")
+    try:
+        remote_result = run([*ssh_cmd, "bash", "-s"], input_text=script, capture_output=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, end="")
+        if exc.stderr:
+            print(exc.stderr, file=sys.stderr, end="")
+        raise
+    if remote_result.stdout:
+        print(remote_result.stdout, end="")
+    if remote_result.stderr:
+        print(remote_result.stderr, file=sys.stderr, end="")
+
+    worker_urls = extract_worker_urls(remote_result.stdout)
+    if worker_urls:
+        log("Fresh Verda worker URLs:")
+        for url in worker_urls:
+            log(f"  {url}")
+        print(f"WORKER_URLS={','.join(worker_urls)}")
+    else:
+        log("No Verda worker URLs found in post-boot output.")
+
+    (SCRIPT_DIR / ".last_ssh_dest").write_text(f"-i {identity} root@{ip}\n")
+
+    if worker_urls and not args.skip_warmup:
+        if not args.warm_asset_groups:
+            args.warm_asset_groups = list(DEFAULT_VERDA_FRESH_WARM_GROUPS)
+        _run_worker_warmup(args, worker_urls[0])
+
+    return 0
+
+
 # ── RunPod automation ────────────────────────────────────────────────────────
 
 RUNPOD_IMAGE = "runpod/comfyui:latest"
 RUNPOD_GPU_TYPE = "NVIDIA L40S"
-RUNPOD_POD_NAME = "filmforge_comfy"
 RUNPOD_BOOT_TIMEOUT = 300   # seconds to wait for pod SSH to become ready
+
+
+def _pod_name_for_gpu(gpu_type: str) -> str:
+    """Derive a stable pod name from the GPU type ID, e.g. 'filmforge_rtx5090'."""
+    slug = re.sub(r"[^a-z0-9]+", "_", gpu_type.lower()).strip("_")
+    # Shorten common prefixes for readability
+    slug = re.sub(r"^nvidia_geforce_", "", slug)
+    slug = re.sub(r"^nvidia_", "", slug)
+    slug = slug.replace("rtx_", "rtx").replace("geforce_", "")
+    return f"filmforge_{slug}"
 RUNPOD_SSH_POLL_INTERVAL = 10
 
 
@@ -755,19 +1531,18 @@ def _read_env_value(env_path: Path, key: str) -> str | None:
     return None
 
 
-def _runpod_find_running_pod(rp: object) -> dict | None:
-    """Return the filmforge pod if it exists (any status), or None."""
+def _runpod_find_running_pod(rp: object, pod_name: str) -> dict | None:
+    """Return the pod with the given name if it exists (any status), or None."""
     try:
         pods = rp.get_pods()  # type: ignore[attr-defined]
     except Exception as exc:
         log(f"RunPod API error listing pods: {exc}")
         return None
-    # Accept any status — pod may be EXITED or STARTING; caller will resume/wait
     for pod in pods:
-        if pod.get("name") == RUNPOD_POD_NAME:
+        if pod.get("name") == pod_name:
             status = pod.get("desiredStatus", "?")
             if status != "RUNNING":
-                log(f"Found pod '{RUNPOD_POD_NAME}' (status={status}) — will resume it.")
+                log(f"Found pod '{pod_name}' (status={status}) — will resume it.")
             return pod
     return None
 
@@ -834,27 +1609,38 @@ def runpod_deploy(args: argparse.Namespace) -> int:
         return 1
     pub_key = pub_key_path.read_text().strip()
 
-    # Find existing running pod
-    pod = _runpod_find_running_pod(rp)
+    # Find existing running pod — by explicit ID, or by GPU-derived name
+    explicit_pod_id = getattr(args, "pod_id", None)
+    gpu_type = getattr(args, "gpu", None) or RUNPOD_GPU_TYPE
+    pod_name = _pod_name_for_gpu(gpu_type)
+    if explicit_pod_id:
+        pods = rp.get_pods()
+        pod = next((p for p in pods if p.get("id") == explicit_pod_id), None)
+        if pod:
+            log(f"Using specified pod: {pod['id']} ({pod.get('name')})")
+        else:
+            log(f"ERROR: Pod ID '{explicit_pod_id}' not found")
+            return 1
+    else:
+        pod = _runpod_find_running_pod(rp, pod_name)
     if pod:
         log(f"Found existing pod: {pod['id']} ({pod.get('name')})")
     else:
-        gpu_type = getattr(args, "gpu", None) or RUNPOD_GPU_TYPE
-        log(f"No running pod found — creating new pod ({gpu_type}, {RUNPOD_IMAGE})…")
+        log(f"No pod '{pod_name}' found — creating new pod ({gpu_type}, {RUNPOD_IMAGE})…")
         try:
             pod = rp.create_pod(
-                name=RUNPOD_POD_NAME,
+                name=pod_name,
                 image_name=RUNPOD_IMAGE,
                 gpu_type_id=gpu_type,
-                cloud_type="SECURE",
+                cloud_type=getattr(args, "runpod_cloud_type", "COMMUNITY"),
                 gpu_count=1,
-                volume_in_gb=150,
-                container_disk_in_gb=50,
+                volume_in_gb=getattr(args, "runpod_volume_gb", 150),
+                container_disk_in_gb=getattr(args, "runpod_container_disk_gb", 50),
                 min_vcpu_count=8,
                 min_memory_in_gb=50,
                 ports=f"22/tcp,8188/http,{args.worker_port}/http",
                 volume_mount_path="/workspace",
-                env={"PUBLIC_KEY": pub_key},
+                env={"PUBLIC_KEY": pub_key, "FILMFORGE_OWNED": "1"},
             )
         except Exception as exc:
             log(f"ERROR: Failed to create RunPod pod: {exc}")
@@ -867,7 +1653,7 @@ def runpod_deploy(args: argparse.Namespace) -> int:
     if pod.get("desiredStatus") != "RUNNING":
         log(f"Resuming pod {pod_id}…")
         try:
-            rp.resume_pod(pod_id)  # type: ignore[attr-defined]
+            rp.resume_pod(pod_id, int(pod.get("gpuCount") or 1))  # type: ignore[attr-defined]
         except Exception as exc:
             log(f"WARNING: resume_pod failed ({exc}) — pod may self-start, continuing…")
 
@@ -984,14 +1770,42 @@ def _do_deploy(args: argparse.Namespace, pod_id: str | None = None) -> tuple[int
     scp_cmd = add_default_host_key_policy(scp_cmd)
 
     run([*ssh_cmd, "mkdir", "-p", args.remote_root])
-    run([*ssh_cmd, "rm", "-rf", f"{args.remote_root.rstrip('/')}/{SCRIPT_DIR.name}"])
-    with stage_worker_tree(SCRIPT_DIR) as staged_dir:
-        staged_worker_dir = Path(staged_dir) / SCRIPT_DIR.name
-        run([*scp_cmd, "-r", str(staged_worker_dir), f"{destination}:{args.remote_root}/"])
+    # Clone or update gpu_worker from GitHub
+    clone_script = f"""set -euo pipefail
+REMOTE_ROOT={shlex.quote(args.remote_root)}
+# Ensure git is available on the remote
+if ! command -v git >/dev/null 2>&1; then
+  echo "Installing git..." >&2
+  apt-get update -qq 2>/dev/null || true
+  apt-get install -y -qq git 2>/dev/null || true
+fi
+cd "$REMOTE_ROOT"
+if test -d gpu_worker/.git; then
+  echo "gpu_worker already exists, updating..." >&2
+  cd gpu_worker
+  git pull origin main 2>/dev/null || echo "git pull failed" >&2
+  cd ..
+else
+  rm -rf gpu_worker
+  echo "Cloning gpu_worker from GitHub..." >&2
+  GIT_TERMINAL_PROMPT=0 git clone https://github.com/taxydriver/gpu_worker.git gpu_worker
+fi
+"""
+    run([*ssh_cmd, "bash", "-s"], input_text=clone_script)
 
     try:
+        # Auto-inject critical env vars from backend .env if not already provided
+        env_vars = list(getattr(args, "env_vars", []) or [])
+        existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
+        for key in ("FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_ID"):
+            if key not in existing_keys:
+                value = _read_env_value(args.backend_env, key)
+                if value:
+                    env_vars.append(f"{key}={value}")
+                    log(f"Auto-injected {key} from backend .env")
+
         script = remote_script(args.remote_root, args.worker_port)
-        env_exports = build_env_exports(getattr(args, "env_vars", []) or [])
+        env_exports = build_env_exports(env_vars)
         if env_exports:
             script = f"{env_exports}\n\n{script}"
         remote_result = run(
@@ -1017,6 +1831,7 @@ def _do_deploy(args: argparse.Namespace, pod_id: str | None = None) -> tuple[int
     if not worker_url and pod_id:
         worker_url = _runpod_proxy_url(pod_id, args.worker_port)
         log(f"Using RunPod proxy URL: {worker_url}")
+        print(f"WORKER_URL={worker_url}")
     if not worker_url and not pod_id and args.backend_env.exists():
         # SSH-mode deploy: try to infer pod_id from existing GPU_WORKER_BASE_URL in .env
         # e.g. https://kafmkv5qfjjdqm-9000.proxy.runpod.net → pod_id=kafmkv5qfjjdqm
@@ -1026,6 +1841,7 @@ def _do_deploy(args: argparse.Namespace, pod_id: str | None = None) -> tuple[int
             pod_id = m.group(1)
             worker_url = _runpod_proxy_url(pod_id, args.worker_port)
             log(f"Inferred RunPod proxy URL from existing .env: {worker_url}")
+            print(f"WORKER_URL={worker_url}")
 
     if worker_url and not args.skip_backend_env and args.backend_env.exists():
         update_env_file(args.backend_env, worker_url)
@@ -1085,6 +1901,22 @@ def parse_args() -> argparse.Namespace:
             "deploy the worker, optionally warm asset groups, and print the public worker URL."
         ),
     )
+    mode.add_argument(
+        "--verda",
+        action="store_true",
+        help=(
+            "Fully automated Verda rehydrate: create a VM from an existing OS volume, "
+            "attach the model data volume, configure systemd workers, and print worker URLs."
+        ),
+    )
+    mode.add_argument(
+        "--verda-fresh",
+        action="store_true",
+        help=(
+            "Fully automated fresh Verda deploy: create OS/storage volumes, install ComfyUI "
+            "and gpu_worker, download models, and print worker URLs."
+        ),
+    )
 
     parser.add_argument(
         "--gpu",
@@ -1095,6 +1927,30 @@ def parse_args() -> argparse.Namespace:
             f"Default: {RUNPOD_GPU_TYPE}. "
             "Run: python3 -c \"import runpod; [print(g['id']) for g in runpod.get_gpus()]\" to list all."
         ),
+    )
+    parser.add_argument(
+        "--pod-id",
+        default=None,
+        metavar="POD_ID",
+        help="Target a specific existing RunPod pod by ID, bypassing name lookup.",
+    )
+    parser.add_argument(
+        "--runpod-volume-gb",
+        type=int,
+        default=150,
+        help="RunPod persistent volume size in GB (mounted at /workspace). Default: 150",
+    )
+    parser.add_argument(
+        "--runpod-container-disk-gb",
+        type=int,
+        default=50,
+        help="RunPod container (ephemeral) disk size in GB. Default: 50",
+    )
+    parser.add_argument(
+        "--runpod-cloud-type",
+        default="COMMUNITY",
+        choices=["SECURE", "COMMUNITY"],
+        help="RunPod cloud type. COMMUNITY is cheaper and has better availability. Default: COMMUNITY",
     )
     parser.add_argument(
         "--ssh-identity",
@@ -1169,6 +2025,124 @@ def parse_args() -> argparse.Namespace:
         help=f"Seconds to wait for Vast SSH readiness. Default: {DEFAULT_VAST_BOOT_TIMEOUT}",
     )
     parser.add_argument(
+        "--verda-cli",
+        type=Path,
+        default=DEFAULT_VERDA_CLI,
+        help=f"Path to Verda CLI. Default: {DEFAULT_VERDA_CLI}",
+    )
+    parser.add_argument(
+        "--verda-location",
+        default=os.getenv("VERDA_LOCATION", DEFAULT_VERDA_LOCATION),
+        help=f"Verda location code. Default: {DEFAULT_VERDA_LOCATION}",
+    )
+    parser.add_argument(
+        "--verda-instance-type",
+        default=os.getenv("VERDA_INSTANCE_TYPE", DEFAULT_VERDA_INSTANCE_TYPE),
+        help=f"Verda instance type. Default: {DEFAULT_VERDA_INSTANCE_TYPE}",
+    )
+    parser.add_argument(
+        "--verda-contract",
+        choices=("pay_as_go", "spot"),
+        default=os.getenv("VERDA_CONTRACT", DEFAULT_VERDA_CONTRACT),
+        help="Verda billing contract. Use spot for disposable install/model-download tests. Default: pay_as_go",
+    )
+    parser.add_argument(
+        "--verda-os-volume-id",
+        default=os.getenv("VERDA_OS_VOLUME_ID", DEFAULT_VERDA_OS_VOLUME_ID),
+        help="Detached Verda OS volume ID to boot from.",
+    )
+    parser.add_argument(
+        "--verda-data-volume-id",
+        default=os.getenv("VERDA_DATA_VOLUME_ID", DEFAULT_VERDA_DATA_VOLUME_ID),
+        help="Detached Verda data/model volume ID to attach.",
+    )
+    parser.add_argument(
+        "--verda-ssh-key-id",
+        default=os.getenv("VERDA_SSH_KEY_ID", DEFAULT_VERDA_SSH_KEY_ID),
+        help="Verda SSH key ID to inject into the instance.",
+    )
+    parser.add_argument(
+        "--verda-hostname",
+        default=os.getenv("VERDA_HOSTNAME", DEFAULT_VERDA_HOSTNAME),
+        help=f"Hostname for the Verda VM. Default: {DEFAULT_VERDA_HOSTNAME}",
+    )
+    parser.add_argument(
+        "--verda-comfy-port",
+        type=int,
+        default=int(os.getenv("VERDA_COMFY_PORT", "8188")),
+        help="Base ComfyUI port for Verda multi-GPU workers. Default: 8188",
+    )
+    parser.add_argument(
+        "--verda-worker-count",
+        type=int,
+        default=int(os.getenv("VERDA_WORKER_COUNT", "0")),
+        help="Number of GPU worker services to start. 0 means auto-detect all GPUs.",
+    )
+    parser.add_argument(
+        "--verda-fresh-os-image",
+        default=os.getenv("VERDA_FRESH_OS_IMAGE", DEFAULT_VERDA_OS_IMAGE),
+        help=f"Base Verda OS image for --verda-fresh. Default: {DEFAULT_VERDA_OS_IMAGE}",
+    )
+    parser.add_argument(
+        "--verda-fresh-os-volume-size",
+        type=int,
+        default=int(os.getenv("VERDA_FRESH_OS_VOLUME_SIZE", str(DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE))),
+        help=f"Fresh OS volume size in GiB. Default: {DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE}",
+    )
+    parser.add_argument(
+        "--verda-fresh-os-volume-name",
+        default=os.getenv("VERDA_FRESH_OS_VOLUME_NAME", ""),
+        help="Fresh OS volume name. Default: <hostname>-os",
+    )
+    parser.add_argument(
+        "--verda-fresh-storage-size",
+        type=int,
+        default=int(os.getenv("VERDA_FRESH_STORAGE_SIZE", str(DEFAULT_VERDA_FRESH_STORAGE_SIZE))),
+        help=f"Fresh model/data storage size in GiB. Default: {DEFAULT_VERDA_FRESH_STORAGE_SIZE}",
+    )
+    parser.add_argument(
+        "--verda-fresh-storage-name",
+        default=os.getenv("VERDA_FRESH_STORAGE_NAME", ""),
+        help="Fresh model/data storage name. Default: <hostname>-models",
+    )
+    parser.add_argument(
+        "--verda-fresh-storage-type",
+        default=os.getenv("VERDA_FRESH_STORAGE_TYPE", "NVMe"),
+        help="Fresh model/data storage type. Default: NVMe",
+    )
+    parser.add_argument(
+        "--verda-worker-repo-url",
+        default=os.getenv("VERDA_WORKER_REPO_URL", DEFAULT_WORKER_REPO_URL),
+        help=f"gpu_worker git URL for --verda-fresh. Default: {DEFAULT_WORKER_REPO_URL}",
+    )
+    parser.add_argument(
+        "--verda-comfy-repo-url",
+        default=os.getenv("VERDA_COMFY_REPO_URL", DEFAULT_COMFY_REPO_URL),
+        help=f"ComfyUI git URL for --verda-fresh. Default: {DEFAULT_COMFY_REPO_URL}",
+    )
+    parser.add_argument(
+        "--verda-pytorch-index-url",
+        default=os.getenv("VERDA_PYTORCH_INDEX_URL", DEFAULT_PYTORCH_INDEX_URL),
+        help=f"PyTorch wheel index for --verda-fresh. Default: {DEFAULT_PYTORCH_INDEX_URL}",
+    )
+    parser.add_argument(
+        "--verda-wait-timeout",
+        default=os.getenv("VERDA_WAIT_TIMEOUT", "8m"),
+        help="Verda VM create wait timeout. Default: 8m",
+    )
+    parser.add_argument(
+        "--verda-create-timeout",
+        type=int,
+        default=int(os.getenv("VERDA_CREATE_TIMEOUT_SEC", "900")),
+        help="Local timeout in seconds for the Verda create command. Default: 900",
+    )
+    parser.add_argument(
+        "--verda-ssh-timeout",
+        type=int,
+        default=int(os.getenv("VERDA_SSH_TIMEOUT_SEC", "300")),
+        help="Seconds to wait for the Verda VM SSH service. Default: 300",
+    )
+    parser.add_argument(
         "--remote-root",
         default=DEFAULT_REMOTE_ROOT,
         help=f"Remote install root. Default: {DEFAULT_REMOTE_ROOT}",
@@ -1235,8 +2209,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if not args.runpod and not args.vast and not args.ssh_command:
-        parser.error("Provide an ssh_command or use --runpod/--vast")
     return args
 
 
@@ -1248,6 +2220,10 @@ def main() -> int:
             return runpod_deploy(args)
         if args.vast:
             return vast_deploy(args)
+        if args.verda:
+            return verda_deploy(args)
+        if args.verda_fresh:
+            return verda_fresh_deploy(args)
 
         exit_code, worker_url = _do_deploy(args)
         if exit_code == 0 and worker_url and args.warm_asset_groups and not args.skip_warmup:

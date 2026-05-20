@@ -124,6 +124,71 @@ Useful flags:
 - `--update-backend-env` for legacy local-dev single-worker routing
 - `--skip-backend-restart`
 
+## Deploy To Verda
+
+Verda supports two deploy modes:
+
+- existing volumes: boot a detached OS volume and attach a detached model/data volume
+- fresh install: create new OS/model volumes, install ComfyUI + gpu_worker, and download models
+
+```bash
+./setup_gpu.sh --verda
+./setup_gpu.sh --verda-fresh
+```
+
+Default Verda volume targets:
+
+- OS volume: `34ec939d-a8c1-4ee2-9637-533e324dfe39`
+- data/model volume: `4ea18b04-564f-4218-ab79-e90d1ccc839b`
+- location: `FIN-01`
+- instance type: `2A100.44V`
+
+Useful overrides:
+
+```bash
+./setup_gpu.sh --verda \
+  --verda-location FIN-01 \
+  --verda-instance-type 2A100.44V \
+  --verda-os-volume-id <os-volume-id> \
+  --verda-data-volume-id <data-volume-id> \
+  --verda-worker-count 2
+```
+
+Fresh install overrides:
+
+```bash
+./setup_gpu.sh --verda-fresh \
+  --verda-location FIN-01 \
+  --verda-instance-type 2A100.44V \
+  --verda-fresh-os-volume-size 100 \
+  --verda-fresh-storage-size 250 \
+  --warm-asset-group flux_stills_v1 \
+  --warm-asset-group wan_i2v_v1 \
+  --warm-asset-group stable_audio_v1
+```
+
+The deploy UI exposes the same flow under **Create & Deploy (Verda)**. It uses
+the mode selector to choose existing volumes or fresh install, streams the
+Verda provisioning log, then stores the resulting SSH target in the Verda Hosts
+list for log viewing.
+
+This flow:
+
+- checks Verda auth, volume status, and GPU availability
+- requires both OS and data volumes to be detached before provisioning
+- creates an on-demand VM from the OS volume and attaches the data volume
+- mounts the data volume at `/mnt/data`
+- starts one ComfyUI service and one GPU worker service per detected GPU
+- prints public worker URLs such as `http://<verda-ip>:9000`
+- registers workers with the backend when `FILMFORGE_BACKEND_URL` and the
+  worker registration token are available
+- sends rolling per-asset-group performance stats in broker heartbeats so the
+  backend can estimate worker ETA
+
+Teardown is intentionally not automated in this first phase. Verda VM deletion
+has a volume-deletion footgun; safe detach/delete flow should be implemented as
+a separate command before using automated teardown.
+
 For split workers, set different capabilities per deployment:
 
 ```bash

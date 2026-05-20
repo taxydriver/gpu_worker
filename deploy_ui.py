@@ -9,10 +9,12 @@ import asyncio
 import json
 import os
 import queue
+import re
 import shlex
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 import uuid
 from pathlib import Path
@@ -75,6 +77,55 @@ class AutoProvisionRequest(BaseModel):
     max_upload_cost: float | None = None
     max_download_cost: float | None = None
     allow_fallback_gpu: bool = False
+
+
+class RunPodProvisionRequest(BaseModel):
+    gpu_type: str = "NVIDIA L40S"
+    cloud_type: str = "COMMUNITY"
+    volume_gb: int = 150
+    container_disk_gb: int = 50
+    worker_port: int = 9000
+    remote_root: str = "/workspace/filmforge_gpu_worker"
+    env_vars: dict[str, str] = {}
+    pod_id: str | None = None
+
+
+class VerdaHostRequest(BaseModel):
+    name: str
+    ssh_command: str
+
+
+class VerdaTeardownRequest(BaseModel):
+    name: str = ""
+    ssh_command: str = ""
+    instance_id: str = ""
+    delete_volumes: bool = False
+
+
+class VerdaProvisionRequest(BaseModel):
+    fresh: bool = False
+    location: str = "FIN-01"
+    instance_type: str = "2A100.44V"
+    contract: str = "pay_as_go"
+    os_volume_id: str = "34ec939d-a8c1-4ee2-9637-533e324dfe39"
+    data_volume_id: str = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
+    ssh_key_id: str = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
+    hostname: str = "filmforge-verda-worker"
+    worker_count: int = 0
+    worker_port: int = 9000
+    comfy_port: int = 8188
+    remote_root: str = "/workspace/filmforge_gpu_worker"
+    fresh_os_volume_size: int = 100
+    fresh_storage_size: int = 250
+    fresh_os_volume_name: str = ""
+    fresh_storage_name: str = ""
+    skip_warmup: bool = True
+    warm_asset_groups: list[str] = []
+    env_vars: dict[str, str] = {}
+
+
+# RunPod proxy URL pattern (no cloudflared on RunPod pods)
+_RUNPOD_PROXY_PATTERN = re.compile(r"https://[\w]+-\d+\.proxy\.runpod\.net")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -175,6 +226,74 @@ def _offer_sort_key(offer: dict) -> tuple[float, float, float]:
     )
 
 
+def _find_runpod_python() -> str:
+    """Return a Python executable that has the runpod package.
+
+    Tries sys.executable first (deploy UI's own Python), then common
+    locations.  Falls back to sys.executable even if runpod isn't there
+    so the subprocess at least produces a clear error.
+    """
+    candidates = [
+        sys.executable,
+        "/opt/homebrew/bin/python3.13",
+        "python3.13",
+        "python3.12",
+        "python3",
+    ]
+    for py in candidates:
+        result = subprocess.run(
+            [py, "-c", "import runpod"],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return py
+    return sys.executable
+
+
+def _read_backend_env_key(key: str) -> str | None:
+    if not DEFAULT_BACKEND_ENV.exists():
+        return None
+    for line in DEFAULT_BACKEND_ENV.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def _runpod_client():
+    try:
+        import runpod as rp  # type: ignore[import]
+    except ImportError:
+        return None
+    api_key = _read_backend_env_key("RUNPOD_API_KEY")
+    if not api_key:
+        return None
+    rp.api_key = api_key
+    return rp
+
+
+def _is_filmforge_pod(pod: dict) -> bool:
+    env = pod.get("env") or []
+    if isinstance(env, dict):
+        return env.get("FILMFORGE_OWNED") == "1"
+    return any(str(e).startswith("FILMFORGE_OWNED=") for e in env)
+
+
+def _normalize_runpod_pod(pod: dict) -> dict:
+    runtime = pod.get("runtime") or {}
+    ports = runtime.get("ports") or []
+    ssh = next((p for p in ports if p.get("privatePort") == 22 and p.get("isIpPublic")), None)
+    machine = pod.get("machine") or {}
+    return {
+        "id": pod["id"],
+        "name": pod.get("name", ""),
+        "status": pod.get("desiredStatus", "UNKNOWN"),
+        "gpu_name": machine.get("gpuDisplayName") or "GPU",
+        "cost_per_hr": pod.get("costPerHr"),
+        "ssh_ip": ssh["ip"] if ssh else None,
+        "ssh_port": ssh["publicPort"] if ssh else None,
+    }
+
+
 def _put(job: dict, msg: str) -> None:
     job["logs"].append(msg)
     job["queue"].put(msg)
@@ -215,12 +334,278 @@ def _last_ssh_command() -> str:
     return f"ssh {dest}" if dest else ""
 
 
+VERDA_HOSTS_PATH = SCRIPT_DIR / ".verda_hosts.json"
+VERDA_CLI = Path.home() / ".verda" / "bin" / "verda"
+VERDA_AVAILABILITY_LOCATIONS = ("FIN-01", "FIN-02", "FIN-03")
+_VERDA_INSTANCE_TYPES_CACHE: dict[str, object] = {"loaded_at": 0.0, "prices": {}}
+_VERDA_INSTANCE_TYPES_TTL_SEC = 600
+
+
+def _normalize_ssh_command(cmd: str) -> str:
+    cmd = (cmd or "").strip()
+    if not cmd:
+        return ""
+    return cmd if cmd.startswith("ssh ") else f"ssh {cmd}"
+
+
+def _load_verda_hosts() -> list[dict]:
+    if VERDA_HOSTS_PATH.exists():
+        try:
+            data = json.loads(VERDA_HOSTS_PATH.read_text() or "[]")
+            if isinstance(data, list):
+                return [h for h in data if isinstance(h, dict) and h.get("name") and h.get("ssh_command")]
+        except json.JSONDecodeError:
+            return []
+        return []
+    seed = _read_backend_env_key("VERDA_SSH_DEST")
+    if seed:
+        hosts = [{"name": "default", "ssh_command": _normalize_ssh_command(seed)}]
+        _save_verda_hosts(hosts)
+        return hosts
+    return []
+
+
+def _save_verda_hosts(hosts: list[dict]) -> None:
+    VERDA_HOSTS_PATH.write_text(json.dumps(hosts, indent=2) + "\n")
+
+
+def _verda_instance_type_prices() -> dict[str, dict]:
+    now = time.time()
+    cached_prices = _VERDA_INSTANCE_TYPES_CACHE.get("prices")
+    loaded_at = float(_VERDA_INSTANCE_TYPES_CACHE.get("loaded_at") or 0.0)
+    if isinstance(cached_prices, dict) and cached_prices and now - loaded_at < _VERDA_INSTANCE_TYPES_TTL_SEC:
+        return cached_prices
+
+    proc = subprocess.run(
+        [str(VERDA_CLI), "--agent", "instance-types"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return cached_prices if isinstance(cached_prices, dict) else {}
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return cached_prices if isinstance(cached_prices, dict) else {}
+
+    prices: dict[str, dict] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            instance_type = str(row.get("instance_type") or "")
+            if not instance_type:
+                continue
+            prices[instance_type] = {
+                "price_per_hour": row.get("price_per_hour"),
+                "spot_price": row.get("spot_price"),
+                "currency": row.get("currency") or "usd",
+                "gpu_memory_gb": (row.get("gpu_memory") or {}).get("size_in_gigabytes"),
+                "ram_gb": (row.get("memory") or {}).get("size_in_gigabytes"),
+                "name": row.get("name") or row.get("model") or "",
+            }
+    _VERDA_INSTANCE_TYPES_CACHE["loaded_at"] = now
+    _VERDA_INSTANCE_TYPES_CACHE["prices"] = prices
+    return prices
+
+
+def _verda_price_label(price_per_hour: object, spot_price: object = None) -> str:
+    try:
+        hourly = float(price_per_hour)
+    except (TypeError, ValueError):
+        return "price unavailable"
+    label = f"${hourly:.3f}/hr"
+    try:
+        spot = float(spot_price)
+    except (TypeError, ValueError):
+        return label
+    return f"{label}, spot ${spot:.3f}/hr"
+
+
+def _verda_list_volumes() -> list[dict]:
+    proc = subprocess.run(
+        [str(VERDA_CLI), "--agent", "volume", "list"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "Verda volume list failed").strip())
+    try:
+        payload = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Verda returned non-JSON volume list: {proc.stdout[:300]}") from exc
+    return payload if isinstance(payload, list) else []
+
+
+def _verda_list_vms() -> list[dict]:
+    proc = subprocess.run(
+        [str(VERDA_CLI), "--agent", "vm", "list"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or "Verda VM list failed").strip())
+    try:
+        payload = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Verda returned non-JSON VM list: {proc.stdout[:300]}") from exc
+    return payload if isinstance(payload, list) else []
+
+
+def _host_from_ssh_command(ssh_command: str) -> str:
+    try:
+        parts = shlex.split(_normalize_ssh_command(ssh_command))
+    except ValueError:
+        return ""
+    for part in reversed(parts):
+        if "@" in part and not part.startswith("-"):
+            return part.rsplit("@", 1)[1]
+    return ""
+
+
+def _verda_find_vm_for_teardown(req: VerdaTeardownRequest) -> dict:
+    vms = _verda_list_vms()
+    if req.instance_id:
+        match = next((vm for vm in vms if isinstance(vm, dict) and vm.get("id") == req.instance_id), None)
+        if match:
+            return match
+        raise RuntimeError(f"Verda instance not found: {req.instance_id}")
+    host = _host_from_ssh_command(req.ssh_command)
+    if host:
+        match = next((vm for vm in vms if isinstance(vm, dict) and vm.get("ip") == host), None)
+        if match:
+            return match
+    if req.name:
+        match = next((vm for vm in vms if isinstance(vm, dict) and vm.get("hostname") == req.name), None)
+        if match:
+            return match
+    raise RuntimeError("Could not match selected Verda host to a running VM")
+
+
+def _verda_validate_existing_volumes(req: VerdaProvisionRequest) -> None:
+    volumes = _verda_list_volumes()
+    os_volume = next((v for v in volumes if isinstance(v, dict) and v.get("id") == req.os_volume_id), None)
+    data_volume = next((v for v in volumes if isinstance(v, dict) and v.get("id") == req.data_volume_id), None)
+    if not os_volume:
+        raise RuntimeError(f"OS volume not found: {req.os_volume_id}")
+    if not data_volume:
+        raise RuntimeError(f"Data/model volume not found: {req.data_volume_id}")
+    problems: list[str] = []
+    if not os_volume.get("is_os_volume"):
+        problems.append("OS volume field is not an OS volume")
+    if data_volume.get("is_os_volume"):
+        problems.append("data/model volume field points to an OS volume")
+    for label, volume in (("OS", os_volume), ("data/model", data_volume)):
+        status = str(volume.get("status") or "").lower()
+        location = str(volume.get("location") or "")
+        if status != "detached":
+            problems.append(f"{label} volume {volume.get('id')} is {status}, not detached")
+        if location != req.location:
+            problems.append(f"{label} volume {volume.get('id')} is in {location}, not {req.location}")
+    if problems:
+        raise RuntimeError("; ".join(problems))
+
+
+def _verda_gpu_count(instance_type: str) -> int:
+    match = re.match(r"^(\d+)", instance_type.upper())
+    return int(match.group(1)) if match else 1
+
+
+def _verda_gpu_rank(instance_type: str, preference: str = "single") -> tuple[int, int, str]:
+    """Rank FilmForge-friendly Verda GPU types for UI defaults."""
+
+    name = instance_type.upper()
+    if name.startswith("CPU"):
+        return (999, 999, name)
+
+    gpu_count = _verda_gpu_count(instance_type)
+
+    if "H200" in name:
+        family = 0
+    elif "B300" in name:
+        family = 1
+    elif "B200" in name:
+        family = 2
+    elif "H100" in name:
+        family = 3
+    elif "A100" in name:
+        family = 4
+    elif "RTXPRO6000" in name or "RTXPRO" in name:
+        family = 5
+    elif "L40S" in name:
+        family = 6
+    elif "A6000" in name:
+        family = 7
+    else:
+        family = 50
+
+    if preference == "sprint":
+        count_penalty = 0 if gpu_count >= 2 else 100
+        return (count_penalty + family, -gpu_count, name)
+    if preference == "four_plus":
+        count_penalty = 0 if gpu_count >= 4 else 100
+        return (count_penalty + family, -gpu_count, name)
+    if preference == "any":
+        return (family, -gpu_count, name)
+
+    count_penalty = 0 if gpu_count == 1 else 100
+    return (count_penalty + family, gpu_count, name)
+
+
+def _verda_instance_label(location: str, instance_type: str, price: dict | None = None) -> str:
+    gpu_count = _verda_gpu_count(instance_type)
+    if "H200" in instance_type.upper() and gpu_count == 1:
+        hint = "recommended"
+    elif gpu_count >= 4:
+        hint = f"{gpu_count} GPU sprint"
+    elif gpu_count > 1:
+        hint = f"{gpu_count} GPU"
+    else:
+        hint = "available"
+    parts = [location, instance_type, hint]
+    if price:
+        parts.append(_verda_price_label(price.get("price_per_hour"), price.get("spot_price")))
+    return " · ".join(parts)
+
+
+_SYSTEMD_UNIT_PATTERNS: dict[str, str] = {
+    "GPU Worker": r"^filmforge-worker-gpu[0-9]+\.service$",
+}
+
+
 def _remote_tail_script(paths: tuple[str, ...], label: str) -> str:
     quoted_paths = " ".join(shlex.quote(path) for path in paths)
     primary = shlex.quote(paths[0])
     quoted_label = shlex.quote(label)
+    systemd_pattern = _SYSTEMD_UNIT_PATTERNS.get(label)
+    systemd_branch = ""
+    if systemd_pattern:
+        quoted_pattern = shlex.quote(systemd_pattern)
+        systemd_branch = f"""if command -v systemctl >/dev/null 2>&1; then
+  units=$(systemctl list-units --type=service --no-legend 2>/dev/null \\
+          | awk '{{print $1}}' | grep -E {quoted_pattern} | sort -u || true)
+  if test -n "$units"; then
+    echo "[remote-log] tailing {quoted_label} systemd units: $(echo $units | tr '\\n' ' ')"
+    pids=""
+    for u in $units; do
+      tag=$(echo "$u" | grep -oE 'gpu[0-9]+')
+      journalctl -n 100 -f -u "$u" | awk -v t="[$tag]" '{{print t" "$0; fflush()}}' &
+      pids="$pids $!"
+    done
+    trap "kill $pids 2>/dev/null || true" EXIT INT TERM
+    wait
+    exit 0
+  fi
+fi
+"""
     return f"""set -euo pipefail
-paths=({quoted_paths})
+{systemd_branch}paths=({quoted_paths})
 found=""
 for path in "${{paths[@]}}"; do
   if test -e "$path"; then
@@ -241,6 +626,23 @@ tail -n 200 -F "$found"
 
 def _remote_comfy_script() -> str:
     return r"""set -euo pipefail
+if command -v systemctl >/dev/null 2>&1; then
+  units=$(systemctl list-units --type=service --no-legend 2>/dev/null \
+          | awk '{print $1}' | grep -E '^comfyui-gpu[0-9]+\.service$' | sort -u || true)
+  if test -n "$units"; then
+    echo "[comfy] tailing systemd units: $(echo $units | tr '\n' ' ')"
+    pids=""
+    for u in $units; do
+      tag=$(echo "$u" | grep -oE 'gpu[0-9]+')
+      journalctl -n 100 -f -u "$u" | awk -v t="[$tag]" '{print t" "$0; fflush()}' &
+      pids="$pids $!"
+    done
+    trap "kill $pids 2>/dev/null || true" EXIT INT TERM
+    wait
+    exit 0
+  fi
+fi
+
 candidates=(
   /tmp/comfyui.log
   /var/log/supervisor/comfyui.log
@@ -344,6 +746,99 @@ async def list_instances():
     return data if isinstance(data, list) else []
 
 
+@app.get("/api/verda/availability")
+async def verda_availability(preference: str = "single"):
+    if not VERDA_CLI.exists():
+        raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
+
+    options: list[dict] = []
+    errors: dict[str, str] = {}
+    prices = _verda_instance_type_prices()
+    for location in VERDA_AVAILABILITY_LOCATIONS:
+        try:
+            proc = subprocess.run(
+                [str(VERDA_CLI), "--agent", "availability", "--location", location],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+            if proc.returncode != 0:
+                errors[location] = (proc.stderr or proc.stdout).strip()
+                continue
+            payload = json.loads(proc.stdout or "[]")
+            rows = payload if isinstance(payload, list) else []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                loc = str(row.get("location_code") or location)
+                for instance_type in row.get("instance_types") or []:
+                    instance_type = str(instance_type)
+                    if instance_type.upper().startswith("CPU"):
+                        continue
+                    rank = _verda_gpu_rank(instance_type, preference)
+                    price = prices.get(instance_type) or {}
+                    options.append({
+                        "location": loc,
+                        "instance_type": instance_type,
+                        "label": _verda_instance_label(loc, instance_type, price),
+                        "rank": rank[0],
+                        "gpu_count": _verda_gpu_count(instance_type),
+                        "price_per_hour": price.get("price_per_hour"),
+                        "spot_price": price.get("spot_price"),
+                        "currency": price.get("currency") or "usd",
+                        "gpu_memory_gb": price.get("gpu_memory_gb"),
+                        "ram_gb": price.get("ram_gb"),
+                        "hardware_name": price.get("name") or "",
+                    })
+        except Exception as exc:
+            errors[location] = str(exc)
+
+    dedup: dict[tuple[str, str], dict] = {}
+    for option in options:
+        dedup[(option["location"], option["instance_type"])] = option
+    ranked = sorted(dedup.values(), key=lambda item: (
+        _verda_gpu_rank(item["instance_type"], preference),
+        item["location"],
+        item["instance_type"],
+    ))
+    return {"items": ranked[:5], "all_items": ranked, "errors": errors}
+
+
+@app.get("/api/verda/cost-estimate")
+async def verda_cost_estimate(
+    instance_type: str,
+    location: str = "FIN-01",
+    os_volume_gb: int = 0,
+    storage_gb: int = 0,
+    storage_type: str = "NVMe",
+    contract: str = "pay_as_go",
+):
+    if not VERDA_CLI.exists():
+        raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
+
+    command = [
+        str(VERDA_CLI), "--agent", "cost", "estimate",
+        "--type", instance_type,
+        "--location", location,
+        "-o", "json",
+    ]
+    if os_volume_gb > 0:
+        command.extend(["--os-volume", str(os_volume_gb)])
+    if storage_gb > 0:
+        command.extend(["--storage", str(storage_gb), "--storage-type", storage_type or "NVMe"])
+    if contract == "spot":
+        command.append("--spot")
+    proc = subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
+    if proc.returncode != 0:
+        raise HTTPException(502, (proc.stderr or proc.stdout or "Verda cost estimate failed").strip())
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(502, f"Verda returned non-JSON cost estimate: {proc.stdout[:300]}") from exc
+    return payload
+
+
 @app.get("/api/templates")
 async def list_templates(q: str = "comfy"):
     return _vast_templates(q)
@@ -395,6 +890,135 @@ async def destroy_instance(instance_id: str):
     return {"ok": r.returncode == 0, "output": (r.stdout + r.stderr).strip()}
 
 
+@app.get("/api/runpod/pods")
+async def list_runpod_pods():
+    import asyncio, traceback
+    rp = _runpod_client()
+    if rp is None:
+        print("[runpod] _runpod_client() returned None (no API key or import failed)")
+        return []
+    try:
+        loop = asyncio.get_event_loop()
+        pods = await loop.run_in_executor(None, rp.get_pods)
+        return [
+            _normalize_runpod_pod(p)
+            for p in (pods or [])
+            if _is_filmforge_pod(p)
+        ]
+    except Exception:
+        print(f"[runpod] list_runpod_pods error:\n{traceback.format_exc()}")
+        return []
+
+
+@app.post("/api/runpod/pods/{pod_id}/resume")
+async def resume_runpod_pod(pod_id: str):
+    rp = _runpod_client()
+    if rp is None:
+        raise HTTPException(503, "RUNPOD_API_KEY not configured")
+    try:
+        loop = asyncio.get_event_loop()
+        pods = await loop.run_in_executor(None, rp.get_pods)
+        pod = next((p for p in (pods or []) if p.get("id") == pod_id), None)
+        gpu_count = int((pod or {}).get("gpuCount") or 1)
+        await loop.run_in_executor(None, rp.resume_pod, pod_id, gpu_count)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "output": str(exc)}
+
+
+@app.post("/api/runpod/pods/{pod_id}/stop")
+async def stop_runpod_pod(pod_id: str):
+    rp = _runpod_client()
+    if rp is None:
+        raise HTTPException(503, "RUNPOD_API_KEY not configured")
+    try:
+        rp.stop_pod(pod_id)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "output": str(exc)}
+
+
+@app.delete("/api/runpod/pods/{pod_id}")
+async def terminate_runpod_pod(pod_id: str):
+    rp = _runpod_client()
+    if rp is None:
+        raise HTTPException(503, "RUNPOD_API_KEY not configured")
+    try:
+        rp.terminate_pod(pod_id)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "output": str(exc)}
+
+
+@app.post("/api/provision-runpod")
+async def start_runpod_provision(req: RunPodProvisionRequest):
+    job_id = str(uuid.uuid4())
+    q: queue.Queue[str | None] = queue.Queue()
+    _jobs[job_id] = {"status": "running", "logs": [], "queue": q, "worker_url": None, "ssh_command": None}
+
+    def _run() -> None:
+        job = _jobs[job_id]
+        try:
+            from gpu_worker.deploy_gpu import extract_worker_url
+            runpod_python = _find_runpod_python()
+            command = [
+                runpod_python, "-u", str(SCRIPT_DIR / "deploy_gpu.py"),
+                "--runpod",
+                "--worker-port", str(req.worker_port),
+                "--remote-root", req.remote_root,
+                "--runpod-volume-gb", str(req.volume_gb),
+                "--runpod-container-disk-gb", str(req.container_disk_gb),
+                "--runpod-cloud-type", req.cloud_type,
+                "--skip-warmup",
+                "--update-backend-env",
+            ]
+            if req.gpu_type:
+                command.extend(["--gpu", req.gpu_type])
+            if req.pod_id:
+                command.extend(["--pod-id", req.pod_id])
+            for key, value in req.env_vars.items():
+                if key and value:
+                    command.extend(["--env", f"{key}={value}"])
+
+            _put(job, "[runpod] Finding or creating pod, deploying worker…")
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            assert proc.stdout is not None
+            output_lines: list[str] = []
+            for line in proc.stdout:
+                line = line.rstrip()
+                output_lines.append(line)
+                _put(job, line)
+            proc.wait()
+            output_text = "\n".join(output_lines)
+
+            worker_url = extract_worker_url(output_text)
+            if not worker_url:
+                m = _RUNPOD_PROXY_PATTERN.search(output_text)
+                if m:
+                    worker_url = m.group(0)
+            job["worker_url"] = worker_url or None
+
+            if proc.returncode == 0:
+                job["status"] = "done"
+                if worker_url:
+                    _put(job, f"[runpod] Worker URL: {worker_url}")
+                _put(job, "[runpod] Provision complete")
+            else:
+                job["status"] = "failed"
+                _put(job, f"[runpod] Provision failed (exit {proc.returncode})")
+        except Exception as exc:
+            _put(job, f"[runpod] ERROR: {exc}")
+            job["status"] = "failed"
+        finally:
+            job["queue"].put(None)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"job_id": job_id}
+
+
 @app.get("/api/workers")
 async def list_workers():
     try:
@@ -416,36 +1040,52 @@ async def start_deploy(req: DeployRequest):
         try:
             from gpu_worker.deploy_gpu import (
                 parse_ssh_command, add_default_identity, add_default_host_key_policy,
-                stage_worker_tree, remote_script, extract_worker_url,
-                SCRIPT_DIR as GPU_SCRIPT_DIR,
+                remote_script, extract_worker_url,
             )
             _put(job, "[deploy] Parsing SSH command...")
             try:
-                ssh_cmd, scp_cmd, destination = parse_ssh_command(req.ssh_command)
+                ssh_cmd, _scp_cmd, destination = parse_ssh_command(req.ssh_command)
             except ValueError as exc:
                 _put(job, f"[deploy] ERROR: {exc}")
                 job["status"] = "failed"
                 return
 
             ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
-            scp_cmd = add_default_host_key_policy(add_default_identity(scp_cmd))
             _put(job, f"[deploy] Waiting for SSH on {destination}…")
             if not _wait_for_ssh_ready(ssh_cmd, job, timeout=180):
                 _put(job, "[deploy] ERROR: timed out waiting for SSH to become ready")
                 job["status"] = "failed"
                 return
-            _put(job, "[deploy] SSH ready — copying worker files…")
+            _put(job, "[deploy] SSH ready — cloning gpu_worker from GitHub…")
+            clone_script = f"""set -euo pipefail
+REMOTE_ROOT={shlex.quote(req.remote_root)}
+mkdir -p "$REMOTE_ROOT"
+if ! command -v git >/dev/null 2>&1; then
+  apt-get update -qq 2>/dev/null || true
+  apt-get install -y -qq git 2>/dev/null || true
+fi
+cd "$REMOTE_ROOT"
+if test -d gpu_worker/.git; then
+  echo "[deploy] Updating existing gpu_worker clone..."
+  cd gpu_worker && git pull origin main && cd ..
+else
+  rm -rf gpu_worker
+  echo "[deploy] Cloning gpu_worker from GitHub..."
+  GIT_TERMINAL_PROMPT=0 git clone https://github.com/taxydriver/gpu_worker.git gpu_worker
+fi
+"""
             try:
-                subprocess.run([*ssh_cmd, "mkdir", "-p", req.remote_root], check=True, capture_output=True)
-                subprocess.run([*ssh_cmd, "rm", "-rf", f"{req.remote_root.rstrip('/')}/{GPU_SCRIPT_DIR.name}"],
-                               check=True, capture_output=True)
-                with stage_worker_tree(GPU_SCRIPT_DIR) as staged_dir:
-                    staged = Path(staged_dir) / GPU_SCRIPT_DIR.name
-                    subprocess.run([*scp_cmd, "-r", str(staged), f"{destination}:{req.remote_root}/"],
-                                   check=True, capture_output=True)
+                proc = subprocess.run(
+                    [*ssh_cmd, "bash", "-s"],
+                    input=clone_script, capture_output=True, text=True,
+                )
+                for line in (proc.stdout + proc.stderr).splitlines():
+                    if line.strip():
+                        _put(job, line)
+                if proc.returncode != 0:
+                    raise subprocess.CalledProcessError(proc.returncode, ssh_cmd)
             except subprocess.CalledProcessError as exc:
-                stderr = getattr(exc, "stderr", "") or ""
-                _put(job, f"[deploy] ERROR copying files: {stderr or exc}")
+                _put(job, f"[deploy] ERROR cloning from GitHub: {exc}")
                 job["status"] = "failed"
                 return
 
@@ -552,7 +1192,7 @@ async def start_vast_provision(req: AutoProvisionRequest):
             proc.wait()
             output_text = "\n".join(output_lines)
             job["worker_url"] = extract_worker_url(output_text) or None
-            job["ssh_command"] = _extract_ssh_command(output_text) or None
+            job["ssh_command"] = _extract_ssh_command(output_text) or _last_ssh_command() or None
 
             if proc.returncode == 0:
                 job["status"] = "done"
@@ -562,6 +1202,126 @@ async def start_vast_provision(req: AutoProvisionRequest):
                 _put(job, f"[vast] Provision failed (exit {proc.returncode})")
         except Exception as exc:
             _put(job, f"[vast] ERROR: {exc}")
+            job["status"] = "failed"
+        finally:
+            job["queue"].put(None)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.post("/api/provision-verda")
+async def start_verda_provision(req: VerdaProvisionRequest):
+    if not req.fresh:
+        try:
+            _verda_validate_existing_volumes(req)
+        except RuntimeError as exc:
+            raise HTTPException(400, f"Existing-volume deploy blocked: {exc}") from exc
+
+    job_id = str(uuid.uuid4())
+    q: queue.Queue[str | None] = queue.Queue()
+    _jobs[job_id] = {
+        "status": "running",
+        "logs": [],
+        "queue": q,
+        "worker_url": None,
+        "worker_urls": [],
+        "ssh_command": None,
+    }
+
+    def _run() -> None:
+        job = _jobs[job_id]
+        try:
+            from gpu_worker.deploy_gpu import extract_worker_url, extract_worker_urls
+
+            command = [
+                sys.executable, "-u", str(SCRIPT_DIR / "deploy_gpu.py"),
+                "--verda-fresh" if req.fresh else "--verda",
+                "--verda-location", req.location,
+                "--verda-instance-type", req.instance_type,
+                "--verda-contract", req.contract,
+                "--verda-ssh-key-id", req.ssh_key_id,
+                "--verda-hostname", req.hostname,
+                "--verda-worker-count", str(req.worker_count),
+                "--verda-comfy-port", str(req.comfy_port),
+                "--worker-port", str(req.worker_port),
+                "--remote-root", req.remote_root,
+            ]
+            if req.fresh:
+                command.extend([
+                    "--verda-fresh-os-volume-size", str(req.fresh_os_volume_size),
+                    "--verda-fresh-storage-size", str(req.fresh_storage_size),
+                ])
+                if req.fresh_os_volume_name:
+                    command.extend(["--verda-fresh-os-volume-name", req.fresh_os_volume_name])
+                if req.fresh_storage_name:
+                    command.extend(["--verda-fresh-storage-name", req.fresh_storage_name])
+                for asset_group in req.warm_asset_groups:
+                    if asset_group:
+                        command.extend(["--warm-asset-group", asset_group])
+            else:
+                command.extend([
+                    "--verda-os-volume-id", req.os_volume_id,
+                    "--verda-data-volume-id", req.data_volume_id,
+                ])
+            if req.skip_warmup:
+                command.append("--skip-warmup")
+
+            env_vars = dict(req.env_vars or {})
+            env_vars.setdefault("WORKER_PROVIDER", "verda")
+            for key, value in env_vars.items():
+                if key and value:
+                    command.extend(["--env", f"{key}={value}"])
+
+            _put(
+                job,
+                (
+                    f"[verda] Fresh install: creating {req.instance_type} in {req.location} "
+                    f"with {req.fresh_storage_size}GB model storage ({req.contract})…"
+                    if req.fresh
+                    else f"[verda] Creating {req.instance_type} in {req.location} from OS volume "
+                    f"{req.os_volume_id} with data volume {req.data_volume_id} ({req.contract})…"
+                ),
+            )
+            proc = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+            assert proc.stdout is not None
+            output_lines: list[str] = []
+            for line in proc.stdout:
+                line = line.rstrip()
+                output_lines.append(line)
+                _put(job, line)
+            proc.wait()
+
+            output_text = "\n".join(output_lines)
+            worker_urls = extract_worker_urls(output_text)
+            if not worker_urls:
+                for line in output_text.splitlines():
+                    if line.startswith("WORKER_URLS="):
+                        worker_urls = [
+                            url.strip()
+                            for url in line.split("=", 1)[1].split(",")
+                            if url.strip()
+                        ]
+                        break
+            worker_url = worker_urls[0] if worker_urls else (extract_worker_url(output_text) or None)
+
+            job["worker_urls"] = worker_urls
+            job["worker_url"] = worker_url
+            job["ssh_command"] = _extract_ssh_command(output_text) or _last_ssh_command() or None
+
+            if proc.returncode == 0:
+                job["status"] = "done"
+                if worker_urls:
+                    _put(job, f"[verda] Worker URLs: {', '.join(worker_urls)}")
+                _put(job, "[verda] Provision complete")
+            else:
+                job["status"] = "failed"
+                _put(job, f"[verda] Provision failed (exit {proc.returncode})")
+        except Exception as exc:
+            _put(job, f"[verda] ERROR: {exc}")
             job["status"] = "failed"
         finally:
             job["queue"].put(None)
@@ -604,7 +1364,12 @@ async def deploy_status(job_id: str):
     if job_id not in _jobs:
         raise HTTPException(404)
     j = _jobs[job_id]
-    return {"status": j["status"], "worker_url": j.get("worker_url"), "ssh_command": j.get("ssh_command")}
+    return {
+        "status": j["status"],
+        "worker_url": j.get("worker_url"),
+        "worker_urls": j.get("worker_urls") or [],
+        "ssh_command": j.get("ssh_command"),
+    }
 
 
 @app.get("/api/remote-logs/{source}/stream")
@@ -668,6 +1433,171 @@ async def stream_remote_log(source: str, ssh: str | None = None):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.get("/api/remote-summary")
+async def remote_summary(ssh: str):
+    try:
+        from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
+        ssh_cmd, _, _ = parse_ssh_command(ssh)
+        ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
+        ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", *ssh_cmd[1:]]
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
+
+    script = r"""set -euo pipefail
+if ! command -v systemctl >/dev/null 2>&1; then
+  exit 0
+fi
+units=$(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 2>/dev/null \
+        | awk '{print $1}' | sort -V || true)
+for unit in $units; do
+  catout=$(systemctl cat "$unit" 2>/dev/null || true)
+  active=$(systemctl is-active "$unit" 2>/dev/null || true)
+  url=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PUBLIC_URL=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+  port=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PORT=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+  name=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_NAME=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+  if test -n "$url"; then
+    printf 'WORKER_URL\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$url" "$name"
+  elif test -n "$port"; then
+    printf 'WORKER_PORT\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$port" "$name"
+  fi
+done
+download=$(journalctl -u 'filmforge-worker-gpu*.service' -n 300 --no-pager 2>/dev/null \
+  | grep -E 'Downloading asset progress:|Download complete:|Downloading asset:' \
+  | tail -n 1 || true)
+if test -n "$download"; then
+  printf 'DOWNLOAD\t%s\n' "$download"
+fi
+"""
+    proc = subprocess.run(
+        [*ssh_cmd, "bash", "-s"],
+        input=script,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise HTTPException(502, (proc.stderr or proc.stdout or "Remote summary failed").strip())
+
+    worker_urls: list[dict] = []
+    download_line = ""
+    for line in proc.stdout.splitlines():
+        if line.startswith("WORKER_URL\t"):
+            _kind, unit, active, url, name = (line.split("\t", 4) + ["", "", "", "", ""])[:5]
+            worker_urls.append({"unit": unit, "active": active, "url": url, "name": name})
+        elif line.startswith("WORKER_PORT\t"):
+            _kind, unit, active, port, name = (line.split("\t", 4) + ["", "", "", "", ""])[:5]
+            worker_urls.append({"unit": unit, "active": active, "port": port, "name": name})
+        elif line.startswith("DOWNLOAD\t"):
+            download_line = line.split("\t", 1)[1]
+    return {"worker_urls": worker_urls, "download_line": download_line}
+
+
+@app.get("/api/verda/hosts")
+async def list_verda_hosts():
+    return _load_verda_hosts()
+
+
+@app.get("/api/verda/volumes")
+async def list_verda_volumes():
+    if not VERDA_CLI.exists():
+        raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
+    try:
+        return _verda_list_volumes()
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.get("/api/verda/vms")
+async def list_verda_vms():
+    if not VERDA_CLI.exists():
+        raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
+    try:
+        return _verda_list_vms()
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+
+@app.post("/api/verda/hosts")
+async def add_verda_host(req: VerdaHostRequest):
+    name = req.name.strip()
+    ssh = _normalize_ssh_command(req.ssh_command)
+    if not name or not ssh:
+        raise HTTPException(400, "name and ssh_command are required")
+    hosts = _load_verda_hosts()
+    hosts = [h for h in hosts if h["name"] != name]
+    hosts.append({"name": name, "ssh_command": ssh})
+    _save_verda_hosts(hosts)
+    return {"name": name, "ssh_command": ssh}
+
+
+@app.delete("/api/verda/hosts/{name}")
+async def remove_verda_host(name: str):
+    hosts = _load_verda_hosts()
+    remaining = [h for h in hosts if h["name"] != name]
+    if len(remaining) == len(hosts):
+        raise HTTPException(404, f"No Verda host named {name!r}")
+    _save_verda_hosts(remaining)
+    return {"ok": True}
+
+
+@app.post("/api/verda/teardown")
+async def teardown_verda(req: VerdaTeardownRequest):
+    if not VERDA_CLI.exists():
+        raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
+    try:
+        vm = _verda_find_vm_for_teardown(req)
+        instance_id = str(vm.get("id") or "")
+        volume_ids = [str(v) for v in (vm.get("volume_ids") or []) if v]
+        command = [str(VERDA_CLI), "--agent", "vm", "delete", instance_id, "--yes", "--wait"]
+        if req.delete_volumes:
+            command.append("--with-volumes")
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=360, check=False)
+        output = (proc.stdout + proc.stderr).strip()
+        if proc.returncode != 0:
+            raise RuntimeError(output or f"verda vm delete exited with {proc.returncode}")
+
+        remaining_volumes = _verda_list_volumes()
+        remaining_by_id = {
+            str(v.get("id")): v for v in remaining_volumes if isinstance(v, dict) and v.get("id")
+        }
+        trash_proc = subprocess.run(
+            [str(VERDA_CLI), "--agent", "volume", "trash"],
+            capture_output=True,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        trash: list[dict] = []
+        if trash_proc.returncode == 0:
+            try:
+                payload = json.loads(trash_proc.stdout or "[]")
+                trash = payload if isinstance(payload, list) else []
+            except json.JSONDecodeError:
+                trash = []
+        trashed_ids = {
+            str(v.get("id")) for v in trash if isinstance(v, dict) and v.get("id")
+        }
+        preserved = [remaining_by_id[vol_id] for vol_id in volume_ids if vol_id in remaining_by_id]
+        deleted_or_trashed = [vol_id for vol_id in volume_ids if vol_id not in remaining_by_id or vol_id in trashed_ids]
+
+        if req.name:
+            hosts = [h for h in _load_verda_hosts() if h.get("name") != req.name]
+            _save_verda_hosts(hosts)
+
+        return {
+            "ok": True,
+            "instance_id": instance_id,
+            "delete_volumes": req.delete_volumes,
+            "volume_ids": volume_ids,
+            "preserved_volumes": preserved,
+            "deleted_or_trashed_volume_ids": deleted_or_trashed,
+            "output": output,
+        }
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
@@ -705,9 +1635,10 @@ header h1{font-size:15px;font-weight:600;color:#a78bfa}
 .btn-full{width:100%}
 
 /* Instance cards */
-.inst-card{background:#13161f;border:1px solid #252a38;border-radius:8px;padding:12px 14px;margin-bottom:8px;transition:border-color .15s}
+.inst-card{background:#13161f;border:1px solid #252a38;border-radius:8px;padding:12px 14px;margin-bottom:8px;transition:border-color .15s;cursor:pointer}
 .inst-card:last-child{margin-bottom:0}
 .inst-card:hover{border-color:#3d4461}
+.inst-card.selected{border-color:#7c3aed;background:#16102a}
 .inst-top{display:flex;align-items:center;gap:8px;margin-bottom:5px}
 .inst-id{font-family:monospace;font-size:11px;color:#475569}
 .inst-gpu{font-size:13px;font-weight:600;color:#e2e8f0;flex:1}
@@ -769,8 +1700,12 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 #sbar.done{background:#0d2b1e;color:#6ee7b7;display:inline-block}
 #sbar.failed{background:#2d1010;color:#fca5a5;display:inline-block}
 #log{flex:1;overflow-y:auto;padding:12px 16px;font-family:'Courier New',monospace;font-size:11.5px;line-height:1.7;background:#080b14;min-height:0}
-.ll{color:#3d4461}
-.ll.info{color:#60a5fa}.ll.ok{color:#475569}.ll.signal{color:#34d399}.ll.err{color:#f87171}.ll.warn{color:#fbbf24}
+.ll{color:#e2e8f0}
+.ll.info{color:#93c5fd}.ll.ok{color:#94a3b8}.ll.signal{color:#6ee7b7}.ll.err{color:#fca5a5}.ll.warn{color:#fde68a}
+.ll.gpu0{border-left:2px solid #60a5fa;padding-left:6px}
+.ll.gpu1{border-left:2px solid #f472b6;padding-left:6px}
+.ll.gpu2{border-left:2px solid #fbbf24;padding-left:6px}
+.ll.gpu3{border-left:2px solid #34d399;padding-left:6px}
 
 /* Workers */
 .workers-pane{flex-shrink:0;border-top:1px solid #2d3148;max-height:200px;overflow-y:auto}
@@ -779,6 +1714,19 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 .wrow:last-child{border-bottom:none}
 .wname{font-size:12px;color:#e2e8f0;font-weight:500}
 .wurl{font-size:10px;color:#3d4461;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
+
+/* Instance header */
+.inst-header{padding:10px 16px;border-bottom:1px solid #2d3148;flex-shrink:0;background:#0f1117}
+.inst-header-info{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.inst-header-name{font-size:13px;font-weight:600;color:#e2e8f0}
+.inst-header-meta{font-size:11px;color:#475569;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px}
+.inst-tools{margin-top:9px;display:grid;gap:6px}
+.url-row{display:grid;grid-template-columns:1fr auto;gap:6px;align-items:center}
+.url-pill{font-size:11px;color:#cbd5e1;background:#080b14;border:1px solid #1e2130;border-radius:5px;padding:6px 8px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.copy-btn{border:1px solid #2d3148;background:#171a24;color:#94a3b8;border-radius:5px;font-size:10px;padding:6px 8px;cursor:pointer}
+.copy-btn:hover{color:#e2e8f0;border-color:#475569}
+.dl-status{font-size:11px;color:#6ee7b7;background:#071512;border:1px solid #12372e;border-radius:5px;padding:6px 8px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.empty-tools{font-size:11px;color:#475569}
 
 .muted{color:#3d4461}.text-xs{font-size:11px}
 .flex{display:flex}.gap6{gap:6px}.gap8{gap:8px}.items-center{align-items:center}.flex1{flex:1}
@@ -805,10 +1753,125 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       <div id="instances-out"><span class="muted text-xs">Loading…</span></div>
     </div>
 
-    <!-- Create & Deploy -->
+    <!-- RunPod Pods -->
+    <div class="sec">
+      <div class="sec-hdr">
+        <span class="sec-title">RunPod Pods</span>
+        <button class="btn btn-ghost btn-xs" onclick="loadRunpodPods()">↻ Refresh</button>
+      </div>
+      <div id="runpod-out"><span class="muted text-xs">Loading…</span></div>
+    </div>
+
+    <!-- Verda Hosts -->
+    <div class="sec">
+      <div class="sec-hdr">
+        <span class="sec-title">Verda Hosts</span>
+        <button class="btn btn-ghost btn-xs" onclick="loadVerdaHosts()">↻ Refresh</button>
+      </div>
+      <div id="verda-out"><span class="muted text-xs">Loading…</span></div>
+      <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #2d3148">
+        <div class="fg" style="margin-bottom:6px"><label>Name</label><input id="verda-name" placeholder="filmforge-2a100-worker"></div>
+        <div class="fg" style="margin-bottom:8px"><label>SSH</label><input id="verda-ssh" placeholder="ssh root@135.181.8.209"></div>
+        <button class="btn btn-ghost btn-xs btn-full" onclick="addVerdaHost()">+ Add Verda host</button>
+      </div>
+    </div>
+
+    <!-- Create & Deploy (Verda) -->
     <div class="sec">
       <div class="sec-hdr mb0">
-        <span class="sec-title mb0">Create &amp; Deploy</span>
+        <span class="sec-title mb0">Create &amp; Deploy (Verda)</span>
+      </div>
+      <div class="fg">
+        <label>Mode</label>
+        <select id="v-mode" onchange="updateVerdaMode()">
+          <option value="existing">Existing volumes</option>
+          <option value="fresh">Fresh install + model download</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>GPU Preference</label>
+        <select id="v-gpu-preference" onchange="loadVerdaAvailability()">
+          <option value="single">Best single GPU</option>
+          <option value="sprint">Multi-GPU sprint</option>
+          <option value="four_plus">4+ GPU sprint</option>
+          <option value="any">Any GPU</option>
+        </select>
+      </div>
+      <div class="grid2" style="margin-bottom:10px">
+        <div class="fg" style="margin-bottom:0">
+          <label>Contract</label>
+          <select id="v-contract" onchange="refreshVerdaCostEstimate()">
+            <option value="pay_as_go">On-demand</option>
+            <option value="spot">Spot</option>
+          </select>
+        </div>
+        <div class="fg" style="margin-bottom:0">
+          <label>GPU Options</label>
+          <select id="v-option-limit" onchange="loadVerdaAvailability()">
+            <option value="5">Top 5</option>
+            <option value="10">Top 10</option>
+            <option value="all">All available</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid2" style="margin-bottom:10px">
+        <div class="fg" style="margin-bottom:0">
+          <label>Location</label>
+          <input id="v-location" value="FIN-01">
+        </div>
+        <div class="fg" style="margin-bottom:0">
+          <label>Instance Type</label>
+          <select id="v-instance-select" onchange="applyVerdaSelection()">
+            <option value="FIN-01|2A100.44V">FIN-01 · 2A100.44V · fallback</option>
+          </select>
+          <input id="v-instance-type" value="2A100.44V" style="margin-top:6px">
+        </div>
+      </div>
+      <div class="flex gap6 items-center" style="margin-bottom:10px">
+        <button class="btn btn-ghost btn-xs" onclick="loadVerdaAvailability()">Refresh GPUs</button>
+        <span id="v-availability-status" class="muted text-xs">Top Verda GPUs</span>
+      </div>
+      <div id="v-cost-estimate" class="muted text-xs" style="margin:-2px 0 10px 0">Cost estimate pending.</div>
+      <div id="v-existing-fields">
+        <div class="fg"><label>OS Volume</label><input id="v-os-volume" placeholder="Detached OS volume ID" onchange="validateVerdaExistingVolumes()"></div>
+        <div class="fg"><label>Data Volume</label><input id="v-data-volume" placeholder="Detached model/data volume ID" onchange="validateVerdaExistingVolumes()"></div>
+        <div class="flex gap6 items-center" style="margin-bottom:10px">
+          <button class="btn btn-ghost btn-xs" onclick="loadVerdaVolumes()">Refresh Volumes</button>
+          <span id="v-volume-status" class="muted text-xs">Volume status pending.</span>
+        </div>
+      </div>
+      <div id="v-fresh-fields" style="display:none">
+        <div class="grid2">
+          <div class="fg"><label>OS GB</label><input id="v-fresh-os-size" type="number" value="100" min="50" onchange="refreshVerdaCostEstimate()"></div>
+          <div class="fg"><label>Storage GB</label><input id="v-fresh-storage-size" type="number" value="250" min="100" onchange="refreshVerdaCostEstimate()"></div>
+        </div>
+        <div class="fg"><label>Preload Models</label>
+          <select id="v-fresh-warm">
+            <option value="flux_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + WAN + Audio</option>
+            <option value="flux_stills_v1,wan_i2v_v1">Flux + WAN</option>
+            <option value="flux_stills_v1">Flux only</option>
+            <option value="">Skip model preload</option>
+          </select>
+        </div>
+      </div>
+      <button class="adv-toggle" onclick="toggleVerdaAdv()">▶ Advanced options</button>
+      <div id="v-adv-body" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #1e2130">
+        <div class="fg"><label>Hostname</label><input id="v-hostname" value="filmforge-verda-worker"></div>
+        <div class="fg"><label>SSH Key ID</label><input id="v-ssh-key" value="11ee08a4-858a-4ee7-98c8-250aad99eb37"></div>
+        <div class="grid2">
+          <div class="fg"><label>Workers</label><input id="v-worker-count" type="number" value="0" min="0"></div>
+          <div class="fg"><label>Comfy Port</label><input id="v-comfy-port" type="number" value="8188"></div>
+        </div>
+      </div>
+      <button class="btn btn-success btn-full" id="verda-provision-btn" onclick="quickDeployVerda()" style="margin-top:8px">
+        ⚡ Create &amp; Deploy (Verda)
+      </button>
+    </div>
+
+    <!-- Create & Deploy (Vast) -->
+    <div class="sec">
+      <div class="sec-hdr mb0">
+        <span class="sec-title mb0">Create &amp; Deploy (Vast)</span>
       </div>
       <div class="grid2" style="margin-bottom:10px">
         <div class="fg" style="margin-bottom:0">
@@ -846,6 +1909,44 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       </div>
     </div>
 
+    <!-- Create & Deploy (RunPod) -->
+    <div class="sec">
+      <div class="sec-hdr mb0">
+        <span class="sec-title mb0">Create &amp; Deploy (RunPod)</span>
+      </div>
+      <div class="fg" style="margin-bottom:10px">
+        <label>GPU Type</label>
+        <select id="rp-gpu">
+          <option value="NVIDIA L40S">L40S</option>
+          <option value="NVIDIA A100-SXM4-80GB">A100 SXM 80GB</option>
+          <option value="NVIDIA A100 80GB PCIe">A100 PCIe 80GB</option>
+          <option value="NVIDIA H100 80GB HBM3">H100 SXM</option>
+          <option value="NVIDIA H100 PCIe">H100 PCIe</option>
+          <option value="NVIDIA GeForce RTX 4090">RTX 4090</option>
+          <option value="NVIDIA GeForce RTX 5090">RTX 5090</option>
+          <option value="NVIDIA RTX 6000 Ada Generation">RTX 6000 Ada</option>
+          <option value="NVIDIA RTX A6000">RTX A6000</option>
+        </select>
+      </div>
+      <button class="adv-toggle" onclick="toggleRpAdv()">▶ Advanced options</button>
+      <div id="rp-adv-body" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid #1e2130">
+        <div class="fg">
+          <label>Cloud Type</label>
+          <select id="rp-cloud">
+            <option value="COMMUNITY">Community (cheaper, more available)</option>
+            <option value="SECURE">Secure (dedicated, higher cost)</option>
+          </select>
+        </div>
+        <div class="grid2">
+          <div class="fg"><label>Volume (GB)</label><input id="rp-volume" type="number" value="150"></div>
+          <div class="fg"><label>Container Disk (GB)</label><input id="rp-cdisk" type="number" value="50"></div>
+        </div>
+      </div>
+      <button class="btn btn-success btn-full" id="runpod-provision-btn" onclick="quickDeployRunpod()" style="margin-top:8px">
+        ⚡ Create &amp; Deploy (RunPod)
+      </button>
+    </div>
+
     <!-- Env Vars (collapsible) -->
     <button class="collapse-btn" id="env-toggle" onclick="toggleEnv()">
       <i class="carrow">▶</i> Env Vars &amp; Settings
@@ -866,6 +1967,11 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 
   <!-- ── RIGHT PANEL ───────────────────────────────────────────────────── -->
   <div class="right">
+
+    <!-- Selected instance header -->
+    <div id="inst-header" class="inst-header">
+      <span class="muted text-xs">← Select an instance from the left panel</span>
+    </div>
 
     <!-- Log -->
     <div class="log-area">
@@ -898,18 +2004,115 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 
 <script>
 // ── State ─────────────────────────────────────────────────────────────────────
-const deployEvtSrcs = new Map();
-const deploySshCommands = new Map();  // Map src → SSH command for context-aware logs
-let deployTabCount = 0;
+const instData = {};   // instData[instId] = { ssh, logBuffers, evtSrc, status, workerUrl, workerUrls }
+let selectedInstId = null;
 let currentLogSrc = 'deploy';
-let currentDeploySrc = 'deploy';  // Currently active deployment tab for remote logs
-const logBuffers = { deploy: [] };
+let remoteEvt = null;
 const MAX_LOG_LINES = 2000;
 
 const LOG_LABELS = {
   deploy: 'Deploy', downloads: 'Downloads',
   worker: 'GPU Worker', comfy: 'ComfyUI', tunnel: 'Tunnel',
 };
+let verdaVolumes = [];
+
+// ── Per-instance data ─────────────────────────────────────────────────────────
+function getInstData(id) {
+  if (!instData[id]) {
+    instData[id] = {
+      ssh: '',
+      logBuffers: { deploy: [], downloads: [], worker: [], comfy: [], tunnel: [] },
+      evtSrc: null,
+      status: null,
+      workerUrl: null,
+      workerUrls: [],
+      downloadStatus: null,
+      summaryLoaded: false,
+    };
+  }
+  return instData[id];
+}
+
+// ── Instance selection ────────────────────────────────────────────────────────
+function selectInstance(id, ssh) {
+  selectedInstId = String(id);
+  const idata = getInstData(selectedInstId);
+  if (ssh) idata.ssh = ssh;
+  document.querySelectorAll('.inst-card').forEach(c => {
+    c.classList.toggle('selected', c.dataset.id === selectedInstId);
+  });
+  updateInstHeader();
+  renderLog(currentLogSrc);
+  refreshSelectedInstanceSummary();
+  if (currentLogSrc !== 'deploy') reconnectRemoteLog(currentLogSrc);
+}
+
+function updateInstHeader() {
+  const el = document.getElementById('inst-header');
+  if (!selectedInstId) {
+    el.innerHTML = '<span class="muted text-xs">← Select an instance from the left panel</span>';
+    return;
+  }
+  const idata = getInstData(selectedInstId);
+  const statusHtml = idata.status
+    ? `<span class="badge ${idata.status === 'done' ? 'b-running' : 'b-exited'}" style="font-size:10px"><span class="dot"></span>${esc(idata.status)}</span>`
+    : '';
+  const urls = normalizedWorkerUrls(idata);
+  const urlHtml = urls.length
+    ? `<div class="inst-tools">
+        <div class="empty-tools">Worker URLs</div>
+        ${urls.map((url, idx) => `<div class="url-row">
+          <div class="url-pill" title="${esc(url)}">${esc(url)}</div>
+          <button class="copy-btn" onclick='copyText(${JSON.stringify(url)}, this)'>Copy</button>
+        </div>`).join('')}
+      </div>`
+    : `<div class="inst-tools"><span class="empty-tools">No worker URL captured yet.</span></div>`;
+  const downloadHtml = idata.downloadStatus
+    ? `<div class="dl-status" title="${esc(idata.downloadStatus.detail)}">${esc(idata.downloadStatus.detail)}</div>`
+    : '';
+  el.innerHTML = `<div class="inst-header-info">
+    <span class="inst-header-name">Instance #${esc(selectedInstId)}</span>
+    ${idata.ssh ? `<span class="inst-header-meta">${esc(idata.ssh)}</span>` : ''}
+    ${statusHtml}
+  </div>
+  ${urlHtml}
+  ${downloadHtml}`;
+}
+
+function normalizedWorkerUrls(idata) {
+  const urls = [];
+  for (const url of idata.workerUrls || []) {
+    if (url && !urls.includes(url)) urls.push(url);
+  }
+  if (idata.workerUrl && !urls.includes(idata.workerUrl)) urls.push(idata.workerUrl);
+  return urls;
+}
+
+async function refreshSelectedInstanceSummary(force = false) {
+  if (!selectedInstId) return;
+  const capturedInstId = selectedInstId;
+  const idata = getInstData(capturedInstId);
+  if (!idata.ssh || (idata.summaryLoaded && !force)) return;
+  idata.summaryLoaded = true;
+  try {
+    const summary = await fetch(`/api/remote-summary?ssh=${encodeURIComponent(idata.ssh)}`).then(r => {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    });
+    const urls = [];
+    for (const item of summary.worker_urls || []) {
+      if (item.url) urls.push(item.url);
+    }
+    if (urls.length) {
+      idata.workerUrls = urls;
+      idata.workerUrl = urls[0];
+    }
+    if (summary.download_line) updateDownloadStatusFromLine(summary.download_line, idata);
+    if (capturedInstId === selectedInstId) updateInstHeader();
+  } catch (e) {
+    idata.summaryLoaded = false;
+  }
+}
 
 // ── Instances ─────────────────────────────────────────────────────────────────
 async function loadInstances() {
@@ -919,11 +2122,13 @@ async function loadInstances() {
     const list = await fetch('/api/instances').then(r => r.json());
     if (!list.length) {
       el.innerHTML = '<p class="muted text-xs">No instances — use Create &amp; Deploy below.</p>';
-      return;
+      return [];
     }
     el.innerHTML = list.map(inst => renderInstCard(inst)).join('');
+    return list;
   } catch (e) {
     el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load instances.</p>';
+    return [];
   }
 }
 
@@ -932,22 +2137,24 @@ function renderInstCard(inst) {
   const status = (inst.actual_status || '?').toLowerCase();
   const isRunning = status === 'running';
   const isStopped = status === 'exited' || status === 'stopped';
-  const isLoading = !isRunning && !isStopped;
+  const isSelected = String(inst.id) === selectedInstId;
 
   const badgeClass = isRunning ? 'b-running' : isStopped ? 'b-exited' : 'b-loading';
   const price = `$${(inst.dph_total || 0).toFixed(3)}/hr`;
   const meta = ssh ? `${price} · ${ssh}` : price;
+  const sshJson = JSON.stringify(ssh);
 
   const actions = isRunning
-    ? `<button class="btn btn-success btn-xs" onclick='deployToInst(${JSON.stringify(ssh)})'>▶ Deploy</button>
-       <button class="btn btn-ghost btn-xs" onclick="destroyInst('${inst.id}')">Destroy</button>`
+    ? `<button class="btn btn-success btn-xs" onclick='event.stopPropagation();deployToInst(${sshJson},"${inst.id}")'>▶ Deploy</button>
+       <button class="btn btn-ghost btn-xs" onclick='event.stopPropagation();destroyInst("${inst.id}")'>Destroy</button>`
     : isStopped
-    ? `<button class="btn btn-primary btn-xs" onclick="activateInst('${inst.id}')">Activate</button>
-       <button class="btn btn-ghost btn-xs" onclick="destroyInst('${inst.id}')">Destroy</button>`
+    ? `<button class="btn btn-primary btn-xs" onclick='event.stopPropagation();activateInst("${inst.id}")'>Activate</button>
+       <button class="btn btn-ghost btn-xs" onclick='event.stopPropagation();destroyInst("${inst.id}")'>Destroy</button>`
     : `<span class="muted text-xs">${status}…</span>
-       <button class="btn btn-ghost btn-xs" onclick="destroyInst('${inst.id}')">Destroy</button>`;
+       <button class="btn btn-ghost btn-xs" onclick='event.stopPropagation();destroyInst("${inst.id}")'>Destroy</button>`;
 
-  return `<div class="inst-card">
+  return `<div class="inst-card${isSelected ? ' selected' : ''}" data-id="${inst.id}"
+    onclick='selectInstance("${inst.id}",${sshJson})'>
     <div class="inst-top">
       <span class="inst-id">#${inst.id}</span>
       <span class="inst-gpu">${esc(inst.gpu_name || '?')}</span>
@@ -987,24 +2194,552 @@ async function destroyInst(id) {
   loadInstances();
 }
 
-// ── Deploy to a running instance ──────────────────────────────────────────────
-async function deployToInst(ssh) {
-  if (!ssh) { alert('No SSH command available for this instance.'); return; }
+// ── RunPod Pods ───────────────────────────────────────────────────────────────
+async function loadRunpodPods() {
+  const el = document.getElementById('runpod-out');
+  const hasCards = el.querySelector('.inst-card') !== null;
+  if (!hasCards) el.innerHTML = '<span class="muted text-xs">Loading…</span>';
+  try {
+    const list = await fetch('/api/runpod/pods').then(r => r.json());
+    if (!list.length) {
+      el.innerHTML = '<p class="muted text-xs">No pods — use Create &amp; Deploy below.</p>';
+      return;
+    }
+    const next = list.map(pod => renderRunpodCard(pod)).join('');
+    if (el.innerHTML !== next) el.innerHTML = next;
+  } catch (e) {
+    if (!hasCards) el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load pods.</p>';
+  }
+}
 
-  // Validation: warn if deploying to remote but Backend URL is "Local"
-  const backendSel = document.getElementById('cfg-backend');
-  const isRemoteSSH = ssh && !ssh.includes('localhost') && !ssh.includes('127.0.0.1');
-  if (isRemoteSSH && backendSel && backendSel.value === 'local') {
-    if (!confirm('⚠ Backend URL is set to "Local" but deploying to a remote instance.\nThis will cause worker registration to fail.\n\nChange to "Fly.io" or "Custom" before deploying.\n\nContinue anyway?')) {
+function getRunpodSsh(pod) {
+  if (!pod.ssh_ip || !pod.ssh_port) return '';
+  return `ssh root@${pod.ssh_ip} -p ${pod.ssh_port}`;
+}
+
+function renderRunpodCard(pod) {
+  const ssh = getRunpodSsh(pod);
+  const status = (pod.status || '').toUpperCase();
+  const isRunning = status === 'RUNNING';
+  const isStopped = status === 'EXITED' || status === 'STOPPED';
+  const podKey = `rp-${pod.id}`;
+  const isSelected = podKey === selectedInstId;
+  const badgeClass = isRunning ? 'b-running' : isStopped ? 'b-exited' : 'b-loading';
+  const price = pod.cost_per_hr != null ? `$${(+pod.cost_per_hr).toFixed(3)}/hr` : '';
+  const meta = [pod.name, price, ssh].filter(Boolean).join(' · ');
+  const sshJson = JSON.stringify(ssh);
+
+  const actions = isRunning && ssh
+    ? `<button class="btn btn-success btn-xs" onclick='event.stopPropagation();quickDeployRunpod("${pod.id}")'>▶ Deploy</button>
+       <button class="btn btn-warning btn-xs" onclick='event.stopPropagation();stopPod("${pod.id}")'>⏹ Stop</button>
+       <button class="btn btn-danger btn-xs" onclick='event.stopPropagation();terminatePod("${pod.id}")'>Terminate</button>`
+    : isStopped
+    ? `<button class="btn btn-primary btn-xs" onclick='event.stopPropagation();resumePod("${pod.id}")'>▶ Resume</button>
+       <button class="btn btn-danger btn-xs" onclick='event.stopPropagation();terminatePod("${pod.id}")'>Terminate</button>`
+    : `<span class="muted text-xs">${status.toLowerCase()}…</span>
+       <button class="btn btn-danger btn-xs" onclick='event.stopPropagation();terminatePod("${pod.id}")'>Terminate</button>`;
+
+  return `<div class="inst-card${isSelected ? ' selected' : ''}" data-id="${podKey}"
+    onclick='selectInstance("${podKey}",${sshJson})'>
+    <div class="inst-top">
+      <span class="inst-id">${esc(pod.name || pod.id)}</span>
+      <span class="inst-gpu">${esc(pod.gpu_name || '?')}</span>
+      <span class="badge ${badgeClass}"><span class="dot"></span>${esc(status)}</span>
+    </div>
+    <div class="inst-meta" title="${esc(meta)}">${esc(meta)}</div>
+    <div class="inst-actions">${actions}</div>
+  </div>`;
+}
+
+async function resumePod(podId) {
+  const r = await fetch(`/api/runpod/pods/${podId}/resume`, {method: 'POST'});
+  const d = await r.json();
+  if (!d.ok) alert(`Failed to resume: ${d.output || ''}`);
+  setTimeout(loadRunpodPods, 2000);
+}
+
+// ── Verda hosts ───────────────────────────────────────────────────────────────
+async function loadVerdaHosts() {
+  const el = document.getElementById('verda-out');
+  try {
+    const hosts = await fetch('/api/verda/hosts').then(r => r.json());
+    if (!hosts.length) {
+      el.innerHTML = '<span class="muted text-xs">No Verda hosts — add one below.</span>';
+      return;
+    }
+    el.innerHTML = hosts.map(h => {
+      const instId = `verda:${h.name}`;
+      const isSelected = instId === selectedInstId;
+      getInstData(instId).ssh = h.ssh_command;
+      const safeName = esc(h.name);
+      const safeSsh = esc(h.ssh_command);
+      return `<div class="inst-card${isSelected ? ' selected' : ''}" data-id="${esc(instId)}"
+                   onclick="selectVerdaHost('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}')">
+        <div class="inst-header-name">${safeName}</div>
+        <div class="inst-meta" title="${safeSsh}">${safeSsh}</div>
+        <div class="inst-actions">
+          <button class="btn btn-warning btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', false)">Delete VM</button>
+          <button class="btn btn-danger btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', true)">Delete VM+Volumes</button>
+          <button class="btn btn-ghost btn-xs" onclick="event.stopPropagation(); removeVerdaHost('${safeName}')">Remove</button>
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load Verda hosts.</p>';
+  }
+}
+
+function selectVerdaHost(name, ssh) {
+  selectInstance(`verda:${name}`, ssh);
+}
+
+async function addVerdaHost() {
+  const name = (document.getElementById('verda-name').value || '').trim();
+  const ssh = (document.getElementById('verda-ssh').value || '').trim();
+  if (!name || !ssh) { alert('Name and SSH are required.'); return; }
+  const r = await fetch('/api/verda/hosts', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, ssh_command: ssh}),
+  });
+  if (!r.ok) { alert(`Failed to add: ${(await r.json()).detail || r.status}`); return; }
+  document.getElementById('verda-name').value = '';
+  document.getElementById('verda-ssh').value = '';
+  loadVerdaHosts();
+}
+
+async function removeVerdaHost(name) {
+  if (!confirm(`Remove Verda host ${name}?`)) return;
+  const r = await fetch(`/api/verda/hosts/${encodeURIComponent(name)}`, {method: 'DELETE'});
+  if (!r.ok) { alert(`Failed to remove: ${(await r.json()).detail || r.status}`); return; }
+  if (selectedInstId === `verda:${name}`) selectedInstId = null;
+  loadVerdaHosts();
+  updateInstHeader();
+}
+
+async function teardownVerda(name, ssh, deleteVolumes) {
+  const mode = deleteVolumes ? 'delete the VM and its attached OS/model volumes' : 'delete the VM and keep/detach its volumes';
+  const warning = deleteVolumes
+    ? 'This moves attached volumes toward deletion/trash. Use this only for disposable test volumes.'
+    : 'This should preserve the OS/model volumes for a later Existing volumes deploy.';
+  if (!confirm(`Verda teardown: ${mode}?\n\n${warning}\n\nHost: ${name}`)) return;
+  const expected = deleteVolumes ? 'DELETE VOLUMES' : 'DELETE VM';
+  const typed = prompt(`Type ${expected} to confirm.`);
+  if (typed !== expected) return;
+  try {
+    const r = await fetch('/api/verda/teardown', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, ssh_command: ssh, delete_volumes: deleteVolumes}),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || r.status);
+    const preserved = (d.preserved_volumes || []).map(v => `${v.name || v.id}: ${v.status}`).join(', ');
+    const deleted = (d.deleted_or_trashed_volume_ids || []).join(', ');
+    alert(`Verda teardown complete.\nInstance: ${d.instance_id}\nPreserved volumes: ${preserved || 'none'}\nDeleted/trashed volumes: ${deleted || 'none'}`);
+    if (selectedInstId === `verda:${name}`) selectedInstId = null;
+    await loadVerdaHosts();
+    await loadVerdaVolumes();
+    updateInstHeader();
+  } catch (e) {
+    alert(`Verda teardown failed: ${e}`);
+  }
+}
+
+async function loadVerdaAvailability() {
+  const sel = document.getElementById('v-instance-select');
+  const status = document.getElementById('v-availability-status');
+  const preference = document.getElementById('v-gpu-preference')?.value || 'single';
+  const optionLimit = document.getElementById('v-option-limit')?.value || '5';
+  if (!sel || !status) return;
+  status.textContent = 'Checking Verda GPUs…';
+  try {
+    const payload = await fetch(`/api/verda/availability?preference=${encodeURIComponent(preference)}`).then(r => {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    });
+    const allItems = payload.all_items || payload.items || [];
+    const items = optionLimit === 'all' ? allItems : allItems.slice(0, Number(optionLimit) || 5);
+    if (!items.length) {
+      status.textContent = 'No GPU capacity found';
+      return;
+    }
+    sel.innerHTML = items.map(item => {
+      const value = `${item.location}|${item.instance_type}`;
+      return `<option value="${esc(value)}">${esc(item.label)}</option>`;
+    }).join('');
+    applyVerdaSelection();
+    const label = {
+      single: 'single-GPU',
+      sprint: 'multi-GPU sprint',
+      four_plus: '4+ GPU sprint',
+      any: 'GPU',
+    }[preference] || 'GPU';
+    status.textContent = `${items.length} of ${allItems.length} ${label} option(s)`;
+  } catch (e) {
+    status.textContent = `Availability unavailable: ${e}`;
+  }
+}
+
+function applyVerdaSelection() {
+  const sel = document.getElementById('v-instance-select');
+  if (!sel || !sel.value) return;
+  const [location, instanceType] = sel.value.split('|');
+  if (location) document.getElementById('v-location').value = location;
+  if (instanceType) document.getElementById('v-instance-type').value = instanceType;
+  refreshVerdaCostEstimate();
+  validateVerdaExistingVolumes();
+}
+
+async function loadVerdaVolumes() {
+  const status = document.getElementById('v-volume-status');
+  if (status) status.textContent = 'Checking volumes…';
+  try {
+    verdaVolumes = await fetch('/api/verda/volumes').then(r => {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    });
+    autofillVerdaVolumeIds();
+    return validateVerdaExistingVolumes();
+  } catch (e) {
+    if (status) status.textContent = `Volume check unavailable: ${e}`;
+    return false;
+  }
+}
+
+function autofillVerdaVolumeIds() {
+  if (!Array.isArray(verdaVolumes) || !verdaVolumes.length) return;
+  const loc = (document.getElementById('v-location').value || '').trim();
+  const osInput = document.getElementById('v-os-volume');
+  const dataInput = document.getElementById('v-data-volume');
+  const ids = new Set(verdaVolumes.map(v => v.id));
+  const candidates = verdaVolumes
+    .filter(v => !loc || v.location === loc)
+    .slice()
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  const osCandidate = candidates.find(v => v.is_os_volume) || verdaVolumes.find(v => v.is_os_volume);
+  const dataCandidate = candidates.find(v => !v.is_os_volume) || verdaVolumes.find(v => !v.is_os_volume);
+  if (osInput && osCandidate && (!osInput.value.trim() || !ids.has(osInput.value.trim()))) {
+    osInput.value = osCandidate.id;
+  }
+  if (dataInput && dataCandidate && (!dataInput.value.trim() || !ids.has(dataInput.value.trim()))) {
+    dataInput.value = dataCandidate.id;
+  }
+}
+
+function validateVerdaExistingVolumes() {
+  const status = document.getElementById('v-volume-status');
+  if (!status || document.getElementById('v-mode').value === 'fresh') return true;
+  const loc = (document.getElementById('v-location').value || '').trim();
+  const osId = (document.getElementById('v-os-volume').value || '').trim();
+  const dataId = (document.getElementById('v-data-volume').value || '').trim();
+  if (!osId || !dataId) {
+    status.textContent = 'Choose detached OS and model/data volumes.';
+    status.style.color = '#fbbf24';
+    return false;
+  }
+  if (!Array.isArray(verdaVolumes) || !verdaVolumes.length) {
+    status.textContent = 'Volume status not loaded yet.';
+    status.style.color = '#fbbf24';
+    return false;
+  }
+  const osVol = verdaVolumes.find(v => v.id === osId);
+  const dataVol = verdaVolumes.find(v => v.id === dataId);
+  if (!osVol || !dataVol) {
+    status.textContent = 'One selected volume was not found in Verda. Refresh volumes.';
+    status.style.color = '#fca5a5';
+    return false;
+  }
+  const problems = [];
+  if (!osVol.is_os_volume) problems.push('OS field is not an OS volume');
+  if (dataVol.is_os_volume) problems.push('data field is an OS volume');
+  for (const [label, vol] of [['OS', osVol], ['data', dataVol]]) {
+    if (String(vol.status || '').toLowerCase() !== 'detached') {
+      problems.push(`${label} volume is ${vol.status}`);
+    }
+    if (loc && vol.location !== loc) {
+      problems.push(`${label} volume is in ${vol.location}, not ${loc}`);
+    }
+  }
+  const fmt = v => `${v.name || v.id.slice(0, 8)} ${v.status} ${v.location}`;
+  if (problems.length) {
+    status.textContent = `${problems.join('; ')}. Existing-volume deploy requires detached volumes. (${fmt(osVol)} / ${fmt(dataVol)})`;
+    status.style.color = '#fca5a5';
+    return false;
+  }
+  status.textContent = `Volumes ready: ${fmt(osVol)} / ${fmt(dataVol)}`;
+  status.style.color = '#6ee7b7';
+  return true;
+}
+
+async function refreshVerdaCostEstimate() {
+  const el = document.getElementById('v-cost-estimate');
+  if (!el) return;
+  const instanceType = (document.getElementById('v-instance-type').value || '').trim();
+  const location = (document.getElementById('v-location').value || 'FIN-01').trim();
+  if (!instanceType) {
+    el.textContent = 'Select a Verda GPU to see cost.';
+    return;
+  }
+  const fresh = document.getElementById('v-mode').value === 'fresh';
+  const contract = document.getElementById('v-contract')?.value || 'pay_as_go';
+  const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 100) : 0;
+  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 250) : 0;
+  const params = new URLSearchParams({
+    instance_type: instanceType,
+    location,
+    os_volume_gb: String(osGb),
+    storage_gb: String(storageGb),
+    storage_type: 'NVMe',
+    contract,
+  });
+  el.textContent = 'Estimating cost…';
+  try {
+    const estimate = await fetch(`/api/verda/cost-estimate?${params.toString()}`).then(r => {
+      if (!r.ok) throw new Error(r.status);
+      return r.json();
+    });
+    const total = estimate.total || estimate.instance || {};
+    const instance = estimate.instance || {};
+    const hourly = money(total.hourly);
+    const daily = money(total.daily);
+    const monthly = money(total.monthly);
+    const compute = money(instance.hourly);
+    const storageNote = fresh ? ` incl. ${osGb}GB OS + ${storageGb}GB model storage` : ' compute only; existing volume storage is already billed separately';
+    const contractNote = contract === 'spot' ? 'spot, interruptible' : 'on-demand';
+    el.textContent = `${hourly}/hr · ${daily}/day · ${monthly}/mo (${contractNote}; ${compute}/hr compute${storageNote})`;
+  } catch (e) {
+    el.textContent = `Cost estimate unavailable: ${e}`;
+  }
+}
+
+function money(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '$?';
+  return `$${n.toFixed(n >= 10 ? 2 : 3)}`;
+}
+
+async function stopPod(podId) {
+  if (!confirm('Stop this pod? It will preserve your volume and models. You can resume it later.')) return;
+  const r = await fetch(`/api/runpod/pods/${podId}/stop`, {method: 'POST'});
+  const d = await r.json();
+  if (!d.ok) alert(`Failed to stop: ${d.output || ''}`);
+  setTimeout(loadRunpodPods, 2000);
+}
+
+async function terminatePod(podId) {
+  if (!confirm(`Terminate RunPod pod ${podId}?`)) return;
+  const r = await fetch(`/api/runpod/pods/${podId}`, {method: 'DELETE'});
+  const d = await r.json();
+  if (!d.ok) alert(`Failed: ${d.output || ''}`);
+  loadRunpodPods();
+}
+
+async function quickDeployRunpod(podId) {
+  const provId = '_runpod_provision';
+  selectInstance(provId, '');
+  selectLog('deploy');
+  clearLog(podId ? 'Deploying to pod…' : 'Provisioning RunPod…', 'deploy', provId);
+  setStatus('running', '⟳ RunPod: deploying…');
+  disableActions(true);
+
+  try {
+    const res = await fetch('/api/provision-runpod', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        gpu_type: document.getElementById('rp-gpu').value,
+        cloud_type: document.getElementById('rp-cloud').value,
+        volume_gb: +(document.getElementById('rp-volume').value) || 150,
+        container_disk_gb: +(document.getElementById('rp-cdisk').value) || 50,
+        worker_port: +(document.getElementById('c-port').value) || 9000,
+        remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
+        pod_id: podId || null,
+        env_vars: getEnv(),
+      }),
+    });
+    const {job_id} = await res.json();
+    streamRunpodJob(job_id, provId);
+  } catch (e) {
+    appendLog(`[runpod] ERROR: ${e}`, 'deploy', provId);
+    setStatus('failed', '✗ Failed');
+    disableActions(false);
+  }
+}
+
+function streamRunpodJob(jobId, instId) {
+  const es = new EventSource(`/api/deploy/${jobId}/stream`);
+  getInstData(instId).evtSrc = es;
+  es.onmessage = e => {
+    if (e.data === '__DONE__') {
+      es.close();
+      getInstData(instId).evtSrc = null;
+      onRunpodJobDone(jobId, instId);
+      return;
+    }
+    appendLog(JSON.parse(e.data), 'deploy', instId);
+  };
+  es.onerror = () => {
+    es.close();
+    getInstData(instId).evtSrc = null;
+    onRunpodJobDone(jobId, instId);
+  };
+}
+
+async function onRunpodJobDone(jobId, instId) {
+  disableActions(false);
+  const d = await fetch(`/api/deploy/${jobId}`).then(r => r.json());
+  const idata = getInstData(instId);
+  idata.status = d.status;
+  idata.workerUrl = d.worker_url;
+  if (d.status === 'done') {
+    setStatus('done', '✓ Done' + (d.worker_url ? ' — ' + d.worker_url : ''));
+    const pods = await fetch('/api/runpod/pods').then(r => r.json()).catch(() => []);
+    let pod = null;
+    const m = (d.worker_url || '').match(/https:\/\/([a-z0-9]+)-\d+\.proxy\.runpod\.net/);
+    if (m) pod = pods.find(p => p.id === m[1]);
+    if (!pod && pods.length === 1) pod = pods[0];
+    await loadRunpodPods();
+    if (pod) {
+      const newId = `rp-${pod.id}`;
+      instData[newId] = instData[instId];
+      delete instData[instId];
+      const ssh = (pod.ssh_ip && pod.ssh_port) ? `ssh root@${pod.ssh_ip} -p ${pod.ssh_port}` : '';
+      selectInstance(newId, ssh);
+      selectLog(ssh ? 'worker' : 'deploy');
+    }
+    loadWorkers();
+  } else {
+    setStatus('failed', '✗ Failed — check log');
+    updateInstHeader();
+  }
+}
+
+async function quickDeployVerda() {
+  const hostname = (document.getElementById('v-hostname').value || 'filmforge-verda-worker').trim();
+  const fresh = document.getElementById('v-mode').value === 'fresh';
+  if (!fresh) {
+    const volumesReady = await loadVerdaVolumes();
+    if (!volumesReady) {
+      alert('Existing-volume deploy needs a detached OS volume and detached model/data volume in the selected region. Use Fresh install, or stop/detach the current instance volumes first.');
       return;
     }
   }
+  const provId = `verda:${hostname}`;
+  selectInstance(provId, '');
+  selectLog('deploy');
+  clearLog(fresh ? 'Provisioning fresh Verda install…' : 'Provisioning Verda…', 'deploy', provId);
+  setStatus('running', fresh ? '⟳ Verda: installing + downloading…' : '⟳ Verda: creating + starting workers…');
+  disableActions(true);
 
-  const src = `deploy-${++deployTabCount}`;
-  const label = `Deploy #${deployTabCount}`;
-  createDeployTab(src, label, ssh);
-  selectLog(src);
-  clearLog('', src);
+  const env = getEnv();
+  env.WORKER_PROVIDER = 'verda';
+  env.WORKER_GPU_NAME = (document.getElementById('v-instance-type').value || '2A100.44V').trim();
+  if (!env.WORKER_REGISTRATION_TOKEN && !env.RENDER_BROKER_WORKER_TOKEN) {
+    delete env.FILMFORGE_BACKEND_URL;
+    delete env.RENDER_BROKER_BASE_URL;
+  }
+
+  try {
+    const res = await fetch('/api/provision-verda', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        fresh,
+        location: (document.getElementById('v-location').value || 'FIN-01').trim(),
+        instance_type: (document.getElementById('v-instance-type').value || '2A100.44V').trim(),
+        contract: document.getElementById('v-contract')?.value || 'pay_as_go',
+        os_volume_id: (document.getElementById('v-os-volume').value || '').trim(),
+        data_volume_id: (document.getElementById('v-data-volume').value || '').trim(),
+        ssh_key_id: (document.getElementById('v-ssh-key').value || '').trim(),
+        hostname,
+        worker_count: +(document.getElementById('v-worker-count').value) || 0,
+        worker_port: +(document.getElementById('c-port').value) || 9000,
+        comfy_port: +(document.getElementById('v-comfy-port').value) || 8188,
+        remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
+        fresh_os_volume_size: +(document.getElementById('v-fresh-os-size').value) || 100,
+        fresh_storage_size: +(document.getElementById('v-fresh-storage-size').value) || 250,
+        skip_warmup: fresh ? !document.getElementById('v-fresh-warm').value : true,
+        warm_asset_groups: fresh
+          ? document.getElementById('v-fresh-warm').value.split(',').map(s => s.trim()).filter(Boolean)
+          : [],
+        env_vars: env,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || res.status);
+    const {job_id} = await res.json();
+    streamVerdaJob(job_id, provId);
+  } catch (e) {
+    appendLog(`[verda] ERROR: ${e}`, 'deploy', provId);
+    setStatus('failed', '✗ Failed');
+    disableActions(false);
+  }
+}
+
+function updateVerdaMode() {
+  const fresh = document.getElementById('v-mode').value === 'fresh';
+  document.getElementById('v-existing-fields').style.display = fresh ? 'none' : 'block';
+  document.getElementById('v-fresh-fields').style.display = fresh ? 'block' : 'none';
+  refreshVerdaCostEstimate();
+  if (!fresh) loadVerdaVolumes();
+}
+
+function streamVerdaJob(jobId, instId) {
+  const es = new EventSource(`/api/deploy/${jobId}/stream`);
+  getInstData(instId).evtSrc = es;
+  es.onmessage = e => {
+    if (e.data === '__DONE__') {
+      es.close();
+      getInstData(instId).evtSrc = null;
+      onVerdaJobDone(jobId, instId);
+      return;
+    }
+    appendLog(JSON.parse(e.data), 'deploy', instId);
+  };
+  es.onerror = () => {
+    es.close();
+    getInstData(instId).evtSrc = null;
+    onVerdaJobDone(jobId, instId);
+  };
+}
+
+async function onVerdaJobDone(jobId, instId) {
+  disableActions(false);
+  const d = await fetch(`/api/deploy/${jobId}`).then(r => r.json());
+  const idata = getInstData(instId);
+  const urls = d.worker_urls && d.worker_urls.length ? d.worker_urls : (d.worker_url ? [d.worker_url] : []);
+  idata.status = d.status;
+  idata.workerUrl = d.worker_url;
+  idata.workerUrls = urls;
+  if (d.ssh_command) idata.ssh = d.ssh_command;
+
+  if (d.status === 'done') {
+    setStatus('done', '✓ Done' + (urls.length ? ' — ' + urls.join(', ') : ''));
+    if (d.ssh_command) {
+      const hostname = instId.replace(/^verda:/, '') || 'verda-worker';
+      await fetch('/api/verda/hosts', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: hostname, ssh_command: d.ssh_command}),
+      }).catch(() => {});
+      await loadVerdaHosts();
+      selectInstance(instId, d.ssh_command);
+      selectLog('worker');
+    }
+    loadWorkers();
+  } else {
+    setStatus('failed', '✗ Failed — check log');
+    updateInstHeader();
+  }
+}
+
+// ── Deploy to a running instance ──────────────────────────────────────────────
+async function deployToInst(ssh, instId) {
+  if (!ssh) { alert('No SSH command available for this instance.'); return; }
+
+  selectInstance(instId, ssh);
+  selectLog('deploy');
+  clearLog('Deploying…', 'deploy', String(instId));
   setStatus('running', '⟳ Deploying…');
   disableActions(true);
 
@@ -1020,9 +2755,9 @@ async function deployToInst(ssh) {
       }),
     });
     const {job_id} = await res.json();
-    streamJob(job_id, false, src);
+    streamJob(job_id, false, String(instId));
   } catch (e) {
-    appendLog(`[deploy] ERROR: ${e}`, src);
+    appendLog(`[deploy] ERROR: ${e}`, 'deploy', String(instId));
     setStatus('failed', '✗ Failed');
     disableActions(false);
   }
@@ -1030,11 +2765,10 @@ async function deployToInst(ssh) {
 
 // ── Create & Deploy (auto-provision) ─────────────────────────────────────────
 async function quickDeploy() {
-  const src = `deploy-${++deployTabCount}`;
-  const label = `Deploy #${deployTabCount}`;
-  createDeployTab(src, label, '');  // SSH will be captured from .last_ssh_dest during provision
-  selectLog(src);
-  clearLog('', src);
+  const provId = '_provision';
+  selectInstance(provId, '');
+  selectLog('deploy');
+  clearLog('Provisioning…', 'deploy', provId);
   setStatus('running', '⟳ Provisioning + deploying…');
   disableActions(true);
 
@@ -1059,44 +2793,72 @@ async function quickDeploy() {
       }),
     });
     const {job_id} = await res.json();
-    streamJob(job_id, true, src);
+    streamJob(job_id, true, provId);
   } catch (e) {
-    appendLog(`[vast] ERROR: ${e}`, src);
+    appendLog(`[vast] ERROR: ${e}`, 'deploy', provId);
     setStatus('failed', '✗ Failed');
     disableActions(false);
   }
 }
 
 // ── Job streaming ─────────────────────────────────────────────────────────────
-function streamJob(jobId, isProvision, src = 'deploy') {
+function streamJob(jobId, isProvision, instId) {
   const es = new EventSource(`/api/deploy/${jobId}/stream`);
-  deployEvtSrcs.set(src, es);
+  getInstData(instId).evtSrc = es;
   es.onmessage = e => {
     if (e.data === '__DONE__') {
-      es.close(); deployEvtSrcs.delete(src);
-      onJobDone(jobId, isProvision, src);
+      es.close();
+      getInstData(instId).evtSrc = null;
+      onJobDone(jobId, isProvision, instId);
       return;
     }
-    appendLog(JSON.parse(e.data), src);
+    appendLog(JSON.parse(e.data), 'deploy', instId);
   };
-  es.onerror = () => { es.close(); deployEvtSrcs.delete(src); onJobDone(jobId, isProvision, src); };
+  es.onerror = () => {
+    es.close();
+    getInstData(instId).evtSrc = null;
+    onJobDone(jobId, isProvision, instId);
+  };
 }
 
-async function onJobDone(jobId, isProvision, src) {
+async function onJobDone(jobId, isProvision, instId) {
   disableActions(false);
   const d = await fetch(`/api/deploy/${jobId}`).then(r => r.json());
+  const idata = getInstData(instId);
+  idata.status = d.status;
+  idata.workerUrl = d.worker_url;
+  idata.workerUrls = d.worker_urls || [];
+  if (d.ssh_command) idata.ssh = d.ssh_command;
+
   if (d.status === 'done') {
     setStatus('done', '✓ Done' + (d.worker_url ? ' — ' + d.worker_url : ''));
-    if (isProvision) selectLog('worker');
-    loadInstances();
+    if (isProvision) {
+      const instances = await loadInstances();
+      if (instances && instances.length) {
+        const newest = instances.reduce((a, b) => (+b.id > +a.id ? b : a));
+        const newId = String(newest.id);
+        const newSsh = getSsh(newest);
+        instData[newId] = instData[instId];
+        delete instData[instId];
+        selectInstance(newId, newSsh || idata.ssh);
+        selectLog('worker');
+      }
+    } else {
+      loadInstances();
+    }
     loadWorkers();
   } else {
     setStatus('failed', '✗ Failed — check log');
+    updateInstHeader();
   }
 }
 
 function disableActions(on) {
   document.getElementById('provision-btn').disabled = on;
+  const rpBtn = document.getElementById('runpod-provision-btn');
+  if (rpBtn) rpBtn.disabled = on;
+  const verdaBtn = document.getElementById('verda-provision-btn');
+  if (verdaBtn) verdaBtn.disabled = on;
 }
 
 // ── Workers ───────────────────────────────────────────────────────────────────
@@ -1111,11 +2873,13 @@ async function loadWorkers() {
     const alive = !!w.is_live || w.status === 'online';
     const age = timeAgo(w.last_heartbeat_at || w.last_seen_at);
     const caps = (w.capabilities || w.supported_asset_groups || []).join(', ');
+    const eta = formatWorkerEta(w.eta_by_asset_group || {});
     return `<div class="wrow">
       <div class="flex1" style="min-width:0">
         <div class="wname">${esc(w.worker_name || w.id || '?')}</div>
         <div class="wurl" title="${esc(w.base_url || '')}">${esc(w.base_url || '—')}</div>
         <div class="wurl" title="${esc(caps)}">${esc(caps || 'no capabilities')}</div>
+        ${eta ? `<div class="wurl" title="${esc(eta)}">${esc(eta)}</div>` : ''}
       </div>
       <span class="badge ${alive ? 'b-running' : 'b-exited'}" style="flex-shrink:0">
         <span class="dot"></span>${alive ? 'Online' : 'Offline'}
@@ -1123,6 +2887,31 @@ async function loadWorkers() {
       <span class="muted text-xs" style="flex-shrink:0;min-width:44px;text-align:right">${age}</span>
     </div>`;
   }).join('');
+}
+
+function formatWorkerEta(etaByAssetGroup) {
+  const labels = {
+    flux_stills_v1: 'flux',
+    juggernaut_stills_v1: 'jugg',
+    wan_i2v_v1: 'wan',
+    stable_audio_v1: 'audio',
+  };
+  return Object.entries(etaByAssetGroup)
+    .map(([group, eta]) => {
+      const seconds = eta && eta.estimated_total_sec;
+      if (!seconds) return '';
+      return `${labels[group] || group}: ${formatDuration(seconds)}`;
+    })
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function formatDuration(seconds) {
+  const s = Math.round(Number(seconds) || 0);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem ? `${m}m ${rem}s` : `${m}m`;
 }
 
 function timeAgo(iso) {
@@ -1134,90 +2923,118 @@ function timeAgo(iso) {
 }
 
 // ── Log ───────────────────────────────────────────────────────────────────────
-let remoteEvt = null;
-
-function createDeployTab(src, label, sshCommand = '') {
-  const tabs = document.querySelector('.log-tabs');
-  const btn = document.createElement('button');
-  btn.className = 'ltab';
-  btn.dataset.src = src;
-  btn.innerHTML = `${esc(label)} <span class="tab-close" onclick="closeDeployTab('${src}',event)">×</span>`;
-  btn.onclick = () => {
-    currentDeploySrc = src;  // Set this as the active deployment for remote logs
-    selectLog(src);
-  };
-  tabs.appendChild(btn);
-  if (sshCommand) deploySshCommands.set(src, sshCommand);
-}
-
-function closeDeployTab(src, e) {
-  e.stopPropagation();
-  const es = deployEvtSrcs.get(src);
-  if (es) { es.close(); deployEvtSrcs.delete(src); }
-  delete logBuffers[src];
-  document.querySelector(`.ltab[data-src="${src}"]`)?.remove();
-  if (currentLogSrc === src) selectLog('deploy');
-}
-
 function selectLog(src) {
   currentLogSrc = src;
   document.querySelectorAll('.ltab').forEach(b => b.classList.toggle('active', b.dataset.src === src));
   if (remoteEvt) { remoteEvt.close(); remoteEvt = null; }
   renderLog(src);
-  if (src === 'deploy' || src.startsWith('deploy-')) return;
-  clearLog(`Connecting to ${LOG_LABELS[src] || src}…`, src);
-
-  // Get SSH command for the currently active deployment
-  const sshCmd = deploySshCommands.get(currentDeploySrc) || '';
-  const sshParam = sshCmd ? `?ssh=${encodeURIComponent(sshCmd)}` : '';
-
-  remoteEvt = new EventSource(`/api/remote-logs/${src}/stream${sshParam}`);
-  remoteEvt.onmessage = e => {
-    if (e.data === '__DONE__') { remoteEvt.close(); remoteEvt = null; return; }
-    appendLog(JSON.parse(e.data), src);
-  };
-  remoteEvt.onerror = () => { appendLog('[remote-log] disconnected', src); remoteEvt.close(); remoteEvt = null; };
+  if (src === 'deploy') return;
+  reconnectRemoteLog(src);
 }
 
-function appendLog(line, src = currentLogSrc) {
-  if (!line) return;
-  if (!logBuffers[src]) logBuffers[src] = [];
+function reconnectRemoteLog(src) {
+  if (remoteEvt) { remoteEvt.close(); remoteEvt = null; }
+  if (!selectedInstId) return;
+  const ssh = getInstData(selectedInstId).ssh;
+  if (!ssh) {
+    appendLog(`[remote-log] No SSH command for instance #${selectedInstId}. Deploy first.`, src, selectedInstId);
+    return;
+  }
+  clearLog(`Connecting to ${LOG_LABELS[src] || src}…`, src, selectedInstId);
+  const capturedInstId = selectedInstId;
+  remoteEvt = new EventSource(`/api/remote-logs/${src}/stream?ssh=${encodeURIComponent(ssh)}`);
+  remoteEvt.onmessage = e => {
+    if (e.data === '__DONE__') { remoteEvt.close(); remoteEvt = null; return; }
+    appendLog(JSON.parse(e.data), src, capturedInstId);
+  };
+  remoteEvt.onerror = () => {
+    appendLog('[remote-log] disconnected', src, capturedInstId);
+    remoteEvt.close(); remoteEvt = null;
+  };
+}
+
+function updateDownloadStatusFromLine(line, idata) {
+  let match = line.match(/Downloading asset progress:\s+([^\s]+)\s+(.+?)\s+\(([^)]+)\)\s+([0-9.]+\s+[KMGT]?B\/s)/);
+  if (match) {
+    idata.downloadStatus = {
+      asset: match[1],
+      detail: `${match[1]} ${match[3]} · ${match[4]} · ${match[2]}`,
+      updatedAt: Date.now(),
+    };
+    return true;
+  }
+  match = line.match(/Download complete:\s+([^\s]+)\s+(.+?)\s+in\s+([0-9.]+s)\s+\(([^)]+)\)/);
+  if (match) {
+    idata.downloadStatus = {
+      asset: match[1],
+      detail: `${match[1]} complete · ${match[2]} · ${match[3]} · ${match[4]}`,
+      updatedAt: Date.now(),
+    };
+    return true;
+  }
+  match = line.match(/Downloading asset:\s+([^\s]+)\s+total=([^ ]+\s+[KMGT]?B)/);
+  if (match) {
+    idata.downloadStatus = {
+      asset: match[1],
+      detail: `${match[1]} starting · ${match[2]}`,
+      updatedAt: Date.now(),
+    };
+    return true;
+  }
+  return false;
+}
+
+function appendLog(line, src = currentLogSrc, instId = selectedInstId) {
+  if (!line || !instId) return;
+  const idata = getInstData(instId);
+  if (!idata.logBuffers[src]) idata.logBuffers[src] = [];
   const isNoise = /"\s*(get|head)\s+\//i.test(line) || /http\/1\.1"\s+200/i.test(line);
   if (isNoise) return;
-  logBuffers[src].push(line);
-  if (logBuffers[src].length > MAX_LOG_LINES) {
-    logBuffers[src].splice(0, logBuffers[src].length - MAX_LOG_LINES);
+  const downloadChanged = updateDownloadStatusFromLine(line, idata);
+  idata.logBuffers[src].push(line);
+  if (idata.logBuffers[src].length > MAX_LOG_LINES) {
+    idata.logBuffers[src].splice(0, idata.logBuffers[src].length - MAX_LOG_LINES);
   }
-  if (src !== currentLogSrc) return;
+  if (downloadChanged && instId === selectedInstId) updateInstHeader();
+  if (instId !== selectedInstId || src !== currentLogSrc) return;
   renderLog(src);
 }
 
 function renderLog(src = currentLogSrc) {
   const el = document.getElementById('log');
-  const lines = logBuffers[src] || [];
+  if (!selectedInstId) {
+    el.innerHTML = `<span class="muted text-xs">← Select an instance to view logs.</span>`;
+    return;
+  }
+  const lines = getInstData(selectedInstId).logBuffers[src] || [];
   if (!lines.length) {
-    el.innerHTML = `<span class="muted text-xs">Ready.</span>`;
+    el.innerHTML = `<span class="muted text-xs">No ${LOG_LABELS[src] || src} log yet for instance #${esc(selectedInstId)}.</span>`;
     return;
   }
   el.innerHTML = '';
   for (const line of lines) {
     const lo = line.toLowerCase();
     const d = document.createElement('div');
-    const cls = lo.includes('error') || lo.includes('failed') ? 'err'
+    const sev = lo.includes('error') || lo.includes('failed') ? 'err'
       : lo.includes('✓') || lo.includes(' done') ? 'ok'
-      : lo.startsWith('[deploy]') || lo.startsWith('[vast]') ? 'info'
+      : lo.startsWith('[deploy]') || lo.startsWith('[vast]') || lo.startsWith('[runpod]') || lo.startsWith('[verda]') ? 'info'
       : lo.includes('download') || lo.includes('asset') || lo.includes('comfy') ? 'signal'
       : lo.includes('warn') ? 'warn' : '';
-    d.className = 'll' + (cls ? ' ' + cls : '');
+    const gpuMatch = line.match(/^\[(gpu\d+)\]/);
+    const gpu = gpuMatch ? gpuMatch[1] : '';
+    d.className = 'll' + (sev ? ' ' + sev : '') + (gpu ? ' ' + gpu : '');
     d.textContent = line;
     el.appendChild(d);
   }
   el.scrollTop = el.scrollHeight;
 }
 
-function clearLog(msg = 'Ready.', src = currentLogSrc) {
-  logBuffers[src] = [];
-  if (src === currentLogSrc) {
+function clearLog(msg = 'Ready.', src = currentLogSrc, instId = selectedInstId) {
+  if (instId) {
+    const idata = getInstData(instId);
+    idata.logBuffers[src] = [];
+  }
+  if (instId === selectedInstId && src === currentLogSrc) {
     document.getElementById('log').innerHTML = `<span class="muted text-xs">${esc(msg)}</span>`;
   }
 }
@@ -1242,6 +3059,7 @@ const CONFIG_FIELDS = [
   ]},
   {key: 'WORKER_PROVIDER', label: 'Provider', type: 'select', selectId: 'cfg-provider', defaultValue: 'dedicated_worker', options: [
     {value: 'dedicated_worker', label: 'Dedicated Worker'},
+    {value: 'verda', label: 'Verda'},
   ]},
   {key: 'WORKER_MAX_CONCURRENT_JOBS', label: 'Max Concurrent Jobs', type: 'select', selectId: 'cfg-max-jobs', defaultValue: '1', options: [
     {value: '1', label: '1'},
@@ -1254,7 +3072,7 @@ const CONFIG_FIELDS = [
     {value: '120', label: '120s'},
     {value: '300', label: '300s'},
   ]},
-  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v', options: [
+  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio', options: [
     {value: 'flux2_stills', label: 'Flux (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
     {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
@@ -1266,6 +3084,7 @@ const CONFIG_FIELDS = [
     {value: 'L40S', label: 'L40S'},
     {value: 'A100 SXM', label: 'A100 SXM'},
     {value: 'A100 PCIe', label: 'A100 PCIe'},
+    {value: '2A100.44V', label: 'Verda 2A100.44V'},
     {value: 'H100 SXM', label: 'H100 SXM'},
     {value: 'H100 PCIe', label: 'H100 PCIe'},
     {value: 'A6000', label: 'A6000'},
@@ -1480,6 +3299,22 @@ function toggleAdv() {
   btn.textContent = (open ? '▶' : '▼') + ' Advanced options';
 }
 
+function toggleRpAdv() {
+  const body = document.getElementById('rp-adv-body');
+  const btn = event.target;
+  const open = body.style.display === 'block';
+  body.style.display = open ? 'none' : 'block';
+  btn.textContent = (open ? '▶' : '▼') + ' Advanced options';
+}
+
+function toggleVerdaAdv() {
+  const body = document.getElementById('v-adv-body');
+  const btn = event.target;
+  const open = body.style.display === 'block';
+  body.style.display = open ? 'none' : 'block';
+  btn.textContent = (open ? '▶' : '▼') + ' Advanced options';
+}
+
 // ── Util ──────────────────────────────────────────────────────────────────────
 function numOrNull(id) {
   const raw = document.getElementById(id).value.trim();
@@ -1492,12 +3327,34 @@ function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (btn) {
+      const old = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => { btn.textContent = old; }, 900);
+    }
+  } catch {
+    window.prompt('Copy worker URL', text);
+  }
+}
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 initEnv();
+updateVerdaMode();
+loadVerdaAvailability();
+loadVerdaVolumes();
 loadInstances();
+loadRunpodPods();
+loadVerdaHosts();
 loadWorkers();
+updateInstHeader();
 setInterval(loadInstances, 15000);
+setInterval(loadRunpodPods, 15000);
+setInterval(loadVerdaHosts, 30000);
 setInterval(loadWorkers, 15000);
+setInterval(() => refreshSelectedInstanceSummary(true), 30000);
 </script>
 </body>
 </html>"""
@@ -1508,5 +3365,23 @@ setInterval(loadWorkers, 15000);
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", "7860"))
+    my_pid = os.getpid()
+    try:
+        out = subprocess.run(
+            ["lsof", "-tiTCP:" + str(port), "-sTCP:LISTEN"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        pids = [int(p) for p in out.split() if p.isdigit() and int(p) != my_pid]
+        for pid in pids:
+            print(f"Killing existing deploy_ui on port {port} (pid {pid})…")
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass
+        if pids:
+            import time as _t
+            _t.sleep(1)
+    except FileNotFoundError:
+        pass
     print(f"FilmForge GPU Deploy UI → http://localhost:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)

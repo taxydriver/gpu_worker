@@ -187,6 +187,27 @@ def _broker_headers() -> dict[str, str]:
     return headers
 
 
+def _performance_snapshot() -> dict[str, dict[str, float | int]]:
+    """Return rolling worker timing stats as heartbeat-safe metadata."""
+
+    with _STATS_LOCK:
+        snapshot = {asset_group: list(entries) for asset_group, entries in _STATS.items()}
+
+    performance: dict[str, dict[str, float | int]] = {}
+    for asset_group, entries in sorted(snapshot.items()):
+        if not entries:
+            continue
+        sample_count = len(entries)
+        avg_comfy_run_sec = sum(entry[0] for entry in entries) / sample_count
+        avg_total_sec = sum(entry[1] for entry in entries) / sample_count
+        performance[asset_group] = {
+            "sample_count": sample_count,
+            "avg_comfy_run_sec": round(avg_comfy_run_sec, 2),
+            "avg_total_sec": round(avg_total_sec, 2),
+        }
+    return performance
+
+
 def _broker_worker_payload() -> dict[str, object]:
     settings = get_settings()
     with _ACTIVE_JOBS_LOCK:
@@ -203,6 +224,7 @@ def _broker_worker_payload() -> dict[str, object]:
     with _WARMED_GROUPS_LOCK:
         warmed = canonicalize_groups(sorted(_WARMED_GROUPS))
 
+    max_concurrent_jobs = settings.resolved_max_concurrent_jobs()
     return {
         "worker_id": settings.resolved_worker_id(),
         "worker_name": settings.resolved_worker_name(),
@@ -218,11 +240,16 @@ def _broker_worker_payload() -> dict[str, object]:
         "vram_gb": settings.worker_vram_gb,
         "used_vram_mb": None,
         "active_jobs": active_jobs,
-        "max_concurrency": settings.resolved_max_concurrent_jobs(),
-        "max_concurrent_jobs": settings.resolved_max_concurrent_jobs(),
+        "max_concurrency": max_concurrent_jobs,
+        "max_concurrent_jobs": max_concurrent_jobs,
         "metadata": {
             "comfy_base_url": settings.comfy_base_url,
             "comfy_reachable": is_comfy_healthy(),
+            "performance": _performance_snapshot(),
+            "performance_window": _STATS_WINDOW,
+            "active_jobs": active_jobs,
+            "max_concurrent_jobs": max_concurrent_jobs,
+            "warmed_asset_groups": warmed,
         },
     }
 

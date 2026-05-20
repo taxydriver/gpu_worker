@@ -11,6 +11,7 @@ env/
 !.env.example
 
 .last_ssh_dest
+.verda_hosts.json
 
 .DS_Store
 

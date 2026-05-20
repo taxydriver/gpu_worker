@@ -37,6 +37,31 @@ MODES
         --update-backend-env  Legacy local-dev mode: write GPU_WORKER_BASE_URL to .env
         --skip-backend-restart  Don't restart local backend
 
+  --verda [options]
+      Fully automated Verda rehydrate from detached OS/data volumes.
+      Creates a Verda VM from the OS volume, attaches the model data volume,
+      configures one worker per GPU, and prints the worker URLs.
+
+      Options (passed to deploy_gpu.py):
+        --verda-location FIN-01
+        --verda-instance-type 2A100.44V
+        --verda-os-volume-id <volume-id>
+        --verda-data-volume-id <volume-id>
+        --verda-worker-count N
+
+  --verda-fresh [options]
+      Fully automated Verda deploy without existing volumes.
+      Creates fresh OS/model volumes, installs ComfyUI + gpu_worker, downloads
+      selected models, configures one worker per GPU, and prints worker URLs.
+
+      Options (passed to deploy_gpu.py):
+        --verda-location FIN-01
+        --verda-instance-type 2A100.44V
+        --verda-fresh-os-volume-size 100
+        --verda-fresh-storage-size 250
+        --warm-asset-group stable_audio_v1
+        --skip-warmup
+
   --gpus
       List all available RunPod GPU types with their IDs and display names.
       Uses RUNPOD_API_KEY from filmforge_backend/app/.env.
@@ -54,6 +79,8 @@ EXAMPLES
   ./setup_gpu.sh --vast --vast-gpu "RTX 4090" --vast-max-price 0.7 --warm-asset-group flux_stills_v1
   ./setup_gpu.sh --runpod
   ./setup_gpu.sh --runpod --gpu "NVIDIA GeForce RTX 4090"
+  ./setup_gpu.sh --verda
+  ./setup_gpu.sh --verda-fresh
   ./setup_gpu.sh --logs
   ./setup_gpu.sh --gpus
   ./setup_gpu.sh ssh root@1.2.3.4 -p 22022 -i ~/.ssh/id_ed25519
@@ -104,6 +131,17 @@ if [[ $# -ge 1 && "$1" == "--runpod" ]]; then
   exec "$PYTHON_BIN" "$SCRIPT_DIR/deploy_gpu.py" --runpod "$@"
 fi
 
+# ── Verda fully-automated mode ────────────────────────────────────────────────
+if [[ $# -ge 1 && "$1" == "--verda" ]]; then
+  shift
+  exec "$PYTHON_BIN" "$SCRIPT_DIR/deploy_gpu.py" --verda "$@"
+fi
+
+if [[ $# -ge 1 && "$1" == "--verda-fresh" ]]; then
+  shift
+  exec "$PYTHON_BIN" "$SCRIPT_DIR/deploy_gpu.py" --verda-fresh "$@"
+fi
+
 # ── Logs mode ─────────────────────────────────────────────────────────────────
 if [[ $# -ge 1 && "$1" == "--logs" ]]; then
   LAST_SSH_FILE="$SCRIPT_DIR/.last_ssh_dest"
@@ -139,7 +177,7 @@ fi
 
 # ── SSH command mode ──────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
-  echo "Usage: $0 --vast | --runpod | --gpus | --logs | ssh root@<host> -p <port> ..." >&2
+  echo "Usage: $0 --vast | --runpod | --verda | --verda-fresh | --gpus | --logs | ssh root@<host> -p <port> ..." >&2
   echo "Run '$0 --help' for full usage." >&2
   exit 1
 fi

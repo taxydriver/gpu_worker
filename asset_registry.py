@@ -92,6 +92,7 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "wan_i2v": ["wan_i2v_v1"],
     "wan_i2v_v1": ["wan_i2v_v1"],
     "stable_audio": ["stable_audio_v1"],
+    "stable_audio1": ["stable_audio_v1"],
     "stable_audio_v1": ["stable_audio_v1"],
     "juggernaut_stills": ["juggernaut_stills_v1"],
     "juggernaut_stills_v1": ["juggernaut_stills_v1"],
