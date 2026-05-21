@@ -3243,6 +3243,7 @@ const CONFIG_FIELDS = [
   {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio', options: [
     {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio (all)'},
     {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
+    {value: 'wan_i2v,stable_audio', label: 'WAN + Audio'},
     {value: 'flux2_stills', label: 'Flux (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
   ]},
