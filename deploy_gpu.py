@@ -269,9 +269,13 @@ set -euo pipefail
 
 REMOTE_ROOT={shlex.quote(remote_root)}
 WORKER_PORT={worker_port}
-DEFAULT_COMFY_BASE_URL="http://127.0.0.1:8188"
+DEFAULT_COMFY_BASE_URL="${{COMFYUI_API_BASE:-http://127.0.0.1:18188}}"
 
 detect_comfy_base() {{
+  if test -n "${{COMFYUI_API_BASE:-}}" && curl -fsS "${{COMFYUI_API_BASE%/}}/system_stats" >/dev/null 2>&1; then
+    echo "${{COMFYUI_API_BASE%/}}"
+    return
+  fi
   if curl -fsS http://127.0.0.1:18188/system_stats >/dev/null 2>&1; then
     echo "http://127.0.0.1:18188"
     return
@@ -283,9 +287,12 @@ detect_comfy_base() {{
   return 1
 }}
 
-# Wait for ComfyUI to respond before probing its port (it may still be starting)
+# Wait for ComfyUI to respond before probing its port (it may still be starting).
+# Vast's ComfyUI template exposes COMFYUI_API_BASE=http://localhost:18188; using
+# 8188 as an early fallback makes the worker boot "healthy" against the wrong
+# port and then repeatedly restart ComfyUI.
 echo "Waiting for ComfyUI to become reachable..." >&2
-for _ in $(seq 1 20); do
+for _ in $(seq 1 60); do
   if detect_comfy_base >/dev/null 2>&1; then
     break
   fi
@@ -295,7 +302,7 @@ done
 COMFY_BASE_URL="$(detect_comfy_base || true)"
 if test -z "$COMFY_BASE_URL"; then
   COMFY_BASE_URL="$DEFAULT_COMFY_BASE_URL"
-  echo "ComfyUI probe did not respond; falling back to $COMFY_BASE_URL" >&2
+  echo "ComfyUI probe did not respond yet; using expected base $COMFY_BASE_URL" >&2
 fi
 COMFY_OUTPUT_DIR="/workspace/ComfyUI/output"
 COMFY_TEMP_DIR="/workspace/ComfyUI/temp"
@@ -308,6 +315,7 @@ COMFY_INPUT_DIR="/workspace/ComfyUI/input"
 RUNPOD_COMFY="/workspace/runpod-slim/ComfyUI"
 if test -f "$RUNPOD_COMFY/main.py"; then
   echo "RunPod ComfyUI detected at $RUNPOD_COMFY — applying path fixes" >&2
+  COMFY_BASE_URL="http://127.0.0.1:8188"
 
   # Output / temp / input: ComfyUI writes here; worker reads from /workspace/ComfyUI/*
   mkdir -p /workspace/ComfyUI/output /workspace/ComfyUI/temp /workspace/ComfyUI/input
@@ -377,7 +385,7 @@ if supervisorctl status comfyui >/dev/null 2>&1; then
     supervisorctl restart comfyui >/dev/null 2>&1 || true
     echo "Waiting for ComfyUI to restart..." >&2
     for _ in $(seq 1 60); do
-      if curl -sf http://127.0.0.1:8188/system_stats > /dev/null 2>&1; then
+      if curl -sf "${{COMFY_BASE_URL%/}}/system_stats" > /dev/null 2>&1; then
         echo "ComfyUI ready" >&2
         break
       fi
