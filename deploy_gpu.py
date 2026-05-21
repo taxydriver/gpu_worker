@@ -446,7 +446,11 @@ if ! test -s /tmp/gpu_worker_health.json; then
 fi
 
 WORKER_URL=""
-if test -x /opt/instance-tools/bin/cloudflared; then
+PRESET_PUBLIC_URL="${{WORKER_PUBLIC_URL:-}}"
+if test -n "$PRESET_PUBLIC_URL"; then
+  WORKER_URL="$PRESET_PUBLIC_URL"
+  echo "Using preset WORKER_PUBLIC_URL=$WORKER_URL (skipping cloudflared)" >&2
+elif test -x /opt/instance-tools/bin/cloudflared; then
   for _tunnel_attempt in 1 2 3; do
     pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
     sleep 2
@@ -483,7 +487,8 @@ if test -z "$WORKER_URL" && test -n "${{RUNPOD_POD_ID:-}}"; then
 fi
 
 # ── Restart worker with public URL injected (so it can self-register) ─────────
-if test -n "$WORKER_URL"; then
+# Skip restart when WORKER_PUBLIC_URL was preset — first start already had it.
+if test -n "$WORKER_URL" && test -z "$PRESET_PUBLIC_URL"; then
   echo "Restarting worker with WORKER_PUBLIC_URL=$WORKER_URL ..." >&2
   pkill -f "uvicorn gpu_worker.app:app" || true
   sleep 2
@@ -696,6 +701,35 @@ def _vast_ssh_command(instance_id: str) -> str | None:
         port = parsed.port or 22
         user = parsed.username or "root"
         return f"ssh -p {port} {user}@{host}"
+    return None
+
+
+def _vast_direct_worker_url(
+    instance_id: str,
+    container_port: int,
+    *,
+    timeout_sec: int = 180,
+) -> str | None:
+    """Poll Vast for the public host:port mapping of a container port.
+
+    With `--env '-p N:N'`, Vast publishes container port N on the host's public IP
+    at a Vast-assigned host port. Returns http://<public_ipaddr>:<HostPort>, or None
+    if the mapping doesn't appear before the deadline.
+    """
+    deadline = time.time() + timeout_sec
+    target_key = f"{container_port}/tcp"
+    while time.time() < deadline:
+        data = _vastai("show", "instance", instance_id, timeout=30)
+        if isinstance(data, dict) and "error" not in data:
+            public_ip = data.get("public_ipaddr")
+            ports = data.get("ports") or {}
+            if isinstance(public_ip, str) and public_ip and isinstance(ports, dict):
+                bindings = ports.get(target_key)
+                if isinstance(bindings, list) and bindings:
+                    host_port = bindings[0].get("HostPort")
+                    if host_port:
+                        return f"http://{public_ip}:{host_port}"
+        time.sleep(5)
     return None
 
 
@@ -1742,6 +1776,8 @@ def vast_deploy(args: argparse.Namespace) -> int:
             str(args.vast_disk_gb),
             "--ssh",
             "--direct",
+            "--env",
+            f"-p {args.worker_port}:{args.worker_port}",
         ]
     )
     create = _vastai(*create_args, timeout=120)
@@ -1762,6 +1798,19 @@ def vast_deploy(args: argparse.Namespace) -> int:
         identity=identity,
         timeout_sec=args.vast_boot_timeout,
     )
+
+    direct_url = _vast_direct_worker_url(instance_id, args.worker_port)
+    if direct_url:
+        log(f"Vast direct worker URL: {direct_url}")
+        env_vars = list(getattr(args, "env_vars", []) or [])
+        if not any(v.startswith("WORKER_PUBLIC_URL=") for v in env_vars):
+            env_vars.append(f"WORKER_PUBLIC_URL={direct_url}")
+            args.env_vars = env_vars
+    else:
+        log(
+            f"Could not resolve Vast direct port mapping for container port "
+            f"{args.worker_port}; falling back to cloudflared."
+        )
 
     exit_code, worker_url = _do_deploy(args)
     if exit_code == 0 and worker_url and args.warm_asset_groups and not args.skip_warmup:
