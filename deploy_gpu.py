@@ -1793,13 +1793,29 @@ def vast_deploy(args: argparse.Namespace) -> int:
     log(f"Created Vast instance {instance_id}")
 
     args.ssh_identity = identity
+
+    # Start polling for direct port mapping in parallel with SSH wait
+    import threading
+    direct_url_result: list[str | None] = [None]
+
+    def _poll_direct_url() -> None:
+        direct_url_result[0] = _vast_direct_worker_url(
+            instance_id, args.worker_port, timeout_sec=args.vast_boot_timeout
+        )
+
+    poll_thread = threading.Thread(target=_poll_direct_url, daemon=True)
+    poll_thread.start()
+
     args.ssh_command = _wait_for_vast_ssh_command(
         instance_id,
         identity=identity,
         timeout_sec=args.vast_boot_timeout,
     )
 
-    direct_url = _vast_direct_worker_url(instance_id, args.worker_port)
+    # Give the poll thread a moment to finish if it hasn't already
+    poll_thread.join(timeout=30)
+    direct_url = direct_url_result[0]
+
     if direct_url:
         log(f"Vast direct worker URL: {direct_url}")
         env_vars = list(getattr(args, "env_vars", []) or [])
@@ -1809,7 +1825,8 @@ def vast_deploy(args: argparse.Namespace) -> int:
     else:
         log(
             f"Could not resolve Vast direct port mapping for container port "
-            f"{args.worker_port}; falling back to cloudflared."
+            f"{args.worker_port} within {args.vast_boot_timeout}s; "
+            f"falling back to cloudflared."
         )
 
     exit_code, worker_url = _do_deploy(args)
