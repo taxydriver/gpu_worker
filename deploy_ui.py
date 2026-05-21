@@ -3241,10 +3241,10 @@ const CONFIG_FIELDS = [
     {value: '300', label: '300s'},
   ]},
   {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio', options: [
+    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio (all)'},
+    {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
     {value: 'flux2_stills', label: 'Flux (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
-    {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
-    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio'},
   ]},
   {key: 'WORKER_NAME', label: 'Worker Name', type: 'text', inputId: 'cfg-worker-name', placeholder: 'auto (hostname)'},
   {key: 'WORKER_GPU_NAME', label: 'GPU Type', type: 'select', selectId: 'cfg-gpu-name', inputId: 'cfg-gpu-custom', defaultValue: 'RTX 4090', options: [
