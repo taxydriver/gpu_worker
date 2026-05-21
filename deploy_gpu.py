@@ -1805,7 +1805,7 @@ fi
         # Auto-inject critical env vars from backend .env if not already provided
         env_vars = list(getattr(args, "env_vars", []) or [])
         existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
-        for key in ("FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_ID"):
+        for key in ("FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_ID", "WORKER_CAPABILITIES"):
             if key not in existing_keys:
                 value = _read_env_value(args.backend_env, key)
                 if value:
