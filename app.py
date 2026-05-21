@@ -84,6 +84,11 @@ _ACTIVE_JOBS: int = 0  # count of jobs currently executing
 _WARMED_GROUPS_LOCK = threading.Lock()
 _WARMED_GROUPS: set[str] = set()  # asset groups that have been successfully downloaded
 
+_STATS_LOCK = threading.Lock()
+_STATS: dict[str, deque] = {}
+_STATS_WINDOW = 20
+_ETA_HISTORY: dict[str, deque] = {}
+
 
 def _declared_capabilities() -> list[str]:
     """Return capabilities exactly as declared by WORKER_CAPABILITIES."""
@@ -389,11 +394,6 @@ class _JobRecord:
 
 _JOB_LOCK = threading.Lock()
 _JOBS: dict[str, _JobRecord] = {}
-
-_STATS_LOCK = threading.Lock()
-_STATS: dict[str, deque] = {}
-_STATS_WINDOW = 20
-_ETA_HISTORY: dict[str, deque] = {}
 
 
 def _detect_resolution_bucket(comfy_payload: dict) -> Literal["low", "medium", "high"]:

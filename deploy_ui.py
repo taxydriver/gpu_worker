@@ -369,6 +369,159 @@ def _save_verda_hosts(hosts: list[dict]) -> None:
     VERDA_HOSTS_PATH.write_text(json.dumps(hosts, indent=2) + "\n")
 
 
+def _verda_ssh_command_for_ip(ip: str) -> str:
+    identity = Path.home() / ".ssh" / "id_ed25519"
+    if identity.exists():
+        return f"ssh -i {identity} root@{ip}"
+    return f"ssh root@{ip}"
+
+
+def _verda_credentials() -> dict[str, str]:
+    path = Path.home() / ".verda" / "credentials"
+    values: dict[str, str] = {}
+    if not path.exists():
+        return values
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("[") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"')
+    return values
+
+
+def _verda_api_request(method: str, path: str, payload: dict | None = None, token: str | None = None) -> object:
+    creds = _verda_credentials()
+    base_url = (creds.get("verda_base_url") or "https://api.verda.com/v1").rstrip("/")
+    data = None if payload is None else json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw else {}
+    except Exception as exc:
+        raise RuntimeError(f"Verda API {method} {path} failed: {exc}") from exc
+
+
+def _verda_api_token() -> str:
+    creds = _verda_credentials()
+    client_id = creds.get("verda_client_id")
+    client_secret = creds.get("verda_client_secret")
+    if not client_id or not client_secret:
+        raise RuntimeError("Verda credentials missing client id/secret")
+    payload = _verda_api_request("POST", "/oauth2/token", {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    })
+    if not isinstance(payload, dict) or not payload.get("access_token"):
+        raise RuntimeError("Verda token response did not include access_token")
+    return str(payload["access_token"])
+
+
+def _verda_volume_api_action(volume_id: str, action: str) -> None:
+    token = _verda_api_token()
+    _verda_api_request("PUT", "/volumes", {"action": action, "id": volume_id}, token)
+
+
+def _verda_wait_for_detached(volume_ids: list[str], timeout_sec: int = 300) -> list[dict]:
+    deadline = time.time() + timeout_sec
+    wanted = set(volume_ids)
+    last: list[dict] = []
+    while time.time() < deadline:
+        volumes = _verda_list_volumes()
+        last = [v for v in volumes if isinstance(v, dict) and str(v.get("id")) in wanted]
+        if len(last) == len(wanted) and all(str(v.get("status") or "").lower() == "detached" for v in last):
+            return last
+        time.sleep(5)
+    status = ", ".join(f"{v.get('id')}:{v.get('status')}" for v in last) or "not found"
+    raise RuntimeError(f"Timed out waiting for Verda volumes to detach: {status}")
+
+
+def _verda_wait_for_vm_deleted(instance_id: str, timeout_sec: int = 300) -> None:
+    deadline = time.time() + timeout_sec
+    last_status = "unknown"
+    while time.time() < deadline:
+        vms = _verda_list_vms()
+        match = next((vm for vm in vms if isinstance(vm, dict) and vm.get("id") == instance_id), None)
+        if not match:
+            return
+        last_status = str(match.get("status") or "unknown")
+        time.sleep(5)
+    raise RuntimeError(f"Timed out waiting for Verda instance {instance_id} to be deleted; last status={last_status}")
+
+
+def _verda_delete_instance(instance_id: str, volume_ids: list[str], *, delete_volumes: bool) -> object:
+    token = _verda_api_token()
+    payload: dict[str, object] = {
+        "action": "delete",
+        "id": instance_id,
+        # Empty list is the documented safe form: delete instance, preserve volumes.
+        "volume_ids": volume_ids if delete_volumes else [],
+    }
+    if delete_volumes:
+        payload["delete_permanently"] = False
+    return _verda_api_request("PUT", "/instances", payload, token)
+
+
+def _verda_hosts_with_live_vms() -> list[dict]:
+    hosts = _load_verda_hosts()
+    by_key: dict[str, dict] = {}
+
+    def add_host(host: dict) -> None:
+        name = str(host.get("name") or "").strip()
+        ssh = _normalize_ssh_command(str(host.get("ssh_command") or ""))
+        if not name or not ssh:
+            return
+        key = _host_from_ssh_command(ssh) or name
+        merged = dict(host)
+        merged["name"] = name
+        merged["ssh_command"] = ssh
+        by_key[key] = {**by_key.get(key, {}), **merged}
+
+    for host in hosts:
+        add_host(host)
+
+    if not VERDA_CLI.exists():
+        return list(by_key.values())
+
+    try:
+        vms = _verda_list_vms()
+    except RuntimeError:
+        return list(by_key.values())
+
+    used_names = {str(host.get("name")) for host in by_key.values()}
+    for vm in vms:
+        if not isinstance(vm, dict):
+            continue
+        ip = str(vm.get("ip") or "").strip()
+        if not ip:
+            continue
+        instance_id = str(vm.get("id") or "").strip()
+        base_name = str(vm.get("hostname") or vm.get("description") or "").strip()
+        name = base_name or (f"verda-{instance_id[:8]}" if instance_id else f"verda-{ip}")
+        if name in used_names and ip not in by_key:
+            suffix = instance_id[:8] if instance_id else ip.replace(".", "-")
+            name = f"{name}-{suffix}"
+        used_names.add(name)
+        add_host({
+            "name": name,
+            "ssh_command": _verda_ssh_command_for_ip(ip),
+            "source": "live",
+            "instance_id": instance_id,
+            "status": vm.get("status"),
+            "location": vm.get("location"),
+            "instance_type": vm.get("instance_type"),
+            "price_per_hour": vm.get("price_per_hour"),
+            "is_spot": vm.get("is_spot"),
+        })
+
+    return list(by_key.values())
+
+
 def _verda_instance_type_prices() -> dict[str, dict]:
     now = time.time()
     cached_prices = _VERDA_INSTANCE_TYPES_CACHE.get("prices")
@@ -1495,7 +1648,7 @@ fi
 
 @app.get("/api/verda/hosts")
 async def list_verda_hosts():
-    return _load_verda_hosts()
+    return _verda_hosts_with_live_vms()
 
 
 @app.get("/api/verda/volumes")
@@ -1549,13 +1702,10 @@ async def teardown_verda(req: VerdaTeardownRequest):
         vm = _verda_find_vm_for_teardown(req)
         instance_id = str(vm.get("id") or "")
         volume_ids = [str(v) for v in (vm.get("volume_ids") or []) if v]
-        command = [str(VERDA_CLI), "--agent", "vm", "delete", instance_id, "--yes", "--wait"]
-        if req.delete_volumes:
-            command.append("--with-volumes")
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=360, check=False)
-        output = (proc.stdout + proc.stderr).strip()
-        if proc.returncode != 0:
-            raise RuntimeError(output or f"verda vm delete exited with {proc.returncode}")
+        output_payload = _verda_delete_instance(instance_id, volume_ids, delete_volumes=req.delete_volumes)
+        _verda_wait_for_vm_deleted(instance_id)
+        if volume_ids and not req.delete_volumes:
+            _verda_wait_for_detached(volume_ids)
 
         remaining_volumes = _verda_list_volumes()
         remaining_by_id = {
@@ -1580,6 +1730,13 @@ async def teardown_verda(req: VerdaTeardownRequest):
         }
         preserved = [remaining_by_id[vol_id] for vol_id in volume_ids if vol_id in remaining_by_id]
         deleted_or_trashed = [vol_id for vol_id in volume_ids if vol_id not in remaining_by_id or vol_id in trashed_ids]
+        if volume_ids and not req.delete_volumes:
+            unsafe = [vol_id for vol_id in volume_ids if vol_id not in remaining_by_id or vol_id in trashed_ids]
+            if unsafe:
+                raise RuntimeError(
+                    "Verda delete completed, but expected preserved volume(s) are missing/trashed: "
+                    + ", ".join(unsafe)
+                )
 
         if req.name:
             hosts = [h for h in _load_verda_hosts() if h.get("name") != req.name]
@@ -1592,7 +1749,7 @@ async def teardown_verda(req: VerdaTeardownRequest):
             "volume_ids": volume_ids,
             "preserved_volumes": preserved,
             "deleted_or_trashed_volume_ids": deleted_or_trashed,
-            "output": output,
+            "output": output_payload,
         }
     except RuntimeError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -2273,14 +2430,25 @@ async function loadVerdaHosts() {
       getInstData(instId).ssh = h.ssh_command;
       const safeName = esc(h.name);
       const safeSsh = esc(h.ssh_command);
+      const metaParts = [h.location, h.instance_type, h.status]
+        .filter(Boolean)
+        .map(v => String(v));
+      if (h.price_per_hour !== undefined && h.price_per_hour !== null) {
+        metaParts.push(`$${Number(h.price_per_hour).toFixed(3)}/hr`);
+      }
+      const liveBadge = h.source === 'live' ? '<span class="pill ok">live</span> ' : '';
+      const meta = metaParts.length ? `${metaParts.join(' · ')} · ${safeSsh}` : safeSsh;
+      const removeButton = h.source === 'live'
+        ? ''
+        : `<button class="btn btn-ghost btn-xs" onclick="event.stopPropagation(); removeVerdaHost('${safeName}')">Remove</button>`;
       return `<div class="inst-card${isSelected ? ' selected' : ''}" data-id="${esc(instId)}"
                    onclick="selectVerdaHost('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}')">
-        <div class="inst-header-name">${safeName}</div>
-        <div class="inst-meta" title="${safeSsh}">${safeSsh}</div>
+        <div class="inst-header-name">${liveBadge}${safeName}</div>
+        <div class="inst-meta" title="${esc(meta)}">${esc(meta)}</div>
         <div class="inst-actions">
           <button class="btn btn-warning btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', false)">Delete VM</button>
           <button class="btn btn-danger btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', true)">Delete VM+Volumes</button>
-          <button class="btn btn-ghost btn-xs" onclick="event.stopPropagation(); removeVerdaHost('${safeName}')">Remove</button>
+          ${removeButton}
         </div>
       </div>`;
     }).join('');
@@ -2318,10 +2486,10 @@ async function removeVerdaHost(name) {
 }
 
 async function teardownVerda(name, ssh, deleteVolumes) {
-  const mode = deleteVolumes ? 'delete the VM and its attached OS/model volumes' : 'delete the VM and keep/detach its volumes';
+  const mode = deleteVolumes ? 'delete the VM and its attached OS/model volumes' : 'detach volumes first, then delete only the VM';
   const warning = deleteVolumes
     ? 'This moves attached volumes toward deletion/trash. Use this only for disposable test volumes.'
-    : 'This should preserve the OS/model volumes for a later Existing volumes deploy.';
+    : 'This preserves the OS/model volumes for a later Existing volumes deploy.';
   if (!confirm(`Verda teardown: ${mode}?\n\n${warning}\n\nHost: ${name}`)) return;
   const expected = deleteVolumes ? 'DELETE VOLUMES' : 'DELETE VM';
   const typed = prompt(`Type ${expected} to confirm.`);
