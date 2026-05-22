@@ -2004,9 +2004,13 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
         </div>
         <div class="fg"><label>Preload Models</label>
           <select id="v-fresh-warm">
+            <option value="flux_stills_v1,juggernaut_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + Juggernaut + WAN + Audio</option>
             <option value="flux_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + WAN + Audio</option>
+            <option value="juggernaut_stills_v1,wan_i2v_v1,stable_audio_v1">Juggernaut + WAN + Audio</option>
             <option value="flux_stills_v1,wan_i2v_v1">Flux + WAN</option>
+            <option value="juggernaut_stills_v1,wan_i2v_v1">Juggernaut + WAN</option>
             <option value="flux_stills_v1">Flux only</option>
+            <option value="juggernaut_stills_v1">Juggernaut only</option>
             <option value="">Skip model preload</option>
           </select>
         </div>
@@ -3240,11 +3244,15 @@ const CONFIG_FIELDS = [
     {value: '120', label: '120s'},
     {value: '300', label: '300s'},
   ]},
-  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio', options: [
-    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio (all)'},
+  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,juggernaut_stills,wan_i2v,stable_audio', options: [
+    {value: 'flux2_stills,juggernaut_stills,wan_i2v,stable_audio', label: 'Flux + Juggernaut + WAN + Audio (all)'},
+    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio'},
+    {value: 'juggernaut_stills,wan_i2v,stable_audio', label: 'Juggernaut + WAN + Audio'},
     {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
+    {value: 'juggernaut_stills,wan_i2v', label: 'Juggernaut + WAN'},
     {value: 'wan_i2v,stable_audio', label: 'WAN + Audio'},
     {value: 'flux2_stills', label: 'Flux (stills only)'},
+    {value: 'juggernaut_stills', label: 'Juggernaut (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
   ]},
   {key: 'WORKER_NAME', label: 'Worker Name', type: 'text', inputId: 'cfg-worker-name', placeholder: 'auto (hostname)'},
