@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -91,112 +88,6 @@ _STATS_LOCK = threading.Lock()
 _STATS: dict[str, deque] = {}
 _STATS_WINDOW = 20
 _ETA_HISTORY: dict[str, deque] = {}
-
-_CUSTOM_NODE_REQUIREMENTS: dict[str, list[dict[str, str]]] = {
-    "flux_stills_v1": [
-        {
-            "name": "ComfyUI_IPAdapter_plus",
-            "repo": "https://github.com/cubiq/ComfyUI_IPAdapter_plus.git",
-            "dest": "ComfyUI_IPAdapter_plus",
-        },
-    ],
-    "juggernaut_stills_v1": [
-        {
-            "name": "ComfyUI_IPAdapter_plus",
-            "repo": "https://github.com/cubiq/ComfyUI_IPAdapter_plus.git",
-            "dest": "ComfyUI_IPAdapter_plus",
-        },
-    ],
-}
-
-
-def _comfy_root() -> Path:
-    """Resolve the local ComfyUI root used by this worker."""
-
-    explicit = os.getenv("COMFY_ROOT")
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path(get_settings().comfy_output_dir).expanduser().parent
-
-
-def _ensure_custom_nodes_for_asset_group(
-    asset_group: str,
-    *,
-    refresh_existing: bool = False,
-) -> tuple[list[str], bool]:
-    """Install custom nodes required by an asset group.
-
-    Model warmup alone is not enough for workflows that depend on custom Comfy
-    node classes. Return (node_names, changed) so callers can restart ComfyUI
-    only when the node tree was actually installed.
-    """
-
-    requirements = _CUSTOM_NODE_REQUIREMENTS.get(asset_group, [])
-    if not requirements:
-        return [], False
-
-    custom_nodes_root = _comfy_root() / "custom_nodes"
-    custom_nodes_root.mkdir(parents=True, exist_ok=True)
-
-    installed: list[str] = []
-    changed = False
-    for item in requirements:
-        name = item["name"]
-        dest = custom_nodes_root / item["dest"]
-        if dest.exists():
-            LOGGER.info("[custom-nodes] %s already installed at %s", name, dest)
-            if refresh_existing:
-                LOGGER.info("[custom-nodes] refreshing %s in %s", name, dest)
-                subprocess.run(
-                    ["git", "-C", str(dest), "pull", "--ff-only"],
-                    check=False,
-                    timeout=180,
-                )
-                changed = True
-                installed.append(name)
-        else:
-            LOGGER.info("[custom-nodes] installing %s into %s", name, dest)
-            subprocess.run(
-                ["git", "clone", "--depth=1", item["repo"], str(dest)],
-                check=True,
-                timeout=180,
-            )
-            changed = True
-            installed.append(name)
-
-        req = dest / "requirements.txt"
-        if req.exists():
-            python_bin = str(_comfy_root() / ".venv" / "bin" / "python")
-            if not Path(python_bin).exists():
-                python_bin = "python3"
-            subprocess.run(
-                [python_bin, "-m", "pip", "install", "-r", str(req)],
-                check=True,
-                timeout=300,
-            )
-
-    return installed, changed
-
-
-def _missing_node_type_from_exception(exc: Exception) -> str | None:
-    """Extract ComfyUI's missing class_type from a failed /prompt response."""
-
-    if not isinstance(exc, requests.exceptions.HTTPError):
-        return None
-    response = exc.response
-    if response is None:
-        return None
-    try:
-        payload = response.json()
-    except Exception:
-        return None
-    error = payload.get("error") if isinstance(payload, dict) else None
-    if not isinstance(error, dict) or error.get("type") != "missing_node_type":
-        return None
-    extra_info = error.get("extra_info")
-    if isinstance(extra_info, dict) and extra_info.get("class_type"):
-        return str(extra_info["class_type"])
-    return None
 
 
 def _declared_capabilities() -> list[str]:
@@ -446,13 +337,8 @@ def _preflight_download_all() -> None:
     LOGGER.info("[preflight] downloading %d asset group(s): %s", len(groups), groups)
 
     downloaded_any = False
-    custom_nodes_changed = False
     for group in groups:
         try:
-            installed_nodes, nodes_changed = _ensure_custom_nodes_for_asset_group(group)
-            if installed_nodes:
-                LOGGER.info("[preflight] %s — installed custom nodes %s", group, installed_nodes)
-            custom_nodes_changed = custom_nodes_changed or nodes_changed
             result = ensure_asset_group(group)
             if result.downloaded_assets:
                 downloaded_any = True
@@ -468,16 +354,16 @@ def _preflight_download_all() -> None:
         except Exception as exc:
             LOGGER.error("[preflight] failed to ensure group=%s: %s", group, exc)
 
-    if downloaded_any or custom_nodes_changed:
+    if downloaded_any:
         with _ACTIVE_JOBS_LOCK:
             active = _ACTIVE_JOBS
         if active > 0:
             LOGGER.info(
-                "[preflight] assets changed but %d job(s) active — deferring ComfyUI restart",
+                "[preflight] new models downloaded but %d job(s) active — deferring ComfyUI restart",
                 active,
             )
         else:
-            LOGGER.info("[preflight] assets changed — restarting ComfyUI once")
+            LOGGER.info("[preflight] new models downloaded — restarting ComfyUI once")
             try:
                 restart_comfy()
                 LOGGER.info("[preflight] ComfyUI restarted, worker ready")
@@ -718,15 +604,12 @@ def ensure_assets(
 
     results: list[EnsureAssetGroupResult] = []
     downloaded_any = False
-    custom_nodes_changed = False
     for asset_group in requested_groups:
         if not _asset_group_allowed(asset_group):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(_asset_group_mismatch_error(asset_group)),
             )
-        _, nodes_changed = _ensure_custom_nodes_for_asset_group(asset_group)
-        custom_nodes_changed = custom_nodes_changed or nodes_changed
         ensure_result = ensure_asset_group(asset_group)
         if ensure_result.downloaded_assets:
             downloaded_any = True
@@ -742,7 +625,7 @@ def ensure_assets(
         )
 
     restart_performed = False
-    if downloaded_any or custom_nodes_changed:
+    if downloaded_any:
         restart_comfy()
         restart_performed = True
 
@@ -819,7 +702,6 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
                 stage_started_monotonic=total_started,
             )
 
-        _, custom_nodes_changed = _ensure_custom_nodes_for_asset_group(request.asset_group)
         ensure_result = ensure_asset_group(request.asset_group)
         downloaded_assets = ensure_result.downloaded_assets
         timings.asset_check_sec = ensure_result.asset_check_sec
@@ -827,7 +709,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         with _WARMED_GROUPS_LOCK:
             _WARMED_GROUPS.add(request.asset_group)
 
-        if downloaded_assets or custom_nodes_changed:
+        if downloaded_assets:
             timings.restart_sec = restart_comfy()
             restart_performed = True
 
@@ -874,61 +756,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             except Exception as exc:
                 is_oom = isinstance(exc, ComfyExecutionError) and exc.is_oom
                 is_restart_detected = isinstance(exc, ComfyRestartDetectedError)
-                missing_node_type = _missing_node_type_from_exception(exc)
                 needs_restart = is_oom or is_restart_detected or not is_comfy_healthy()
-
-                if attempt == 0 and missing_node_type and get_settings().comfy_start_cmd:
-                    LOGGER.warning(
-                        "job_id=%s attempt %d failed because ComfyUI is missing node type %s; "
-                        "refreshing custom nodes and retrying",
-                        request.job_id,
-                        attempt + 1,
-                        missing_node_type,
-                    )
-                    try:
-                        if progress is not None:
-                            _set_progress_stage(
-                                progress,
-                                "starting",
-                                message=f"Installing missing ComfyUI node {missing_node_type}",
-                                eta_sec=_extended_remaining_sec(expected_prompt_sec) + _FINALIZATION_BUFFER_SEC,
-                            )
-                            _update_progress_elapsed(
-                                progress,
-                                total_started_monotonic=total_started,
-                                stage_started_monotonic=time.monotonic(),
-                            )
-                        installed_nodes, _ = _ensure_custom_nodes_for_asset_group(
-                            request.asset_group,
-                            refresh_existing=True,
-                        )
-                        LOGGER.info(
-                            "custom node refresh complete for asset_group=%s nodes=%s",
-                            request.asset_group,
-                            installed_nodes,
-                        )
-                        restart_comfy()
-                        restart_performed = True
-                        LOGGER.info("ComfyUI restarted after missing node repair; retrying job_id=%s", request.job_id)
-                        stage_started = time.monotonic()
-                        if progress is not None:
-                            _set_progress_stage(
-                                progress,
-                                prompt_stage,
-                                message=_prompt_stage_message(progress),
-                                eta_sec=expected_prompt_sec + _FINALIZATION_BUFFER_SEC,
-                            )
-                    except Exception as repair_exc:
-                        LOGGER.error("Missing node repair failed: %s", repair_exc)
-                        timings.total_sec = time.monotonic() - total_started
-                        return _error_response(
-                            request=request, timings=timings,
-                            downloaded_assets=downloaded_assets,
-                            restart_performed=restart_performed,
-                            comfy_prompt_id=prompt_id, history_found=history_found,
-                            error=exc,
-                        )
-                    continue
 
                 if attempt == 0 and needs_restart and get_settings().comfy_start_cmd:
                     reason = "OOM" if is_oom else ("ComfyUI restart detected" if is_restart_detected else type(exc).__name__)
