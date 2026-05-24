@@ -22,6 +22,8 @@ from gpu_worker.utils import is_non_empty_file, safe_unlink
 LOGGER = logging.getLogger(__name__)
 PROMPT_LOGGER = logging.getLogger("gpu_worker.prompts")
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
 
 def _comfy_url(path: str) -> str:
     """Build a ComfyUI URL from a relative API path."""
@@ -373,6 +375,48 @@ def _download_input_source(source_url: str, destination: Path) -> None:
         raise
 
 
+def _is_supported_image_file(path: Path) -> bool:
+    """Return True when the file has a known image container signature."""
+
+    if not is_non_empty_file(path):
+        return False
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+
+    header = data[:16]
+    return (
+        (header.startswith(b"\x89PNG\r\n\x1a\n") and b"IEND" in data[-32:])
+        or (header.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"))
+        or (header.startswith(b"RIFF") and header[8:12] == b"WEBP")
+        or header.startswith((b"GIF87a", b"GIF89a"))
+        or header.startswith(b"BM")
+    )
+
+
+def _requires_image_validation(file_spec: ComfyInputFile) -> bool:
+    """Identify staged inputs that ComfyUI will load as images."""
+
+    if str(file_spec.input_name or "").strip().lower() == "image":
+        return True
+    return Path(str(file_spec.filename or "")).suffix.lower() in _IMAGE_EXTENSIONS
+
+
+def _is_valid_staged_input(path: Path, file_spec: ComfyInputFile) -> bool:
+    if not _requires_image_validation(file_spec):
+        return is_non_empty_file(path)
+    return _is_supported_image_file(path)
+
+
+def _ensure_valid_staged_input(path: Path, file_spec: ComfyInputFile, action: str) -> None:
+    if _is_valid_staged_input(path, file_spec):
+        return
+    if _requires_image_validation(file_spec):
+        raise RuntimeError(f"{action} input file is not a valid image: {path.name}")
+    raise RuntimeError(f"{action} input file is empty: {path.name}")
+
+
 def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) -> Path:
     """Resolve a safe destination under ComfyUI input, honoring an optional subfolder."""
 
@@ -390,24 +434,28 @@ def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) 
 
 
 def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
-    """Stage one file into ComfyUI input and return the staged filename."""
+    """Stage one file into ComfyUI input and return the LoadImage path."""
 
     staged_filename = Path(file_spec.filename).name
     if not staged_filename:
         raise ValueError(f"Invalid comfy input filename: {file_spec.filename!r}")
 
+    subfolder = str(file_spec.subfolder or "").strip().strip("/")
+    staged_input_path = str(Path(subfolder) / staged_filename) if subfolder else staged_filename
     destination = _resolve_input_destination(file_spec, staged_filename)
     destination_dir = destination.parent
     destination_dir.mkdir(parents=True, exist_ok=True)
-    if is_non_empty_file(destination):
-        return staged_filename
+    if _is_valid_staged_input(destination, file_spec):
+        return staged_input_path
+    if destination.exists():
+        LOGGER.warning("Replacing invalid staged Comfy input: %s", destination)
+        safe_unlink(destination)
 
     if file_spec.source_data:
         import base64 as _base64
         destination.write_bytes(_base64.b64decode(file_spec.source_data))
-        if not is_non_empty_file(destination):
-            raise RuntimeError(f"Decoded source_data is empty for: {file_spec.filename}")
-        return staged_filename
+        _ensure_valid_staged_input(destination, file_spec, "Decoded source_data")
+        return staged_input_path
 
     if file_spec.source_path:
         source = _resolve_local_input_source(file_spec.source_path)
@@ -415,13 +463,13 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
             raise FileNotFoundError(f"Comfy input source not found: {source}")
         if source.resolve(strict=False) != destination.resolve(strict=False):
             shutil.copyfile(source, destination)
-        if not is_non_empty_file(destination):
-            raise RuntimeError(f"Copied input file is empty: {destination}")
-        return staged_filename
+        _ensure_valid_staged_input(destination, file_spec, "Copied")
+        return staged_input_path
 
     if file_spec.source_url:
         _download_input_source(file_spec.source_url, destination)
-        return staged_filename
+        _ensure_valid_staged_input(destination, file_spec, "Downloaded")
+        return staged_input_path
 
     raise ValueError(f"Comfy input file has no usable source: {file_spec}")
 
