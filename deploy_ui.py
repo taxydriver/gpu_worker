@@ -49,6 +49,8 @@ class DeployRequest(BaseModel):
     ssh_command: str
     env_vars: dict[str, str] = {}
     worker_port: int = 9000
+    worker_count: int = 0
+    comfy_port: int = 18188
     remote_root: str = "/workspace/filmforge_gpu_worker"
 
 
@@ -71,6 +73,8 @@ class AutoProvisionRequest(BaseModel):
     image: str = "vastai/comfy:v0.15.1-cuda-12.9-py312"
     template_hash: str | None = None
     worker_port: int = 9000
+    worker_count: int = 0
+    comfy_port: int = 18188
     remote_root: str = "/workspace/filmforge_gpu_worker"
     warm_asset_groups: list[str] = []
     env_vars: dict[str, str] = {}
@@ -622,6 +626,17 @@ def _host_from_ssh_command(ssh_command: str) -> str:
     return ""
 
 
+def _host_from_ssh_destination(destination: str) -> str:
+    """Extract the network host from a parsed SSH destination string."""
+
+    target = str(destination or "").strip()
+    if "@" in target:
+        target = target.rsplit("@", 1)[1]
+    if ":" in target and not target.startswith("["):
+        target = target.split(":", 1)[0]
+    return target.strip("[]")
+
+
 def _verda_find_vm_for_teardown(req: VerdaTeardownRequest) -> dict:
     vms = _verda_list_vms()
     if req.instance_id:
@@ -1107,12 +1122,19 @@ async def terminate_runpod_pod(pod_id: str):
 async def start_runpod_provision(req: RunPodProvisionRequest):
     job_id = str(uuid.uuid4())
     q: queue.Queue[str | None] = queue.Queue()
-    _jobs[job_id] = {"status": "running", "logs": [], "queue": q, "worker_url": None, "ssh_command": None}
+    _jobs[job_id] = {
+        "status": "running",
+        "logs": [],
+        "queue": q,
+        "worker_url": None,
+        "worker_urls": [],
+        "ssh_command": None,
+    }
 
     def _run() -> None:
         job = _jobs[job_id]
         try:
-            from gpu_worker.deploy_gpu import extract_worker_url
+            from gpu_worker.deploy_gpu import extract_worker_url, extract_worker_urls
             runpod_python = _find_runpod_python()
             command = [
                 runpod_python, "-u", str(SCRIPT_DIR / "deploy_gpu.py"),
@@ -1186,14 +1208,22 @@ async def list_workers():
 async def start_deploy(req: DeployRequest):
     job_id = str(uuid.uuid4())
     q: queue.Queue[str | None] = queue.Queue()
-    _jobs[job_id] = {"status": "running", "logs": [], "queue": q, "worker_url": None}
+    _jobs[job_id] = {
+        "status": "running",
+        "logs": [],
+        "queue": q,
+        "worker_url": None,
+        "worker_urls": [],
+    }
 
     def _run() -> None:
         job = _jobs[job_id]
         try:
             from gpu_worker.deploy_gpu import (
                 parse_ssh_command, add_default_identity, add_default_host_key_policy,
-                remote_script, extract_worker_url,
+                remote_script, vast_multi_gpu_script, extract_worker_url, extract_worker_urls,
+                verda_fresh_install_script, verda_rehydrate_script,
+                DEFAULT_WORKER_REPO_URL, DEFAULT_COMFY_REPO_URL, DEFAULT_PYTORCH_INDEX_URL,
             )
             _put(job, "[deploy] Parsing SSH command...")
             try:
@@ -1245,7 +1275,99 @@ fi
             env_exports = "\n".join(
                 f"export {k}={shlex.quote(str(v))}" for k, v in req.env_vars.items() if k and v
             )
-            script = remote_script(req.remote_root, req.worker_port)
+            env_vars = dict(req.env_vars or {})
+            is_verda = str(env_vars.get("WORKER_PROVIDER") or "").lower() == "verda"
+            direct_host = _host_from_ssh_destination(destination) if is_verda else None
+            if is_verda:
+                if direct_host and not env_vars.get("WORKER_PUBLIC_URL"):
+                    env_vars["WORKER_PUBLIC_URL"] = f"http://{direct_host}:{req.worker_port}"
+                    _put(job, f"[deploy] Verda direct worker URL: {env_vars['WORKER_PUBLIC_URL']}")
+                if direct_host and int(req.worker_count or 0) > 1 and not env_vars.get("WORKER_PUBLIC_URLS"):
+                    env_vars["WORKER_PUBLIC_URLS"] = ",".join(
+                        f"http://{direct_host}:{req.worker_port + idx}"
+                        for idx in range(int(req.worker_count or 0))
+                    )
+                    _put(job, f"[deploy] Verda direct worker URLs: {env_vars['WORKER_PUBLIC_URLS']}")
+                env_exports = "\n".join(
+                    f"export {k}={shlex.quote(str(v))}" for k, v in env_vars.items() if k and v
+                )
+
+                # Fresh Verda VMs ship with a base Ubuntu image — no ComfyUI.
+                # The shared remote_script (Vast/RunPod path) only probes for an
+                # existing ComfyUI and silently continues if absent, leaving the
+                # worker unable to render. Detect missing ComfyUI and run the
+                # CLI's fresh-install script to clone it and mount /dev/vdb.
+                _put(job, "[deploy] Verda detected — checking for ComfyUI on remote VM...")
+                comfy_check = subprocess.run(
+                    [*ssh_cmd, "test -f /workspace/ComfyUI/main.py && test -x /workspace/ComfyUI/.venv/bin/python"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                if comfy_check.returncode != 0:
+                    _put(job, "[deploy] ComfyUI not installed — running Verda fresh-install (clones ComfyUI, mounts /dev/vdb, installs deps). This takes ~5–10 min.")
+                    install_script = verda_fresh_install_script(
+                        worker_repo_url=DEFAULT_WORKER_REPO_URL,
+                        comfy_repo_url=DEFAULT_COMFY_REPO_URL,
+                        pytorch_index_url=DEFAULT_PYTORCH_INDEX_URL,
+                        remote_root=req.remote_root,
+                    )
+                    if env_exports:
+                        install_script = env_exports + "\n\n" + install_script
+                    iproc = subprocess.Popen(
+                        [*ssh_cmd, "bash", "-s"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    assert iproc.stdin and iproc.stdout
+                    iproc.stdin.write(install_script)
+                    iproc.stdin.close()
+                    for line in iproc.stdout:
+                        line = line.rstrip()
+                        if line:
+                            _put(job, line)
+                    iproc.wait()
+                    if iproc.returncode != 0:
+                        _put(job, f"[deploy] ERROR: Verda fresh-install failed (exit {iproc.returncode})")
+                        job["status"] = "failed"
+                        return
+                    _put(job, "[deploy] Verda fresh-install complete — ComfyUI is now on the VM.")
+                else:
+                    _put(job, "[deploy] ComfyUI already present on remote — skipping fresh-install.")
+            remote_gpu_count = 0
+            try:
+                gpu_probe = subprocess.run(
+                    [*ssh_cmd, "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L | wc -l | tr -d ' ' || true"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                remote_gpu_count = int((gpu_probe.stdout or "0").strip().splitlines()[-1] or "0")
+            except Exception:
+                remote_gpu_count = 0
+
+            requested_worker_count = int(req.worker_count or 0)
+            effective_worker_count = requested_worker_count if requested_worker_count > 0 else remote_gpu_count
+            if is_verda:
+                # Verda: use the rehydrate script so ComfyUI + worker run under
+                # systemd (survives reboots) and the data volume binds re-mount
+                # cleanly. This is the same path the CLI's --verda-fresh uses.
+                _put(job, f"[deploy] Verda bootstrap: {max(effective_worker_count, 1)} worker(s) under systemd.")
+                script = verda_rehydrate_script(
+                    public_ip=direct_host or "",
+                    worker_port=req.worker_port,
+                    comfy_port=req.comfy_port,
+                    worker_count=max(effective_worker_count, 1),
+                    remote_root=req.remote_root,
+                )
+            elif effective_worker_count > 1:
+                _put(job, f"[deploy] Detected {remote_gpu_count} GPUs; starting {effective_worker_count} workers.")
+                script = vast_multi_gpu_script(
+                    remote_root=req.remote_root,
+                    worker_port=req.worker_port,
+                    comfy_port=req.comfy_port,
+                    worker_count=effective_worker_count,
+                )
+            else:
+                script = remote_script(req.remote_root, req.worker_port)
             if env_exports:
                 script = env_exports + "\n\n" + script
 
@@ -1271,12 +1393,17 @@ fi
                 return
 
             stdout_text = "\n".join(stdout_lines)
-            worker_url = extract_worker_url(stdout_text)
+            worker_urls = extract_worker_urls(stdout_text)
+            worker_url = worker_urls[0] if worker_urls else extract_worker_url(stdout_text)
 
             if worker_url:
-                _put(job, f"[deploy] Worker URL: {worker_url}")
+                if worker_urls:
+                    _put(job, f"[deploy] Worker URLs: {', '.join(worker_urls)}")
+                else:
+                    _put(job, f"[deploy] Worker URL: {worker_url}")
                 _put(job, "[deploy] Worker registration is handled by FILMFORGE_BACKEND_URL / render broker heartbeat.")
                 job["worker_url"] = worker_url
+                job["worker_urls"] = worker_urls
             else:
                 _put(job, "[deploy] ERROR: no public worker URL found")
                 job["status"] = "failed"
@@ -1300,12 +1427,19 @@ fi
 async def start_vast_provision(req: AutoProvisionRequest):
     job_id = str(uuid.uuid4())
     q: queue.Queue[str | None] = queue.Queue()
-    _jobs[job_id] = {"status": "running", "logs": [], "queue": q, "worker_url": None, "ssh_command": None}
+    _jobs[job_id] = {
+        "status": "running",
+        "logs": [],
+        "queue": q,
+        "worker_url": None,
+        "worker_urls": [],
+        "ssh_command": None,
+    }
 
     def _run() -> None:
         job = _jobs[job_id]
         try:
-            from gpu_worker.deploy_gpu import extract_worker_url
+            from gpu_worker.deploy_gpu import extract_worker_url, extract_worker_urls
             command = [
                 sys.executable, "-u", str(SCRIPT_DIR / "deploy_gpu.py"),
                 "--vast",
@@ -1315,6 +1449,8 @@ async def start_vast_provision(req: AutoProvisionRequest):
                 "--vast-disk-gb", str(req.disk_gb),
                 "--vast-image", req.image,
                 "--worker-port", str(req.worker_port),
+                "--vast-worker-count", str(req.worker_count),
+                "--vast-comfy-port", str(req.comfy_port),
                 "--remote-root", req.remote_root,
             ]
             if req.template_hash:
@@ -1344,11 +1480,15 @@ async def start_vast_provision(req: AutoProvisionRequest):
                 _put(job, line)
             proc.wait()
             output_text = "\n".join(output_lines)
-            job["worker_url"] = extract_worker_url(output_text) or None
+            worker_urls = extract_worker_urls(output_text)
+            job["worker_urls"] = worker_urls
+            job["worker_url"] = (worker_urls[0] if worker_urls else extract_worker_url(output_text)) or None
             job["ssh_command"] = _extract_ssh_command(output_text) or _last_ssh_command() or None
 
             if proc.returncode == 0:
                 job["status"] = "done"
+                if worker_urls:
+                    _put(job, f"[vast] Worker URLs: {', '.join(worker_urls)}")
                 _put(job, "[vast] Provision complete")
             else:
                 job["status"] = "failed"
@@ -1597,29 +1737,61 @@ async def remote_summary(ssh: str):
         raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
 
     script = r"""set -euo pipefail
-if ! command -v systemctl >/dev/null 2>&1; then
-  exit 0
+if command -v systemctl >/dev/null 2>&1; then
+  units=$(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 2>/dev/null \
+          | awk '{print $1}' | sort -V || true)
+  for unit in $units; do
+    catout=$(systemctl cat "$unit" 2>/dev/null || true)
+    active=$(systemctl is-active "$unit" 2>/dev/null || true)
+    url=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PUBLIC_URL=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+    port=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PORT=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+    name=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_NAME=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+    if test -n "$url"; then
+      printf 'WORKER_URL\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$url" "$name"
+    elif test -n "$port"; then
+      printf 'WORKER_PORT\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$port" "$name"
+    fi
+  done
+  download=$(journalctl -u 'filmforge-worker-gpu*.service' -n 300 --no-pager 2>/dev/null \
+    | grep -E 'Downloading asset progress:|Download complete:|Downloading asset:' \
+    | tail -n 1 || true)
+  if test -n "$download"; then
+    printf 'DOWNLOAD\t%s\n' "$download"
+  fi
 fi
-units=$(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 2>/dev/null \
-        | awk '{print $1}' | sort -V || true)
-for unit in $units; do
-  catout=$(systemctl cat "$unit" 2>/dev/null || true)
-  active=$(systemctl is-active "$unit" 2>/dev/null || true)
-  url=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PUBLIC_URL=//p' | tail -n 1 | sed 's/^"//;s/"$//')
-  port=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_PORT=//p' | tail -n 1 | sed 's/^"//;s/"$//')
-  name=$(printf '%s\n' "$catout" | sed -n 's/^Environment=WORKER_NAME=//p' | tail -n 1 | sed 's/^"//;s/"$//')
+
+# Vast ComfyUI images usually run without systemd. In that case the multi-GPU
+# deploy writes per-worker health files and tunnel logs under /tmp.
+for health in /tmp/filmforge_worker_gpu*_health.json; do
+  test -s "$health" || continue
+  idx=$(printf '%s' "$health" | grep -oE 'gpu[0-9]+' | grep -oE '[0-9]+' | tail -n 1)
+  port=$((9000 + idx))
+  name=$(python3 - "$health" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("worker_name") or "")
+except Exception:
+    pass
+PY
+)
+  url=$(python3 - "$health" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("public_url") or "")
+except Exception:
+    pass
+PY
+)
+  if test -z "$url"; then
+    log="/tmp/filmforge_gpu_worker_tunnel_gpu${idx}.log"
+    url=$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' "$log" 2>/dev/null | tail -n 1 || true)
+  fi
   if test -n "$url"; then
-    printf 'WORKER_URL\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$url" "$name"
-  elif test -n "$port"; then
-    printf 'WORKER_PORT\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$port" "$name"
+    printf 'WORKER_URL\tfilmforge-worker-gpu%s\tunknown\t%s\t%s\n' "$idx" "$url" "$name"
+  elif ss -ltn 2>/dev/null | grep -q ":${port} "; then
+    printf 'WORKER_PORT\tfilmforge-worker-gpu%s\tactive\t%s\t%s\n' "$idx" "$port" "$name"
   fi
 done
-download=$(journalctl -u 'filmforge-worker-gpu*.service' -n 300 --no-pager 2>/dev/null \
-  | grep -E 'Downloading asset progress:|Download complete:|Downloading asset:' \
-  | tail -n 1 || true)
-if test -n "$download"; then
-  printf 'DOWNLOAD\t%s\n' "$download"
-fi
 """
     proc = subprocess.run(
         [*ssh_cmd, "bash", "-s"],
@@ -2004,9 +2176,13 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
         </div>
         <div class="fg"><label>Preload Models</label>
           <select id="v-fresh-warm">
+            <option value="flux_stills_v1,juggernaut_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + Juggernaut + WAN + Audio</option>
             <option value="flux_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + WAN + Audio</option>
+            <option value="juggernaut_stills_v1,wan_i2v_v1,stable_audio_v1">Juggernaut + WAN + Audio</option>
             <option value="flux_stills_v1,wan_i2v_v1">Flux + WAN</option>
+            <option value="juggernaut_stills_v1,wan_i2v_v1">Juggernaut + WAN</option>
             <option value="flux_stills_v1">Flux only</option>
+            <option value="juggernaut_stills_v1">Juggernaut only</option>
             <option value="">Skip model preload</option>
           </select>
         </div>
@@ -2037,7 +2213,7 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
             <option>L40S</option><option>A100 SXM</option><option>A100 PCIe</option>
             <option>H100 PCIe</option><option>H100 SXM</option>
             <option>RTX 6000 Ada</option><option>RTX PRO 6000</option>
-            <option>A6000</option><option>RTX 4090</option><option>B200</option>
+            <option>A6000</option><option>L4</option><option>RTX 4090</option><option>B200</option>
           </select>
         </div>
         <div class="fg" style="margin-bottom:0">
@@ -2060,7 +2236,11 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
           <div class="fg"><label>Max Upload $/GB</label><input id="c-up" type="number" step="0.001" placeholder="any"></div>
           <div class="fg"><label>Max Download $/GB</label><input id="c-down" type="number" step="0.001" placeholder="any"></div>
         </div>
-        <div class="fg"><label>Worker Port</label><input id="c-port" type="number" value="9000"></div>
+        <div class="grid2">
+          <div class="fg"><label>Worker Port</label><input id="c-port" type="number" value="9000"></div>
+          <div class="fg"><label>Workers (0 = auto)</label><input id="c-worker-count" type="number" value="0" min="0"></div>
+        </div>
+        <div class="fg"><label>Comfy Port</label><input id="c-comfy-port" type="number" value="18188"></div>
         <button class="btn btn-ghost btn-xs" onclick="autoDetectTemplate()" style="margin-bottom:6px">↻ Auto-detect template</button>
         <div id="tmpl-status" class="muted text-xs"></div>
       </div>
@@ -2430,6 +2610,9 @@ async function loadVerdaHosts() {
       getInstData(instId).ssh = h.ssh_command;
       const safeName = esc(h.name);
       const safeSsh = esc(h.ssh_command);
+      const nameJson = JSON.stringify(h.name);
+      const sshJson = JSON.stringify(h.ssh_command);
+      const instTypeJson = JSON.stringify(h.instance_type || '');
       const metaParts = [h.location, h.instance_type, h.status]
         .filter(Boolean)
         .map(v => String(v));
@@ -2446,6 +2629,7 @@ async function loadVerdaHosts() {
         <div class="inst-header-name">${liveBadge}${safeName}</div>
         <div class="inst-meta" title="${esc(meta)}">${esc(meta)}</div>
         <div class="inst-actions">
+          <button class="btn btn-success btn-xs" onclick='event.stopPropagation(); redeployVerdaHost(${nameJson}, ${sshJson}, ${instTypeJson})'>Redeploy</button>
           <button class="btn btn-warning btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', false)">Delete VM</button>
           <button class="btn btn-danger btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', true)">Delete VM+Volumes</button>
           ${removeButton}
@@ -2459,6 +2643,32 @@ async function loadVerdaHosts() {
 
 function selectVerdaHost(name, ssh) {
   selectInstance(`verda:${name}`, ssh);
+}
+
+async function redeployVerdaHost(name, ssh, instanceType) {
+  const verdaWorkerPort = Number((document.getElementById('v-worker-port') || {}).value);
+  const fallbackWorkerPort = Number((document.getElementById('c-port') || {}).value);
+  const verdaWorkerCount = Number((document.getElementById('v-worker-count') || {}).value);
+  const verdaComfyPort = Number((document.getElementById('v-comfy-port') || {}).value);
+  const workerPort = verdaWorkerPort || fallbackWorkerPort || 9000;
+  const workerCount = verdaWorkerCount || 0;
+  const host = sshHost(ssh);
+  const env = {};
+  if (host) {
+    env.WORKER_PUBLIC_URL = `http://${host}:${workerPort}`;
+    if (workerCount > 1) {
+      env.WORKER_PUBLIC_URLS = Array.from({length: workerCount}, (_, idx) => `http://${host}:${workerPort + idx}`).join(',');
+    }
+  }
+  await deployToInst(ssh, `verda:${name}`, {
+    provider: 'verda',
+    gpuName: instanceType || document.getElementById('v-instance-type')?.value || 'Verda',
+    workerPort,
+    workerCount,
+    comfyPort: verdaComfyPort || 8188,
+    remoteRoot: document.getElementById('remote-root')?.value || '/workspace/filmforge_gpu_worker',
+    env,
+  });
 }
 
 async function addVerdaHost() {
@@ -2902,14 +3112,27 @@ async function onVerdaJobDone(jobId, instId) {
 }
 
 // ── Deploy to a running instance ──────────────────────────────────────────────
-async function deployToInst(ssh, instId) {
+async function deployToInst(ssh, instId, options = {}) {
   if (!ssh) { alert('No SSH command available for this instance.'); return; }
 
+  const provider = options.provider || 'vast';
   selectInstance(instId, ssh);
   selectLog('deploy');
-  clearLog('Deploying…', 'deploy', String(instId));
-  setStatus('running', '⟳ Deploying…');
+  clearLog(provider === 'verda' ? 'Redeploying Verda worker…' : 'Deploying…', 'deploy', String(instId));
+  setStatus('running', provider === 'verda' ? '⟳ Verda: redeploying…' : '⟳ Deploying…');
   disableActions(true);
+
+  const env = getEnv();
+  Object.assign(env, options.env || {});
+  env.WORKER_PROVIDER = provider;
+  env.WORKER_GPU_NAME = options.gpuName || document.getElementById('c-gpu').value;
+  delete env.RENDER_BROKER_WORKER_ID;
+  if (!env.FILMFORGE_BACKEND_URL || env.FILMFORGE_BACKEND_URL.includes('localhost')) {
+    env.FILMFORGE_BACKEND_URL = 'https://filmforgepythonbackend.fly.dev';
+  }
+  if (!env.RENDER_BROKER_BASE_URL || env.RENDER_BROKER_BASE_URL.includes('localhost')) {
+    env.RENDER_BROKER_BASE_URL = env.FILMFORGE_BACKEND_URL;
+  }
 
   try {
     const res = await fetch('/api/deploy', {
@@ -2917,9 +3140,11 @@ async function deployToInst(ssh, instId) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         ssh_command: ssh,
-        env_vars: getEnv(),
-        worker_port: +document.getElementById('c-port').value || 9000,
-        remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
+        env_vars: env,
+        worker_port: options.workerPort || +document.getElementById('c-port').value || 9000,
+        worker_count: options.workerCount ?? (+document.getElementById('c-worker-count').value || 0),
+        comfy_port: options.comfyPort || +document.getElementById('c-comfy-port').value || 18188,
+        remote_root: options.remoteRoot || document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
       }),
     });
     const {job_id} = await res.json();
@@ -2940,6 +3165,17 @@ async function quickDeploy() {
   setStatus('running', '⟳ Provisioning + deploying…');
   disableActions(true);
 
+  const env = getEnv();
+  env.WORKER_PROVIDER = 'vast';
+  env.WORKER_GPU_NAME = document.getElementById('c-gpu').value;
+  delete env.RENDER_BROKER_WORKER_ID;
+  if (!env.FILMFORGE_BACKEND_URL || env.FILMFORGE_BACKEND_URL.includes('localhost')) {
+    env.FILMFORGE_BACKEND_URL = 'https://filmforgepythonbackend.fly.dev';
+  }
+  if (!env.RENDER_BROKER_BASE_URL || env.RENDER_BROKER_BASE_URL.includes('localhost')) {
+    env.RENDER_BROKER_BASE_URL = env.FILMFORGE_BACKEND_URL;
+  }
+
   try {
     const res = await fetch('/api/provision-vast', {
       method: 'POST',
@@ -2955,9 +3191,11 @@ async function quickDeploy() {
         max_download_cost: numOrNull('c-down'),
         allow_fallback_gpu: false,
         worker_port: +(document.getElementById('c-port').value) || 9000,
+        worker_count: +(document.getElementById('c-worker-count').value) || 0,
+        comfy_port: +(document.getElementById('c-comfy-port').value) || 18188,
         remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
         warm_asset_groups: [],
-        env_vars: getEnv(),
+        env_vars: env,
       }),
     });
     const {job_id} = await res.json();
@@ -2993,13 +3231,14 @@ async function onJobDone(jobId, isProvision, instId) {
   disableActions(false);
   const d = await fetch(`/api/deploy/${jobId}`).then(r => r.json());
   const idata = getInstData(instId);
+  const urls = d.worker_urls && d.worker_urls.length ? d.worker_urls : (d.worker_url ? [d.worker_url] : []);
   idata.status = d.status;
-  idata.workerUrl = d.worker_url;
-  idata.workerUrls = d.worker_urls || [];
+  idata.workerUrl = d.worker_url || urls[0] || null;
+  idata.workerUrls = urls;
   if (d.ssh_command) idata.ssh = d.ssh_command;
 
   if (d.status === 'done') {
-    setStatus('done', '✓ Done' + (d.worker_url ? ' — ' + d.worker_url : ''));
+    setStatus('done', '✓ Done' + (urls.length ? ' — ' + urls.join(', ') : ''));
     if (isProvision) {
       const instances = await loadInstances();
       if (instances && instances.length) {
@@ -3227,6 +3466,7 @@ const CONFIG_FIELDS = [
   ]},
   {key: 'WORKER_PROVIDER', label: 'Provider', type: 'select', selectId: 'cfg-provider', defaultValue: 'dedicated_worker', options: [
     {value: 'dedicated_worker', label: 'Dedicated Worker'},
+    {value: 'vast', label: 'Vast'},
     {value: 'verda', label: 'Verda'},
   ]},
   {key: 'WORKER_MAX_CONCURRENT_JOBS', label: 'Max Concurrent Jobs', type: 'select', selectId: 'cfg-max-jobs', defaultValue: '1', options: [
@@ -3240,11 +3480,15 @@ const CONFIG_FIELDS = [
     {value: '120', label: '120s'},
     {value: '300', label: '300s'},
   ]},
-  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio', options: [
-    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio (all)'},
+  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,juggernaut_stills,wan_i2v,stable_audio', options: [
+    {value: 'flux2_stills,juggernaut_stills,wan_i2v,stable_audio', label: 'Flux + Juggernaut + WAN + Audio (all)'},
+    {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio'},
+    {value: 'juggernaut_stills,wan_i2v,stable_audio', label: 'Juggernaut + WAN + Audio'},
     {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},
+    {value: 'juggernaut_stills,wan_i2v', label: 'Juggernaut + WAN'},
     {value: 'wan_i2v,stable_audio', label: 'WAN + Audio'},
     {value: 'flux2_stills', label: 'Flux (stills only)'},
+    {value: 'juggernaut_stills', label: 'Juggernaut (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
   ]},
   {key: 'WORKER_NAME', label: 'Worker Name', type: 'text', inputId: 'cfg-worker-name', placeholder: 'auto (hostname)'},
@@ -3280,13 +3524,13 @@ function renderConfigPanel() {
     if (field.type === 'select') {
       input = document.createElement('select');
       input.id = field.selectId;
-      input.value = field.defaultValue || '';
       field.options.forEach(opt => {
         const option = document.createElement('option');
         option.value = opt.value;
         option.textContent = opt.label;
         input.appendChild(option);
       });
+      input.value = field.defaultValue || '';
       if (field.options.some(o => o.value === '__custom__')) {
         input.addEventListener('change', () => {
           const custom = document.getElementById(field.inputId);
@@ -3494,6 +3738,16 @@ function numOrNull(id) {
 
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function sshHost(ssh) {
+  const parts = String(ssh || '').trim().split(/\s+/).filter(Boolean);
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i];
+    if (part.startsWith('-')) continue;
+    if (part.includes('@')) return part.split('@').pop().replace(/^\[/, '').replace(/\]$/, '');
+  }
+  return '';
 }
 
 async function copyText(text, btn) {

@@ -88,6 +88,21 @@ You can now rent, deploy, and optionally warm a fresh Vast worker in one command
   --warm-asset-group wan_i2v_v1
 ```
 
+For a Vast offer with multiple GPUs in the same instance, start one worker per
+GPU:
+
+```bash
+./setup_gpu.sh --vast \
+  --vast-gpu "RTX A4000" \
+  --vast-worker-count 2 \
+  --vast-max-price 0.40 \
+  --warm-asset-group flux_stills_v1
+```
+
+`--vast-worker-count 0` is the default and auto-detects the GPU count from the
+selected Vast offer when Vast reports it. Each worker gets its own ComfyUI
+process, `CUDA_VISIBLE_DEVICES`, worker port, public URL, and broker worker id.
+
 This flow:
 
 - searches Vast offers using the provided GPU, VRAM, and price filters

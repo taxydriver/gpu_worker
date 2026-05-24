@@ -513,6 +513,310 @@ printf 'WORKER_HEALTH=%s\\n' "$(cat /tmp/gpu_worker_health.json)"
 """
 
 
+def vast_multi_gpu_script(
+    *,
+    remote_root: str,
+    worker_port: int,
+    comfy_port: int,
+    worker_count: int,
+) -> str:
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_ROOT={shlex.quote(remote_root)}
+WORKER_PORT_BASE={worker_port}
+COMFY_PORT_BASE={comfy_port}
+WORKER_COUNT_REQUESTED={worker_count}
+COMFY_ROOT="/workspace/ComfyUI"
+
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "nvidia-smi not found; GPU drivers are not ready" >&2
+  exit 1
+fi
+
+HAS_SYSTEMD=0
+if test -d /run/systemd/system && systemctl list-units >/dev/null 2>&1; then
+  HAS_SYSTEMD=1
+fi
+
+GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -lt "$GPU_COUNT"; then
+  GPU_COUNT="$WORKER_COUNT_REQUESTED"
+fi
+if test "$GPU_COUNT" -lt 1; then
+  echo "No GPUs detected" >&2
+  exit 1
+fi
+
+if ! test -f "$COMFY_ROOT/main.py"; then
+  echo "ComfyUI not found at $COMFY_ROOT/main.py" >&2
+  exit 1
+fi
+
+mkdir -p "$REMOTE_ROOT"
+cd "$REMOTE_ROOT"
+python3 -m venv .venv
+.venv/bin/pip install -r gpu_worker/requirements.txt
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  echo "Installing aria2c..." >&2
+  apt-get install -y -q aria2 2>/dev/null || true
+fi
+
+if test "$HAS_SYSTEMD" = "1"; then
+  for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 'comfyui-gpu*.service' 2>/dev/null | awk '{{print $1}}'); do
+    systemctl stop "$unit" || true
+  done
+fi
+
+# Stop the template's single ComfyUI process; multi-GPU mode owns one ComfyUI
+# process per GPU so each process can be pinned with CUDA_VISIBLE_DEVICES.
+if supervisorctl status comfyui >/dev/null 2>&1; then
+  supervisorctl stop comfyui >/dev/null 2>&1 || true
+fi
+pkill -f "uvicorn gpu_worker.app:app" || true
+pkill -f "main.py.*--port $COMFY_PORT_BASE" || true
+
+mkdir -p "$COMFY_ROOT/output" "$COMFY_ROOT/temp" "$COMFY_ROOT/input"
+
+COMFY_PYTHON="python3"
+if test -x "/venv/main/bin/python"; then
+  COMFY_PYTHON="/venv/main/bin/python"
+elif test -x "$COMFY_ROOT/.venv/bin/python"; then
+  COMFY_PYTHON="$COMFY_ROOT/.venv/bin/python"
+elif test -x "$COMFY_ROOT/venv/bin/python"; then
+  COMFY_PYTHON="$COMFY_ROOT/venv/bin/python"
+fi
+
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+PUBLIC_URLS="${{WORKER_PUBLIC_URLS:-}}"
+mkdir -p /etc/systemd/system
+
+public_url_for_idx() {{
+  idx="$1"
+  python3 - "$PUBLIC_URLS" "$idx" <<'PY'
+import sys
+urls = [u.strip() for u in (sys.argv[1] or "").split(",")]
+idx = int(sys.argv[2])
+print(urls[idx] if idx < len(urls) else "")
+PY
+}}
+
+start_worker_no_systemd() {{
+  idx="$1"
+  worker_public_url="$2"
+  comfy_port=$((COMFY_PORT_BASE + idx))
+  worker_port=$((WORKER_PORT_BASE + idx))
+  pkill -f "uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}" || true
+  declare -a worker_env
+  worker_env+=(CUDA_VISIBLE_DEVICES="$idx")
+  worker_env+=(COMFY_BASE_URL="http://127.0.0.1:${{comfy_port}}")
+  worker_env+=(COMFY_OUTPUT_DIR="$COMFY_ROOT/output")
+  worker_env+=(COMFY_TEMP_DIR="$COMFY_ROOT/temp")
+  worker_env+=(COMFY_INPUT_DIR="$COMFY_ROOT/input")
+  worker_env+=(WORKER_HOST="0.0.0.0")
+  worker_env+=(WORKER_PORT="$worker_port")
+  worker_env+=(WORKER_NAME="filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}")
+  worker_env+=(WORKER_PROVIDER="vast")
+  worker_env+=(WORKER_GPU_NAME="$GPU_NAME")
+  worker_env+=(WORKER_VRAM_GB="$VRAM_GB")
+  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1}}")
+  worker_env+=(WORKER_ID_FILE="/workspace/.filmforge_worker_gpu${{idx}}.id")
+  worker_env+=(MODEL_DOWNLOAD_TIMEOUT_SEC="7200")
+  worker_env+=(COMFY_HEALTH_TIMEOUT_SEC="180")
+  worker_env+=(COMFY_STOP_CMD="pkill -f 'main.py.*--port ${{comfy_port}}' || true")
+  worker_env+=(COMFY_START_CMD="cd $COMFY_ROOT && CUDA_VISIBLE_DEVICES=${{idx}} $COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory $COMFY_ROOT/user_gpu${{idx}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}} >> /tmp/comfyui_gpu${{idx}}.log 2>&1 &")
+  worker_env+=(WORKER_MAX_CONCURRENT_JOBS="1")
+  worker_env+=(WORKER_HEARTBEAT_SECONDS="30")
+  worker_env+=(RENDER_BROKER_HEARTBEAT_SEC="30")
+  worker_env+=(TMPDIR="/tmp")
+  test -n "$worker_public_url" && worker_env+=(WORKER_PUBLIC_URL="$worker_public_url")
+  test -n "${{FILMFORGE_BACKEND_URL:-}}" && worker_env+=(FILMFORGE_BACKEND_URL="${{FILMFORGE_BACKEND_URL}}")
+  test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && worker_env+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
+  test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}" && worker_env+=(RENDER_BROKER_WORKER_TOKEN="${{RENDER_BROKER_WORKER_TOKEN}}")
+  test -n "${{WORKER_API_TOKEN:-}}" && worker_env+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
+  nohup env "${{worker_env[@]}}" "$REMOTE_ROOT/.venv/bin/python" -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$worker_port" \\
+    >/tmp/gpu_worker_gpu${{idx}}.log 2>&1 </dev/null &
+}}
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  comfy_port=$((COMFY_PORT_BASE + idx))
+  worker_port=$((WORKER_PORT_BASE + idx))
+  comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+  comfy_temp_dir="$COMFY_ROOT/temp/gpu${{idx}}"
+  mkdir -p "$comfy_user_dir" "$comfy_temp_dir"
+
+  cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
+[Unit]
+Description=ComfyUI GPU ${{idx}}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$COMFY_ROOT
+Environment=CUDA_VISIBLE_DEVICES=${{idx}}
+ExecStart=$COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory ${{comfy_user_dir}} --temp-directory ${{comfy_temp_dir}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  worker_public_url="$(public_url_for_idx "$idx")"
+  if test -z "$worker_public_url" && test -n "${{WORKER_PUBLIC_URL:-}}" && test "$idx" = "0"; then
+    worker_public_url="$WORKER_PUBLIC_URL"
+  fi
+
+  cat > "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
+[Unit]
+Description=FilmForge GPU Worker API GPU ${{idx}}
+After=network-online.target comfyui-gpu${{idx}}.service
+Wants=network-online.target comfyui-gpu${{idx}}.service
+
+[Service]
+Type=simple
+WorkingDirectory=$REMOTE_ROOT
+Environment=CUDA_VISIBLE_DEVICES=${{idx}}
+Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
+Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
+Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
+Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
+Environment=WORKER_HOST=0.0.0.0
+Environment=WORKER_PORT=${{worker_port}}
+Environment=WORKER_NAME=filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}
+Environment=WORKER_PROVIDER=vast
+Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
+Environment=WORKER_VRAM_GB=${{VRAM_GB}}
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1}}"
+Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
+Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
+Environment=COMFY_HEALTH_TIMEOUT_SEC=180
+Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
+Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
+Environment=WORKER_MAX_CONCURRENT_JOBS=1
+Environment=WORKER_HEARTBEAT_SECONDS=30
+Environment=RENDER_BROKER_HEARTBEAT_SEC=30
+UNIT
+
+  if test -n "$worker_public_url"; then
+    echo "Environment=WORKER_PUBLIC_URL=$worker_public_url" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
+    echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
+    echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}"; then
+    echo "Environment=RENDER_BROKER_WORKER_TOKEN=${{RENDER_BROKER_WORKER_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_API_TOKEN:-}}"; then
+    echo "Environment=WORKER_API_TOKEN=${{WORKER_API_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+
+  cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
+ExecStart=$REMOTE_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+done
+
+if test "$HAS_SYSTEMD" = "1"; then
+  systemctl daemon-reload
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    systemctl enable --now "comfyui-gpu${{idx}}.service"
+  done
+else
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    comfy_port=$((COMFY_PORT_BASE + idx))
+    comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+    comfy_temp_dir="$COMFY_ROOT/temp/gpu${{idx}}"
+    nohup env CUDA_VISIBLE_DEVICES="$idx" "$COMFY_PYTHON" "$COMFY_ROOT/main.py" \\
+      --listen 127.0.0.1 --port "$comfy_port" --enable-cors-header \\
+      --user-directory "$comfy_user_dir" --temp-directory "$comfy_temp_dir" \\
+      >/tmp/comfyui_gpu${{idx}}.log 2>&1 </dev/null &
+  done
+fi
+
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  port=$((COMFY_PORT_BASE + idx))
+  for _ in $(seq 1 90); do
+    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+done
+
+if test "$HAS_SYSTEMD" = "1"; then
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    systemctl enable --now "filmforge-worker-gpu${{idx}}.service"
+  done
+else
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    start_worker_no_systemd "$idx" "$(public_url_for_idx "$idx")"
+  done
+fi
+
+declare -a WORKER_URLS
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  port=$((WORKER_PORT_BASE + idx))
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:${{port}}/health" >/tmp/filmforge_worker_gpu${{idx}}_health.json 2>/dev/null; then
+      break
+    fi
+    sleep 2
+  done
+  if ! test -s "/tmp/filmforge_worker_gpu${{idx}}_health.json"; then
+    echo "Worker gpu${{idx}} failed health check" >&2
+    journalctl -u "filmforge-worker-gpu${{idx}}.service" -n 100 --no-pager >&2 || true
+    exit 1
+  fi
+
+  worker_url="$(public_url_for_idx "$idx")"
+  if test -z "$worker_url" && test -x /opt/instance-tools/bin/cloudflared; then
+    >/tmp/filmforge_gpu_worker_tunnel_gpu${{idx}}.log
+    pkill -f "cloudflared tunnel --url http://127.0.0.1:${{port}}" || true
+    nohup /opt/instance-tools/bin/cloudflared tunnel --url "http://127.0.0.1:${{port}}" --protocol http2 --no-autoupdate \\
+      >/tmp/filmforge_gpu_worker_tunnel_gpu${{idx}}.log 2>&1 </dev/null &
+    for _ in $(seq 1 30); do
+      worker_url="$(grep -aEo 'https://[-a-z0-9]+\\.trycloudflare\\.com' /tmp/filmforge_gpu_worker_tunnel_gpu${{idx}}.log | tail -n 1 || true)"
+      if test -n "$worker_url"; then
+        if test "$HAS_SYSTEMD" = "1"; then
+          systemctl set-environment WORKER_PUBLIC_URL_GPU${{idx}}="$worker_url" >/dev/null 2>&1 || true
+          sed -i "/^Environment=WORKER_PUBLIC_URL=/d" "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+          sed -i "/^Environment=WORKER_ID_FILE=/i Environment=WORKER_PUBLIC_URL=$worker_url" "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+          systemctl daemon-reload
+          systemctl restart "filmforge-worker-gpu${{idx}}.service"
+        else
+          start_worker_no_systemd "$idx" "$worker_url"
+        fi
+        break
+      fi
+      sleep 1
+    done
+  fi
+
+  if test -n "$worker_url"; then
+    WORKER_URLS+=("$worker_url")
+    echo "WORKER_URL=$worker_url"
+  fi
+  echo "WORKER_HEALTH_GPU${{idx}}=$(cat /tmp/filmforge_worker_gpu${{idx}}_health.json)"
+done
+
+if test "${{#WORKER_URLS[@]}}" -gt 0; then
+  (IFS=,; echo "WORKER_URLS=${{WORKER_URLS[*]}}")
+fi
+echo "GPU_COUNT=${{GPU_COUNT}}"
+"""
+
+
 def update_env_file(env_path: Path, worker_url: str) -> None:
     content = env_path.read_text()
     line = f"GPU_WORKER_BASE_URL={worker_url}"
@@ -623,6 +927,46 @@ def _vast_preferred_offer_sort_key(offer: dict) -> tuple[float, float, float, fl
     return (_vast_transfer_cost(offer), price, -reliability, -dlperf)
 
 
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 1 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return int(number) if number >= 1 else None
+    if isinstance(value, (list, tuple, set)):
+        return len(value) if value else None
+    if isinstance(value, dict):
+        return len(value) if value else None
+    return None
+
+
+def _positive_float(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) > 0 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+        return number if number > 0 else None
+    return None
+
+
 def _select_vast_offer(args: argparse.Namespace) -> dict:
     query = " ".join(
         [
@@ -661,11 +1005,30 @@ def _select_vast_offer(args: argparse.Namespace) -> dict:
         candidates = offers
     else:
         raise RuntimeError(f"No Vast offers matched the requested GPU {args.vast_gpu!r}.")
+    requested_worker_count = int(getattr(args, "vast_worker_count", 0) or 0)
+    if requested_worker_count > 1:
+        multi_gpu_candidates = [
+            offer for offer in candidates
+            if _vast_offer_gpu_count(offer) >= requested_worker_count
+        ]
+        if multi_gpu_candidates:
+            candidates = multi_gpu_candidates
+        else:
+            log(
+                f"No Vast offers in the current result set reported "
+                f"{requested_worker_count}+ GPUs; falling back to single-worker selection."
+            )
     selected = sorted(candidates, key=_vast_preferred_offer_sort_key)[0]
+    selected_gpu_count = _vast_offer_gpu_count(selected)
+    selected_price = float(selected.get("dph_total") or selected.get("dph") or 0.0)
+    selected_worker_count = max(1, min(selected_gpu_count, requested_worker_count or selected_gpu_count))
+    per_worker_price = selected_price / selected_worker_count if selected_worker_count else selected_price
     log(
         "Selected Vast offer "
         f"id={selected.get('id')} gpu={selected.get('gpu_name')} "
-        f"price=${float(selected.get('dph_total') or selected.get('dph') or 0.0):.3f}/hr "
+        f"gpus={selected_gpu_count} "
+        f"price=${selected_price:.3f}/hr "
+        f"per_worker=${per_worker_price:.3f}/hr "
         f"up=${float(selected.get('inet_up_cost') or 0.0):.4f}/GB "
         f"down=${float(selected.get('inet_down_cost') or 0.0):.4f}/GB"
     )
@@ -730,6 +1093,80 @@ def _vast_direct_worker_url(
                     if host_port:
                         return f"http://{public_ip}:{host_port}"
         time.sleep(5)
+    return None
+
+
+def _vast_offer_gpu_count(offer: dict) -> int:
+    """Best-effort GPU count from a Vast offer payload."""
+
+    for key in (
+        "num_gpus",
+        "gpu_count",
+        "num_gpus_total",
+        "gpu_count_total",
+        "total_gpus",
+        "gpu_quantity",
+        "gpus",
+        "gpu_ids",
+        "gpu_names",
+    ):
+        count = _positive_int(offer.get(key))
+        if count:
+            return count
+
+    per_gpu_ram = _positive_float(offer.get("gpu_ram") or offer.get("gpu_memory"))
+    total_gpu_ram = _positive_float(
+        offer.get("gpu_total_ram")
+        or offer.get("gpu_totalram")
+        or offer.get("gpu_ram_total")
+        or offer.get("total_gpu_ram")
+        or offer.get("gpu_memory_total")
+    )
+    if per_gpu_ram and total_gpu_ram and total_gpu_ram >= per_gpu_ram:
+        count = round(total_gpu_ram / per_gpu_ram)
+        if count > 0:
+            return count
+
+    for key in ("gpu_name", "gpu_display_name", "bundle_id"):
+        value = str(offer.get(key) or "")
+        for pattern in (
+            r"\b(\d+)\s*x\b",
+            r"\bx\s*(\d+)\b",
+            r"\b(\d+)\s+gpus?\b",
+        ):
+            match = re.search(pattern, value, flags=re.IGNORECASE)
+            if match:
+                return max(1, int(match.group(1)))
+
+    return 1
+
+
+def _vast_remote_gpu_count(args: argparse.Namespace) -> int | None:
+    """Read the actual GPU count from the rented Vast instance over SSH."""
+
+    try:
+        ssh_cmd, _, _ = parse_ssh_command(args.ssh_command)
+        ssh_cmd = add_default_identity(ssh_cmd, override=args.ssh_identity)
+        ssh_cmd = add_default_host_key_policy(ssh_cmd)
+        result = subprocess.run(
+            [
+                *ssh_cmd,
+                "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L | wc -l | tr -d ' ' || true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        log(f"Could not query remote Vast GPU count: {exc}")
+        return None
+
+    count = _positive_int((result.stdout or "").strip().splitlines()[-1] if result.stdout else None)
+    if count:
+        return count
+    if result.stderr.strip():
+        log(f"Remote Vast GPU count query returned no count: {result.stderr.strip().splitlines()[-1]}")
     return None
 
 
@@ -1006,6 +1443,10 @@ mkdir -p /mnt/data
 if ! mountpoint -q /mnt/data; then
   mount /dev/vdb /mnt/data
 fi
+VDB_UUID="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
+if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
+  echo "UUID=$VDB_UUID /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
 
 for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 'comfyui-gpu*.service' 2>/dev/null | awk '{{print $1}}'); do
   systemctl stop "$unit" || true
@@ -1214,8 +1655,30 @@ apt-get install -y --no-install-recommends \\
 
 mkdir -p /opt /workspace "$REMOTE_ROOT"
 
-if test -b /dev/vdb && ! blkid /dev/vdb >/dev/null 2>&1; then
-  mkfs.ext4 -F /dev/vdb
+# Mount the 150G data volume at /mnt/data early so it's available — but do
+# NOT bind-mount onto /workspace/ComfyUI/* yet. Cloning ComfyUI needs to
+# `rm -rf "$COMFY_ROOT"` if a stub exists, and that fails on bind mounts
+# with "Device or resource busy". We move the asset dirs onto the data
+# volume AFTER ComfyUI is installed (see _bind_comfy_asset_dirs below).
+if test -b /dev/vdb; then
+  if ! blkid /dev/vdb >/dev/null 2>&1; then
+    mkfs.ext4 -F /dev/vdb
+  fi
+  mkdir -p /mnt/data
+  if ! mountpoint -q /mnt/data; then
+    mount /dev/vdb /mnt/data
+  fi
+  VDB_UUID="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
+  if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
+    echo "UUID=$VDB_UUID /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+  fi
+  # Tear down any stale bind mounts from a prior failed run so the rm -rf
+  # ahead of git clone can succeed.
+  for dir in models input output temp; do
+    if mountpoint -q "$COMFY_ROOT/$dir" 2>/dev/null; then
+      umount "$COMFY_ROOT/$dir" || true
+    fi
+  done
 fi
 
 if test -d "$WORKER_ROOT/.git"; then
@@ -1259,6 +1722,29 @@ for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
     "$COMFY_ROOT/.venv/bin/python" -m pip install -r "$req" || true
   fi
 done
+
+# Now that ComfyUI is fully installed, move its asset dirs onto the 150GB
+# data volume and bind-mount them back. Doing this AFTER install avoids the
+# rm-on-busy-mount problem (the install needs to `rm -rf "$COMFY_ROOT"` for
+# a clean clone, which fails if the subdirs are bind mounts).
+if mountpoint -q /mnt/data; then
+  mkdir -p /mnt/data/ComfyUI/models /mnt/data/ComfyUI/input \
+           /mnt/data/ComfyUI/output /mnt/data/ComfyUI/temp
+  for dir in models input output temp; do
+    if mountpoint -q "$COMFY_ROOT/$dir"; then
+      continue
+    fi
+    mkdir -p "$COMFY_ROOT/$dir"
+    # Seed the data volume with whatever ComfyUI shipped (usually empty
+    # placeholder subdirs like models/checkpoints, models/vae, etc.).
+    if test -n "$(ls -A "$COMFY_ROOT/$dir" 2>/dev/null || true)"; then
+      cp -aRT "$COMFY_ROOT/$dir/" "/mnt/data/ComfyUI/$dir/"
+      rm -rf "$COMFY_ROOT/$dir"
+      mkdir -p "$COMFY_ROOT/$dir"
+    fi
+    mount --bind "/mnt/data/ComfyUI/$dir" "$COMFY_ROOT/$dir"
+  done
+fi
 
 echo "FRESH_INSTALL_DONE=1"
 """
@@ -1761,6 +2247,20 @@ def vast_deploy(args: argparse.Namespace) -> int:
         raise RuntimeError(f"SSH private key not found at {identity}")
 
     offer = _select_vast_offer(args)
+    offer_gpu_count = _vast_offer_gpu_count(offer)
+    requested_worker_count = int(getattr(args, "vast_worker_count", 0) or 0)
+    effective_worker_count = requested_worker_count if requested_worker_count > 0 else offer_gpu_count
+    effective_worker_count = max(1, effective_worker_count)
+    # When Vast's offer payload omits the GPU count, still expose the first two
+    # worker ports so a 2-GPU host can use direct URLs after SSH confirms it.
+    port_publish_count = effective_worker_count
+    if requested_worker_count == 0:
+        port_publish_count = max(port_publish_count, 2)
+
+    port_publish_flags = " ".join(
+        f"-p {args.worker_port + idx}:{args.worker_port + idx}"
+        for idx in range(port_publish_count)
+    )
     create_args = [
         "create",
         "instance",
@@ -1777,7 +2277,7 @@ def vast_deploy(args: argparse.Namespace) -> int:
             "--ssh",
             "--direct",
             "--env",
-            f"-p {args.worker_port}:{args.worker_port}",
+            port_publish_flags,
         ]
     )
     create = _vastai(*create_args, timeout=120)
@@ -1794,17 +2294,21 @@ def vast_deploy(args: argparse.Namespace) -> int:
 
     args.ssh_identity = identity
 
-    # Start polling for direct port mapping in parallel with SSH wait
+    # Start polling for direct port mappings in parallel with SSH wait.
     import threading
-    direct_url_result: list[str | None] = [None]
+    direct_url_results: list[str | None] = [None] * port_publish_count
 
-    def _poll_direct_url() -> None:
-        direct_url_result[0] = _vast_direct_worker_url(
-            instance_id, args.worker_port, timeout_sec=args.vast_boot_timeout
+    def _poll_direct_url(idx: int) -> None:
+        direct_url_results[idx] = _vast_direct_worker_url(
+            instance_id, args.worker_port + idx, timeout_sec=args.vast_boot_timeout
         )
 
-    poll_thread = threading.Thread(target=_poll_direct_url, daemon=True)
-    poll_thread.start()
+    poll_threads = [
+        threading.Thread(target=_poll_direct_url, args=(idx,), daemon=True)
+        for idx in range(port_publish_count)
+    ]
+    for thread in poll_threads:
+        thread.start()
 
     args.ssh_command = _wait_for_vast_ssh_command(
         instance_id,
@@ -1812,26 +2316,57 @@ def vast_deploy(args: argparse.Namespace) -> int:
         timeout_sec=args.vast_boot_timeout,
     )
 
-    # Give the poll thread a moment to finish if it hasn't already
-    poll_thread.join(timeout=30)
-    direct_url = direct_url_result[0]
+    remote_gpu_count = _vast_remote_gpu_count(args)
+    if remote_gpu_count:
+        if requested_worker_count > 0:
+            effective_worker_count = min(requested_worker_count, remote_gpu_count)
+            if effective_worker_count < requested_worker_count:
+                log(
+                    f"Requested {requested_worker_count} Vast workers, but the rented "
+                    f"instance exposes {remote_gpu_count} GPU(s); using {effective_worker_count}."
+                )
+        else:
+            effective_worker_count = remote_gpu_count
+        effective_worker_count = max(1, effective_worker_count)
+    args._vast_effective_worker_count = effective_worker_count
+    if effective_worker_count > 1:
+        log(f"Vast multi-GPU mode: starting {effective_worker_count} worker services on one instance.")
+    else:
+        log("Vast single-GPU mode: using legacy worker bootstrap.")
 
-    if direct_url:
-        log(f"Vast direct worker URL: {direct_url}")
+    # Give the poll threads a moment to finish if they haven't already.
+    for thread in poll_threads:
+        thread.join(timeout=30)
+    if effective_worker_count > len(direct_url_results):
+        direct_url_results.extend([None] * (effective_worker_count - len(direct_url_results)))
+    direct_url_results = direct_url_results[:effective_worker_count]
+    direct_urls = [url for url in direct_url_results if url]
+    direct_url = direct_url_results[0] if direct_url_results else None
+
+    if direct_urls:
+        for idx, url in enumerate(direct_url_results):
+            if url:
+                log(f"Vast direct worker URL gpu{idx}: {url}")
         env_vars = list(getattr(args, "env_vars", []) or [])
-        if not any(v.startswith("WORKER_PUBLIC_URL=") for v in env_vars):
+        if effective_worker_count > 1 and not any(v.startswith("WORKER_PUBLIC_URLS=") for v in env_vars):
+            env_vars.append(f"WORKER_PUBLIC_URLS={','.join(url or '' for url in direct_url_results)}")
+            args.env_vars = env_vars
+        elif direct_url and not any(v.startswith("WORKER_PUBLIC_URL=") for v in env_vars):
             env_vars.append(f"WORKER_PUBLIC_URL={direct_url}")
             args.env_vars = env_vars
     else:
         log(
-            f"Could not resolve Vast direct port mapping for container port "
-            f"{args.worker_port} within {args.vast_boot_timeout}s; "
+            f"Could not resolve Vast direct port mapping for worker port(s) "
+            f"{args.worker_port}..{args.worker_port + effective_worker_count - 1} "
+            f"within {args.vast_boot_timeout}s; "
             f"falling back to cloudflared."
         )
 
     exit_code, worker_url = _do_deploy(args)
-    if exit_code == 0 and worker_url and args.warm_asset_groups and not args.skip_warmup:
-        _run_worker_warmup(args, worker_url)
+    worker_urls = getattr(args, "_last_worker_urls", None) or ([worker_url] if worker_url else [])
+    if exit_code == 0 and worker_urls and args.warm_asset_groups and not args.skip_warmup:
+        for url in worker_urls:
+            _run_worker_warmup(args, url)
     return exit_code
 
 
@@ -1871,14 +2406,30 @@ fi
         # Auto-inject critical env vars from backend .env if not already provided
         env_vars = list(getattr(args, "env_vars", []) or [])
         existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
-        for key in ("FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_ID", "WORKER_CAPABILITIES"):
+        requested_vast_workers = int(getattr(args, "vast_worker_count", 0) or 0)
+        effective_vast_workers = int(
+            getattr(args, "_vast_effective_worker_count", 0) or requested_vast_workers or 1
+        )
+        is_vast_multi = effective_vast_workers > 1
+        auto_env_keys = ["FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "WORKER_CAPABILITIES"]
+        if not is_vast_multi:
+            auto_env_keys.append("RENDER_BROKER_WORKER_ID")
+        for key in auto_env_keys:
             if key not in existing_keys:
                 value = _read_env_value(args.backend_env, key)
                 if value:
                     env_vars.append(f"{key}={value}")
                     log(f"Auto-injected {key} from backend .env")
 
-        script = remote_script(args.remote_root, args.worker_port)
+        if is_vast_multi:
+            script = vast_multi_gpu_script(
+                remote_root=args.remote_root,
+                worker_port=args.worker_port,
+                comfy_port=args.vast_comfy_port,
+                worker_count=effective_vast_workers,
+            )
+        else:
+            script = remote_script(args.remote_root, args.worker_port)
         env_exports = build_env_exports(env_vars)
         if env_exports:
             script = f"{env_exports}\n\n{script}"
@@ -1900,8 +2451,15 @@ fi
     if remote_result.stderr:
         print(remote_result.stderr, file=sys.stderr, end="")
 
+    worker_urls = extract_worker_urls(remote_result.stdout)
+    if worker_urls:
+        log("Worker URLs:")
+        for url in worker_urls:
+            log(f"  {url}")
+        setattr(args, "_last_worker_urls", worker_urls)
+
     # For RunPod: use proxy URL since cloudflared won't be available
-    worker_url = extract_worker_url(remote_result.stdout)
+    worker_url = worker_urls[0] if worker_urls else extract_worker_url(remote_result.stdout)
     if not worker_url and pod_id:
         worker_url = _runpod_proxy_url(pod_id, args.worker_port)
         log(f"Using RunPod proxy URL: {worker_url}")
@@ -2097,6 +2655,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_VAST_BOOT_TIMEOUT,
         help=f"Seconds to wait for Vast SSH readiness. Default: {DEFAULT_VAST_BOOT_TIMEOUT}",
+    )
+    parser.add_argument(
+        "--vast-comfy-port",
+        type=int,
+        default=int(os.getenv("VAST_COMFY_PORT", "18188")),
+        help="Base ComfyUI port for Vast multi-GPU workers. Default: 18188",
+    )
+    parser.add_argument(
+        "--vast-worker-count",
+        type=int,
+        default=int(os.getenv("VAST_WORKER_COUNT", "0")),
+        help=(
+            "Number of worker services to start on a Vast instance. "
+            "0 auto-detects from the selected offer; 1 keeps the legacy single-worker flow."
+        ),
     )
     parser.add_argument(
         "--verda-cli",

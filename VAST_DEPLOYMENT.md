@@ -158,6 +158,20 @@ Use `WORKER_CAPABILITIES=flux2_stills` for a Flux stills worker and
 `WORKER_CAPABILITIES=wan_i2v` for a WAN video worker. Keep
 `GPU_WORKER_BASE_URL` only as a legacy local-dev single-worker fallback.
 
+For a Vast instance with two GPUs, use the automated multi-GPU path:
+
+```bash
+./setup_gpu.sh --vast \
+  --vast-gpu "RTX A4000" \
+  --vast-worker-count 2 \
+  --vast-max-price 0.40
+```
+
+This starts `comfyui-gpu0`/`filmforge-worker-gpu0` and
+`comfyui-gpu1`/`filmforge-worker-gpu1`. The workers use ports `9000` and
+`9001`, ComfyUI ports `18188` and `18189`, and separate
+`WORKER_ID_FILE` values so they register as two broker workers.
+
 ## Step 6: What The Worker Downloads
 
 The worker auto-downloads models on first use by asset group.
