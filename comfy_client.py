@@ -140,8 +140,11 @@ def _history_entry_complete(entry: dict[str, Any]) -> bool:
         return True
 
     status = entry.get("status")
-    if isinstance(status, dict) and status.get("completed") is True:
-        return True
+    if isinstance(status, dict):
+        if status.get("completed") is True:
+            return True
+        if status.get("status_str") == "error":
+            return True
 
     return False
 
