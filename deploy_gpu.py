@@ -1689,8 +1689,37 @@ WORKER_REPO_URL={shlex.quote(worker_repo_url)}
 COMFY_REPO_URL={shlex.quote(comfy_repo_url)}
 PYTORCH_INDEX_URL={shlex.quote(pytorch_index_url)}
 
-apt-get update
-apt-get install -y --no-install-recommends \\
+wait_for_apt_locks() {{
+  local waited=0
+  local timeout="${{APT_LOCK_TIMEOUT_SEC:-600}}"
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    if test "$waited" -ge "$timeout"; then
+      echo "Timed out waiting for apt/dpkg locks after ${{timeout}}s" >&2
+      fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock >&2 || true
+      return 1
+    fi
+    echo "Waiting for apt/dpkg locks to clear... (${{waited}}s)" >&2
+    sleep 5
+    waited=$((waited + 5))
+  done
+}}
+
+apt_retry() {{
+  local attempt
+  for attempt in 1 2 3; do
+    wait_for_apt_locks
+    if apt-get "$@"; then
+      return 0
+    fi
+    echo "apt-get $* failed on attempt ${{attempt}}; retrying..." >&2
+    sleep 10
+  done
+  wait_for_apt_locks
+  apt-get "$@"
+}}
+
+apt_retry update
+apt_retry install -y --no-install-recommends \\
   ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv \\
   build-essential e2fsprogs ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 
