@@ -44,7 +44,7 @@ DEFAULT_VERDA_FRESH_STORAGE_SIZE = 250
 DEFAULT_VERDA_CONTRACT = "pay_as_go"
 DEFAULT_WORKER_REPO_URL = "https://github.com/taxydriver/gpu_worker.git"
 DEFAULT_COMFY_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
-DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
+DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1"]
 
 # Ordered list of candidate identity files to try when none is specified
@@ -220,9 +220,19 @@ def has_identity_config(cmd: list[str]) -> bool:
 
 
 def add_default_host_key_policy(cmd: list[str]) -> list[str]:
+    # Ephemeral cloud GPUs (Vast/RunPod/Verda) reuse host:port across instances,
+    # so a cached known_hosts entry from a destroyed rental will reject the new
+    # one with "Host key verification failed". Bypass known_hosts entirely.
     if has_ssh_option(cmd, "StrictHostKeyChecking"):
         return cmd
-    return [cmd[0], "-o", "StrictHostKeyChecking=accept-new", *cmd[1:]]
+    return [
+        cmd[0],
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "GlobalKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        *cmd[1:],
+    ]
 
 
 def add_default_identity(cmd: list[str], override: Path | None = None) -> list[str]:
@@ -1291,6 +1301,30 @@ def _verda_find_volume(volumes: object, volume_id: str) -> dict:
     raise RuntimeError(f"Verda volume not found: {volume_id}")
 
 
+def _verda_available_instance_types(args: argparse.Namespace) -> set[str]:
+    command = ["availability", "--location", args.verda_location]
+    if _verda_contract(args) == "spot":
+        command.append("--spot")
+    availability = _verda_json(args, *command, timeout=60)
+    available_types: set[str] = set()
+    if isinstance(availability, list):
+        for row in availability:
+            if isinstance(row, dict):
+                available_types.update(str(item) for item in (row.get("instance_types") or []))
+    return available_types
+
+
+def _verda_check_gpu_availability(args: argparse.Namespace) -> None:
+    log("Checking Verda GPU availability...")
+    available_types = _verda_available_instance_types(args)
+    if args.verda_instance_type not in available_types:
+        types = ", ".join(sorted(available_types)) or "(none)"
+        raise RuntimeError(
+            f"Verda instance type {args.verda_instance_type!r} is not currently available in "
+            f"{args.verda_location} for contract {_verda_contract(args)!r}. Available: {types}"
+        )
+
+
 def _verda_preflight(args: argparse.Namespace) -> None:
     cli = args.verda_cli.expanduser()
     if not cli.exists():
@@ -1313,19 +1347,7 @@ def _verda_preflight(args: argparse.Namespace) -> None:
                 f"Verda {label} volume is in {location}, but deploy location is {args.verda_location}"
             )
 
-    log("Checking Verda GPU availability...")
-    availability = _verda_json(args, "availability", "--location", args.verda_location, timeout=60)
-    available_types: set[str] = set()
-    if isinstance(availability, list):
-        for row in availability:
-            if isinstance(row, dict):
-                available_types.update(str(item) for item in (row.get("instance_types") or []))
-    if args.verda_instance_type not in available_types:
-        types = ", ".join(sorted(available_types)) or "(none)"
-        raise RuntimeError(
-            f"Verda instance type {args.verda_instance_type!r} is not currently available in "
-            f"{args.verda_location}. Available: {types}"
-        )
+    _verda_check_gpu_availability(args)
 
 
 def _verda_fresh_preflight(args: argparse.Namespace) -> None:
@@ -1336,19 +1358,7 @@ def _verda_fresh_preflight(args: argparse.Namespace) -> None:
     log("Checking Verda auth...")
     _verda_check(args, "auth", "show", timeout=30)
 
-    log("Checking Verda GPU availability...")
-    availability = _verda_json(args, "availability", "--location", args.verda_location, timeout=60)
-    available_types: set[str] = set()
-    if isinstance(availability, list):
-        for row in availability:
-            if isinstance(row, dict):
-                available_types.update(str(item) for item in (row.get("instance_types") or []))
-    if args.verda_instance_type not in available_types:
-        types = ", ".join(sorted(available_types)) or "(none)"
-        raise RuntimeError(
-            f"Verda instance type {args.verda_instance_type!r} is not currently available in "
-            f"{args.verda_location}. Available: {types}"
-        )
+    _verda_check_gpu_availability(args)
 
 
 def _verda_instance_by_hostname(args: argparse.Namespace, hostname: str) -> dict | None:
@@ -1388,7 +1398,10 @@ def _wait_for_verda_ssh(ip: str, identity: Path, timeout_sec: int) -> None:
         result = subprocess.run(
             [
                 "ssh",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
                 "-o", "ConnectTimeout=8",
                 "-o", "BatchMode=yes",
                 "-i", str(identity),
@@ -1481,6 +1494,27 @@ if ! test -f "$COMFY_ROOT/main.py"; then
 fi
 if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
   echo "ComfyUI venv not found at $COMFY_ROOT/.venv/bin/python" >&2
+  exit 1
+fi
+
+if nvidia-smi | grep -q "CUDA Version: 13" && \
+   ! "$COMFY_ROOT/.venv/bin/python" - <<'PY' >/dev/null 2>&1
+import torch
+raise SystemExit(0 if str(getattr(torch.version, "cuda", "") or "").startswith("13.") and torch.cuda.is_available() else 1)
+PY
+then
+  echo "Repairing ComfyUI PyTorch CUDA wheel for Verda CUDA 13 driver..." >&2
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu130 torch torchvision torchaudio
+fi
+if ! "$COMFY_ROOT/.venv/bin/python" - <<'PY'
+import torch
+print("ComfyUI torch=" + torch.__version__ + " cuda=" + str(torch.version.cuda) + " available=" + str(torch.cuda.is_available()))
+if not torch.cuda.is_available():
+    raise SystemExit("ComfyUI PyTorch cannot initialize CUDA")
+print("ComfyUI CUDA device=" + torch.cuda.get_device_name(0))
+PY
+then
+  echo "ComfyUI PyTorch CUDA validation failed; refusing to register an unusable worker" >&2
   exit 1
 fi
 WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
@@ -1594,12 +1628,19 @@ done
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   port=$((COMFY_PORT_BASE + idx))
+  stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
+  rm -f "$stats_file"
   for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >"$stats_file" 2>/dev/null; then
       break
     fi
     sleep 2
   done
+  if ! test -s "$stats_file"; then
+    echo "ComfyUI gpu${{idx}} failed system_stats health check" >&2
+    journalctl -u "comfyui-gpu${{idx}}.service" -n 120 --no-pager >&2 || true
+    exit 1
+  fi
 done
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
@@ -2096,7 +2137,10 @@ def _wait_for_ssh(ip: str, port: int, identity: Path, timeout: int) -> bool:
         result = subprocess.run(
             [
                 "ssh",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "GlobalKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
                 "-o", "ConnectTimeout=8",
                 "-o", "BatchMode=yes",
                 "-p", str(port),

@@ -915,17 +915,22 @@ async def list_instances():
 
 
 @app.get("/api/verda/availability")
-async def verda_availability(preference: str = "single"):
+async def verda_availability(preference: str = "single", contract: str = "pay_as_go"):
     if not VERDA_CLI.exists():
         raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
 
     options: list[dict] = []
     errors: dict[str, str] = {}
     prices = _verda_instance_type_prices()
+    contract = str(contract or "pay_as_go").lower()
+    use_spot = contract == "spot"
     for location in VERDA_AVAILABILITY_LOCATIONS:
         try:
+            command = [str(VERDA_CLI), "--agent", "availability", "--location", location]
+            if use_spot:
+                command.append("--spot")
             proc = subprocess.run(
-                [str(VERDA_CLI), "--agent", "availability", "--location", location],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=45,
@@ -1737,6 +1742,14 @@ async def remote_summary(ssh: str):
         raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
 
     script = r"""set -euo pipefail
+fetch_stats() {
+  local unit="$1" port="$2"
+  local stats_json
+  stats_json=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/stats" 2>/dev/null | tr '\n\t' '  ' || true)
+  if test -n "$stats_json"; then
+    printf 'WORKER_STATS\t%s\t%s\n' "$unit" "$stats_json"
+  fi
+}
 if command -v systemctl >/dev/null 2>&1; then
   units=$(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 2>/dev/null \
           | awk '{print $1}' | sort -V || true)
@@ -1751,9 +1764,12 @@ if command -v systemctl >/dev/null 2>&1; then
     elif test -n "$port"; then
       printf 'WORKER_PORT\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$port" "$name"
     fi
+    if test -n "$port"; then
+      fetch_stats "$unit" "$port"
+    fi
   done
-  download=$(journalctl -u 'filmforge-worker-gpu*.service' -n 300 --no-pager 2>/dev/null \
-    | grep -E 'Downloading asset progress:|Download complete:|Downloading asset:' \
+  download=$(journalctl -u 'filmforge-worker-gpu*.service' --since '2 minutes ago' --no-pager 2>/dev/null \
+    | grep -E 'Downloading asset progress:|Downloading asset:' \
     | tail -n 1 || true)
   if test -n "$download"; then
     printf 'DOWNLOAD\t%s\n' "$download"
@@ -1791,6 +1807,7 @@ PY
   elif ss -ltn 2>/dev/null | grep -q ":${port} "; then
     printf 'WORKER_PORT\tfilmforge-worker-gpu%s\tactive\t%s\t%s\n' "$idx" "$port" "$name"
   fi
+  fetch_stats "filmforge-worker-gpu${idx}" "$port"
 done
 """
     proc = subprocess.run(
@@ -1805,6 +1822,7 @@ done
         raise HTTPException(502, (proc.stderr or proc.stdout or "Remote summary failed").strip())
 
     worker_urls: list[dict] = []
+    stats_by_unit: dict[str, list[dict]] = {}
     download_line = ""
     for line in proc.stdout.splitlines():
         if line.startswith("WORKER_URL\t"):
@@ -1815,6 +1833,22 @@ done
             worker_urls.append({"unit": unit, "active": active, "port": port, "name": name})
         elif line.startswith("DOWNLOAD\t"):
             download_line = line.split("\t", 1)[1]
+        elif line.startswith("WORKER_STATS\t"):
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                _kind, unit, raw_json = parts
+                try:
+                    parsed = json.loads(raw_json)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    groups = parsed.get("groups") or []
+                    if isinstance(groups, list):
+                        stats_by_unit[unit] = groups
+    for entry in worker_urls:
+        unit = entry.get("unit") or ""
+        if unit in stats_by_unit:
+            entry["stats"] = stats_by_unit[unit]
     return {"worker_urls": worker_urls, "download_line": download_line}
 
 
@@ -2055,6 +2089,7 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 .copy-btn{border:1px solid #2d3148;background:#171a24;color:#94a3b8;border-radius:5px;font-size:10px;padding:6px 8px;cursor:pointer}
 .copy-btn:hover{color:#e2e8f0;border-color:#475569}
 .dl-status{font-size:11px;color:#6ee7b7;background:#071512;border:1px solid #12372e;border-radius:5px;padding:6px 8px;font-family:monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.worker-stats{font-size:10px;color:#94a3b8;font-family:monospace;padding:2px 8px 0 2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .empty-tools{font-size:11px;color:#475569}
 
 .muted{color:#3d4461}.text-xs{font-size:11px}
@@ -2129,7 +2164,7 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       <div class="grid2" style="margin-bottom:10px">
         <div class="fg" style="margin-bottom:0">
           <label>Contract</label>
-          <select id="v-contract" onchange="refreshVerdaCostEstimate()">
+          <select id="v-contract" onchange="loadVerdaAvailability(); refreshVerdaCostEstimate()">
             <option value="pay_as_go">On-demand</option>
             <option value="spot">Spot</option>
           </select>
@@ -2146,7 +2181,7 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       <div class="grid2" style="margin-bottom:10px">
         <div class="fg" style="margin-bottom:0">
           <label>Location</label>
-          <input id="v-location" value="FIN-01">
+          <input id="v-location" value="FIN-01" onchange="autofillVerdaVolumeIds(); validateVerdaExistingVolumes(); refreshVerdaCostEstimate()">
         </div>
         <div class="fg" style="margin-bottom:0">
           <label>Instance Type</label>
@@ -2363,6 +2398,7 @@ function getInstData(id) {
       status: null,
       workerUrl: null,
       workerUrls: [],
+      workerStats: {},
       downloadStatus: null,
       summaryLoaded: false,
     };
@@ -2395,17 +2431,25 @@ function updateInstHeader() {
     ? `<span class="badge ${idata.status === 'done' ? 'b-running' : 'b-exited'}" style="font-size:10px"><span class="dot"></span>${esc(idata.status)}</span>`
     : '';
   const urls = normalizedWorkerUrls(idata);
+  const statsByUrl = idata.workerStats || {};
   const urlHtml = urls.length
     ? `<div class="inst-tools">
         <div class="empty-tools">Worker URLs</div>
-        ${urls.map((url, idx) => `<div class="url-row">
-          <div class="url-pill" title="${esc(url)}">${esc(url)}</div>
-          <button class="copy-btn" onclick='copyText(${JSON.stringify(url)}, this)'>Copy</button>
-        </div>`).join('')}
+        ${urls.map((url, idx) => {
+          const statsLine = formatWorkerStats(statsByUrl[url]);
+          const statsHtml = statsLine
+            ? `<div class="worker-stats" title="${esc(statsLine)}">${esc(statsLine)}</div>`
+            : '';
+          return `<div class="url-row">
+            <div class="url-pill" title="${esc(url)}">${esc(url)}</div>
+            <button class="copy-btn" onclick='copyText(${JSON.stringify(url)}, this)'>Copy</button>
+          </div>${statsHtml}`;
+        }).join('')}
       </div>`
     : `<div class="inst-tools"><span class="empty-tools">No worker URL captured yet.</span></div>`;
-  const downloadHtml = idata.downloadStatus
-    ? `<div class="dl-status" title="${esc(idata.downloadStatus.detail)}">${esc(idata.downloadStatus.detail)}</div>`
+  const activeDl = activeDownloadStatus(idata);
+  const downloadHtml = activeDl
+    ? `<div class="dl-status" title="${esc(activeDl.detail)}">${esc(activeDl.detail)}</div>`
     : '';
   el.innerHTML = `<div class="inst-header-info">
     <span class="inst-header-name">Instance #${esc(selectedInstId)}</span>
@@ -2437,14 +2481,24 @@ async function refreshSelectedInstanceSummary(force = false) {
       return r.json();
     });
     const urls = [];
+    const statsByUrl = {};
     for (const item of summary.worker_urls || []) {
-      if (item.url) urls.push(item.url);
+      if (item.url) {
+        urls.push(item.url);
+        if (Array.isArray(item.stats) && item.stats.length) statsByUrl[item.url] = item.stats;
+      }
     }
     if (urls.length) {
       idata.workerUrls = urls;
       idata.workerUrl = urls[0];
     }
-    if (summary.download_line) updateDownloadStatusFromLine(summary.download_line, idata);
+    idata.workerStats = statsByUrl;
+    if (summary.download_line) {
+      updateDownloadStatusFromLine(summary.download_line, idata);
+    } else if (idata.downloadStatus) {
+      // No active download line in the recent journal → clear stale status.
+      idata.downloadStatus = null;
+    }
     if (capturedInstId === selectedInstId) updateInstHeader();
   } catch (e) {
     idata.summaryLoaded = false;
@@ -2729,10 +2783,12 @@ async function loadVerdaAvailability() {
   const status = document.getElementById('v-availability-status');
   const preference = document.getElementById('v-gpu-preference')?.value || 'single';
   const optionLimit = document.getElementById('v-option-limit')?.value || '5';
+  const contract = document.getElementById('v-contract')?.value || 'pay_as_go';
   if (!sel || !status) return;
   status.textContent = 'Checking Verda GPUs…';
   try {
-    const payload = await fetch(`/api/verda/availability?preference=${encodeURIComponent(preference)}`).then(r => {
+    const params = new URLSearchParams({preference, contract});
+    const payload = await fetch(`/api/verda/availability?${params.toString()}`).then(r => {
       if (!r.ok) throw new Error(r.status);
       return r.json();
     });
@@ -2791,12 +2847,29 @@ function autofillVerdaVolumeIds() {
   const osInput = document.getElementById('v-os-volume');
   const dataInput = document.getElementById('v-data-volume');
   const ids = new Set(verdaVolumes.map(v => v.id));
-  const candidates = verdaVolumes
-    .filter(v => !loc || v.location === loc)
+  const detached = v => String(v.status || '').toLowerCase() === 'detached';
+  const byNewest = (a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''));
+  const candidatesFor = location => verdaVolumes
+    .filter(v => !location || v.location === location)
     .slice()
-    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
-  const osCandidate = candidates.find(v => v.is_os_volume) || verdaVolumes.find(v => v.is_os_volume);
-  const dataCandidate = candidates.find(v => !v.is_os_volume) || verdaVolumes.find(v => !v.is_os_volume);
+    .sort(byNewest);
+  const findPair = volumes => {
+    const os = volumes.find(v => detached(v) && v.is_os_volume);
+    const data = volumes.find(v => detached(v) && !v.is_os_volume);
+    return os && data && os.location === data.location ? {os, data} : null;
+  };
+  const sameLocationPair = findPair(candidatesFor(loc));
+  const locations = [...new Set(verdaVolumes.map(v => v.location).filter(Boolean))];
+  const anyLocationPair = locations
+    .map(location => findPair(candidatesFor(location)))
+    .find(Boolean);
+  const pair = sameLocationPair || anyLocationPair;
+  const candidates = candidatesFor(loc);
+  const osCandidate = pair?.os || candidates.find(v => v.is_os_volume) || verdaVolumes.find(v => v.is_os_volume);
+  const dataCandidate = pair?.data || candidates.find(v => !v.is_os_volume) || verdaVolumes.find(v => !v.is_os_volume);
+  if (pair && pair.os.location && pair.os.location !== loc) {
+    document.getElementById('v-location').value = pair.os.location;
+  }
   if (osInput && osCandidate && (!osInput.value.trim() || !ids.has(osInput.value.trim()))) {
     osInput.value = osCandidate.id;
   }
@@ -2821,10 +2894,18 @@ function validateVerdaExistingVolumes() {
     status.style.color = '#fbbf24';
     return false;
   }
+  const regionSummary = [...verdaVolumes.reduce((acc, v) => {
+    const region = v.location || 'unknown';
+    acc.set(region, (acc.get(region) || 0) + 1);
+    return acc;
+  }, new Map())]
+    .sort(([a], [b]) => String(a).localeCompare(String(b)))
+    .map(([region, count]) => `${region}:${count}`)
+    .join(', ');
   const osVol = verdaVolumes.find(v => v.id === osId);
   const dataVol = verdaVolumes.find(v => v.id === dataId);
   if (!osVol || !dataVol) {
-    status.textContent = 'One selected volume was not found in Verda. Refresh volumes.';
+    status.textContent = `One selected volume was not found in Verda. Refresh volumes. Seen regions: ${regionSummary || 'none'}.`;
     status.style.color = '#fca5a5';
     return false;
   }
@@ -2841,11 +2922,11 @@ function validateVerdaExistingVolumes() {
   }
   const fmt = v => `${v.name || v.id.slice(0, 8)} ${v.status} ${v.location}`;
   if (problems.length) {
-    status.textContent = `${problems.join('; ')}. Existing-volume deploy requires detached volumes. (${fmt(osVol)} / ${fmt(dataVol)})`;
+    status.textContent = `${problems.join('; ')}. Existing-volume deploy requires detached volumes in the selected region. Seen regions: ${regionSummary || 'none'}. (${fmt(osVol)} / ${fmt(dataVol)})`;
     status.style.color = '#fca5a5';
     return false;
   }
-  status.textContent = `Volumes ready: ${fmt(osVol)} / ${fmt(dataVol)}`;
+  status.textContent = `Volumes ready: ${fmt(osVol)} / ${fmt(dataVol)}. Seen regions: ${regionSummary || 'none'}.`;
   status.style.color = '#6ee7b7';
   return true;
 }
@@ -3370,14 +3451,13 @@ function updateDownloadStatusFromLine(line, idata) {
     };
     return true;
   }
-  match = line.match(/Download complete:\s+([^\s]+)\s+(.+?)\s+in\s+([0-9.]+s)\s+\(([^)]+)\)/);
-  if (match) {
-    idata.downloadStatus = {
-      asset: match[1],
-      detail: `${match[1]} complete · ${match[2]} · ${match[3]} · ${match[4]}`,
-      updatedAt: Date.now(),
-    };
-    return true;
+  if (/Download complete:/.test(line)) {
+    // Download just finished — clear any lingering status so the UI hides it.
+    if (idata.downloadStatus) {
+      idata.downloadStatus = null;
+      return true;
+    }
+    return false;
   }
   match = line.match(/Downloading asset:\s+([^\s]+)\s+total=([^ ]+\s+[KMGT]?B)/);
   if (match) {
@@ -3389,6 +3469,26 @@ function updateDownloadStatusFromLine(line, idata) {
     return true;
   }
   return false;
+}
+
+const DOWNLOAD_STATUS_TTL_MS = 30000;
+
+function activeDownloadStatus(idata) {
+  const ds = idata.downloadStatus;
+  if (!ds || !ds.updatedAt) return null;
+  if (Date.now() - ds.updatedAt > DOWNLOAD_STATUS_TTL_MS) return null;
+  return ds;
+}
+
+function formatWorkerStats(stats) {
+  if (!Array.isArray(stats) || !stats.length) return '';
+  const parts = stats.map(g => {
+    const ag = g.asset_group || '?';
+    const sec = (g.avg_total_sec ?? g.avg_comfy_run_sec ?? 0);
+    return `${ag} ${Number(sec).toFixed(1)}s`;
+  });
+  const totalSamples = stats.reduce((acc, g) => acc + (g.sample_count || 0), 0);
+  return `Avg gen: ${parts.join(' · ')} (n=${totalSamples})`;
 }
 
 function appendLog(line, src = currentLogSrc, instId = selectedInstId) {
