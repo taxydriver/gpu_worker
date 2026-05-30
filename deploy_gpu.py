@@ -574,9 +574,18 @@ if ! command -v aria2c >/dev/null 2>&1; then
 fi
 
 if test "$HAS_SYSTEMD" = "1"; then
-  for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 'comfyui-gpu*.service' 2>/dev/null | awk '{{print $1}}'); do
-    systemctl stop "$unit" || true
+  # Remove ALL filmforge/comfyui GPU unit files (not just stop them) so a box
+  # that previously deployed with more GPUs doesn't leave orphaned gpuN units
+  # behind. Stale units stay visible as phantom worker URLs in the deploy UI
+  # even when inactive. The loop below recreates exactly GPU_COUNT units.
+  for unit_file in /etc/systemd/system/filmforge-worker-gpu*.service /etc/systemd/system/comfyui-gpu*.service; do
+    test -e "$unit_file" || continue
+    unit="$(basename "$unit_file")"
+    systemctl stop "$unit" 2>/dev/null || true
+    systemctl disable "$unit" 2>/dev/null || true
+    rm -f "$unit_file"
   done
+  systemctl daemon-reload 2>/dev/null || true
 fi
 
 # Stop the template's single ComfyUI process; multi-GPU mode owns one ComfyUI
@@ -1461,9 +1470,18 @@ if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
   echo "UUID=$VDB_UUID /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
 fi
 
-for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 'comfyui-gpu*.service' 2>/dev/null | awk '{{print $1}}'); do
-  systemctl stop "$unit" || true
+# Remove ALL filmforge/comfyui GPU unit files (not just stop them) so a box
+# that previously deployed with more GPUs doesn't leave orphaned gpuN units
+# behind. Stale units stay visible as phantom worker URLs in the deploy UI
+# even when inactive. The loop below recreates exactly GPU_COUNT units.
+for unit_file in /etc/systemd/system/filmforge-worker-gpu*.service /etc/systemd/system/comfyui-gpu*.service; do
+  test -e "$unit_file" || continue
+  unit="$(basename "$unit_file")"
+  systemctl stop "$unit" 2>/dev/null || true
+  systemctl disable "$unit" 2>/dev/null || true
+  rm -f "$unit_file"
 done
+systemctl daemon-reload 2>/dev/null || true
 
 mkdir -p /mnt/data/ComfyUI/models /mnt/data/ComfyUI/input /mnt/data/ComfyUI/output /mnt/data/ComfyUI/temp
 mkdir -p "$COMFY_ROOT"
