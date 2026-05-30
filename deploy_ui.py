@@ -2014,8 +2014,12 @@ header h1{font-size:15px;font-weight:600;color:#a78bfa}
 .b-running{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}.b-running .dot{background:#34d399}
 .b-exited{background:#1c1f2a;color:#64748b;border:1px solid #2d3148}.b-exited .dot{background:#475569}
 .b-loading{background:#0f2744;color:#60a5fa;border:1px solid #1a3a5f}.b-loading .dot{background:#60a5fa;animation:pulse 1s infinite}
-.b-generating{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}.b-generating .dot{background:#34d399;animation:pulse 1s infinite}
+.b-generating{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}
 .b-idle{background:#1c1f2a;color:#94a3b8;border:1px solid #2d3148}.b-idle .dot{background:#64748b}
+.eq{display:inline-flex;align-items:flex-end;gap:1px;height:9px}
+.eq i{display:block;width:2px;height:30%;background:#34d399;border-radius:1px;animation:eqbar .9s ease-in-out infinite}
+.eq i:nth-child(2){animation-delay:.18s}.eq i:nth-child(3){animation-delay:.36s}.eq i:nth-child(4){animation-delay:.12s}
+@keyframes eqbar{0%,100%{height:25%}50%{height:100%}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 /* Forms */
@@ -3371,10 +3375,14 @@ async function loadWorkers() {
       ? w.metadata.comfy_queue_running : null;
     const pending = (w.metadata && typeof w.metadata.comfy_queue_pending === 'number')
       ? w.metadata.comfy_queue_pending : 0;
-    let badgeClass, badgeText;
+    let badgeClass, badgeText, badgeIcon = '<span class="dot"></span>';
     if (!alive) { badgeClass = 'b-exited'; badgeText = 'Offline'; }
     else if (running === null) { badgeClass = 'b-running'; badgeText = 'Online'; }
-    else if (running > 0) { badgeClass = 'b-generating'; badgeText = pending > 0 ? `Generating +${pending}` : 'Generating'; }
+    else if (running > 0) {
+      badgeClass = 'b-generating';
+      badgeText = pending > 0 ? `Generating +${pending}` : 'Generating';
+      badgeIcon = '<span class="eq"><i></i><i></i><i></i><i></i></span>';
+    }
     else { badgeClass = 'b-idle'; badgeText = 'Idle'; }
     return `<div class="wrow">
       <div class="flex1" style="min-width:0">
@@ -3384,7 +3392,7 @@ async function loadWorkers() {
         ${eta ? `<div class="wurl" title="${esc(eta)}">${esc(eta)}</div>` : ''}
       </div>
       <span class="badge ${badgeClass}" style="flex-shrink:0">
-        <span class="dot"></span>${badgeText}
+        ${badgeIcon}${badgeText}
       </span>
       <span class="muted text-xs" style="flex-shrink:0;min-width:44px;text-align:right">${age}</span>
     </div>`;
