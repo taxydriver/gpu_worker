@@ -83,6 +83,24 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
         },
     ],
+    # LTX-2.3 Fast (distilled) — T2V/I2V with native audio. Uses ComfyUI's built-in
+    # LTX-2 nodes only (no custom node). Requires a recent ComfyUI build (>= the one
+    # shipping LTXAVTextEncoderLoader / the LTX-2.3 AV nodes). The distilled checkpoint
+    # is all-in-one (video transformer + video VAE + audio VAE). The Gemma text encoder
+    # is the ungated Comfy-Org repack, downloaded under the name the AV nodes expect.
+    # Validated 2026-05-30: see filmforge_backend/docs/ltx-2-3-gpu-worker-install-2026-05-30.md.
+    "ltx_i2v_v1": [
+        {
+            "name": "ltx2_3_distilled_checkpoint",
+            "path": "/workspace/ComfyUI/models/checkpoints/ltx-2.3-22b-distilled-1.1.safetensors",
+            "url": "https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-1.1.safetensors",
+        },
+        {
+            "name": "ltx2_3_gemma_text_encoder",
+            "path": "/workspace/ComfyUI/models/text_encoders/comfy_gemma_3_12B_it.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it.safetensors",
+        },
+    ],
 }
 
 
@@ -96,6 +114,11 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "stable_audio_v1": ["stable_audio_v1"],
     "juggernaut_stills": ["juggernaut_stills_v1"],
     "juggernaut_stills_v1": ["juggernaut_stills_v1"],
+    "ltx_av": ["ltx_i2v_v1"],
+    "ltx_i2v": ["ltx_i2v_v1"],
+    "ltx_t2v": ["ltx_i2v_v1"],
+    "ltx2_3": ["ltx_i2v_v1"],
+    "ltx_i2v_v1": ["ltx_i2v_v1"],
 }
 
 

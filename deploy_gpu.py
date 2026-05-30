@@ -40,12 +40,16 @@ DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
 DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
 DEFAULT_VERDA_HOSTNAME = "filmforge-verda-worker"
 DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
-DEFAULT_VERDA_FRESH_STORAGE_SIZE = 250
+# Models on the data volume: default warm set (flux 71 + wan 38 + stable_audio 6 + ltx 70)
+# ≈ 186 GB; +juggernaut 10 ≈ 196 GB. 300 GB leaves ~100 GB for ComfyUI outputs/temp/.part
+# download slack (LTX checkpoint alone is 46 GB) and the next model. See
+# filmforge_backend/docs/ltx-2-3-gpu-worker-install-2026-05-30.md.
+DEFAULT_VERDA_FRESH_STORAGE_SIZE = 300
 DEFAULT_VERDA_CONTRACT = "pay_as_go"
 DEFAULT_WORKER_REPO_URL = "https://github.com/taxydriver/gpu_worker.git"
 DEFAULT_COMFY_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
 DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
-DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1"]
+DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1", "ltx_i2v_v1"]
 
 # Ordered list of candidate identity files to try when none is specified
 _CANDIDATE_IDENTITIES = [
