@@ -31,6 +31,30 @@ def _comfy_url(path: str) -> str:
     return f"{get_settings().comfy_base_url.rstrip('/')}{path}"
 
 
+def comfy_queue_depth() -> dict[str, int] | None:
+    """Read ComfyUI's live queue depth — ground truth for whether the GPU is
+    generating right now.
+
+    ``queue_running`` is what ComfyUI is executing this instant (the same engine
+    that prints "got prompt" / "Prompt executed in N seconds"); ``queue_pending``
+    is what's waiting. Returns None when ComfyUI is unreachable so callers can
+    distinguish "idle" from "unknown".
+    """
+
+    try:
+        response = requests.get(_comfy_url("/queue"), timeout=3)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "running": len(data.get("queue_running") or []),
+        "pending": len(data.get("queue_pending") or []),
+    }
+
+
 def served_file_roots() -> dict[str, Path]:
     """Return the configured roots the worker is allowed to expose."""
 

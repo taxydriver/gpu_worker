@@ -2014,6 +2014,8 @@ header h1{font-size:15px;font-weight:600;color:#a78bfa}
 .b-running{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}.b-running .dot{background:#34d399}
 .b-exited{background:#1c1f2a;color:#64748b;border:1px solid #2d3148}.b-exited .dot{background:#475569}
 .b-loading{background:#0f2744;color:#60a5fa;border:1px solid #1a3a5f}.b-loading .dot{background:#60a5fa;animation:pulse 1s infinite}
+.b-generating{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}.b-generating .dot{background:#34d399;animation:pulse 1s infinite}
+.b-idle{background:#1c1f2a;color:#94a3b8;border:1px solid #2d3148}.b-idle .dot{background:#64748b}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 /* Forms */
@@ -3362,6 +3364,18 @@ async function loadWorkers() {
     const age = timeAgo(w.last_heartbeat_at || w.last_seen_at);
     const caps = (w.capabilities || w.supported_asset_groups || []).join(', ');
     const eta = formatWorkerEta(w.eta_by_asset_group || {});
+    // ComfyUI queue depth is ground truth for "is the GPU generating right now".
+    // It rides the worker heartbeat metadata; null means the worker isn't
+    // reporting it (older build) so we fall back to plain Online/Offline.
+    const running = (w.metadata && typeof w.metadata.comfy_queue_running === 'number')
+      ? w.metadata.comfy_queue_running : null;
+    const pending = (w.metadata && typeof w.metadata.comfy_queue_pending === 'number')
+      ? w.metadata.comfy_queue_pending : 0;
+    let badgeClass, badgeText;
+    if (!alive) { badgeClass = 'b-exited'; badgeText = 'Offline'; }
+    else if (running === null) { badgeClass = 'b-running'; badgeText = 'Online'; }
+    else if (running > 0) { badgeClass = 'b-generating'; badgeText = pending > 0 ? `Generating +${pending}` : 'Generating'; }
+    else { badgeClass = 'b-idle'; badgeText = 'Idle'; }
     return `<div class="wrow">
       <div class="flex1" style="min-width:0">
         <div class="wname">${esc(w.worker_name || w.id || '?')}</div>
@@ -3369,8 +3383,8 @@ async function loadWorkers() {
         <div class="wurl" title="${esc(caps)}">${esc(caps || 'no capabilities')}</div>
         ${eta ? `<div class="wurl" title="${esc(eta)}">${esc(eta)}</div>` : ''}
       </div>
-      <span class="badge ${alive ? 'b-running' : 'b-exited'}" style="flex-shrink:0">
-        <span class="dot"></span>${alive ? 'Online' : 'Offline'}
+      <span class="badge ${badgeClass}" style="flex-shrink:0">
+        <span class="dot"></span>${badgeText}
       </span>
       <span class="muted text-xs" style="flex-shrink:0;min-width:44px;text-align:right">${age}</span>
     </div>`;

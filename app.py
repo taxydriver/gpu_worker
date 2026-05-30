@@ -27,6 +27,7 @@ from gpu_worker.comfy_client import (
     apply_comfy_input_files,
     build_output_files,
     collect_output_paths,
+    comfy_queue_depth,
     free_comfy_memory,
     poll_for_completion,
     resolve_served_file,
@@ -230,6 +231,7 @@ def _broker_worker_payload() -> dict[str, object]:
         warmed = canonicalize_groups(sorted(_WARMED_GROUPS))
 
     max_concurrent_jobs = settings.resolved_max_concurrent_jobs()
+    comfy_queue = comfy_queue_depth()
     return {
         "worker_id": settings.resolved_worker_id(),
         "worker_name": settings.resolved_worker_name(),
@@ -250,6 +252,8 @@ def _broker_worker_payload() -> dict[str, object]:
         "metadata": {
             "comfy_base_url": settings.comfy_base_url,
             "comfy_reachable": is_comfy_healthy(),
+            "comfy_queue_running": comfy_queue["running"] if comfy_queue else None,
+            "comfy_queue_pending": comfy_queue["pending"] if comfy_queue else None,
             "performance": _performance_snapshot(),
             "performance_window": _STATS_WINDOW,
             "active_jobs": active_jobs,
