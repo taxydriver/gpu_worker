@@ -3364,7 +3364,10 @@ async function loadWorkers() {
     return;
   }
   el.innerHTML = list.map(w => {
-    const alive = !!w.is_live || w.status === 'online';
+    // is_live is computed server-side from heartbeat freshness. Do NOT also
+    // trust w.status — the broker stamps it 'online' at registration and never
+    // downgrades it, so a dead worker would otherwise show alive forever.
+    const alive = !!w.is_live;
     const age = timeAgo(w.last_heartbeat_at || w.last_seen_at);
     const caps = (w.capabilities || w.supported_asset_groups || []).join(', ');
     const eta = formatWorkerEta(w.eta_by_asset_group || {});
