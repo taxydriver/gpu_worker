@@ -925,55 +925,61 @@ async def verda_availability(preference: str = "single", contract: str = "pay_as
     errors: dict[str, str] = {}
     prices = _verda_instance_type_prices()
     contract = str(contract or "pay_as_go").lower()
-    use_spot = contract == "spot"
-    for location in VERDA_AVAILABILITY_LOCATIONS:
-        try:
-            command = [str(VERDA_CLI), "--agent", "availability", "--location", location]
-            if use_spot:
-                command.append("--spot")
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=45,
-                check=False,
-            )
-            if proc.returncode != 0:
-                errors[location] = (proc.stderr or proc.stdout).strip()
-                continue
-            payload = json.loads(proc.stdout or "[]")
-            rows = payload if isinstance(payload, list) else []
-            for row in rows:
-                if not isinstance(row, dict):
+    # "both" surfaces on-demand and spot together so the UI can list them in one
+    # dropdown (separated by group) without forcing the user to toggle first.
+    contracts = ["pay_as_go", "spot"] if contract == "both" else [contract]
+    for c in contracts:
+        use_spot = c == "spot"
+        for location in VERDA_AVAILABILITY_LOCATIONS:
+            try:
+                command = [str(VERDA_CLI), "--agent", "availability", "--location", location]
+                if use_spot:
+                    command.append("--spot")
+                proc = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    errors[f"{location}/{c}"] = (proc.stderr or proc.stdout).strip()
                     continue
-                loc = str(row.get("location_code") or location)
-                for instance_type in row.get("instance_types") or []:
-                    instance_type = str(instance_type)
-                    if instance_type.upper().startswith("CPU"):
+                payload = json.loads(proc.stdout or "[]")
+                rows = payload if isinstance(payload, list) else []
+                for row in rows:
+                    if not isinstance(row, dict):
                         continue
-                    rank = _verda_gpu_rank(instance_type, preference)
-                    price = prices.get(instance_type) or {}
-                    options.append({
-                        "location": loc,
-                        "instance_type": instance_type,
-                        "label": _verda_instance_label(loc, instance_type, price),
-                        "rank": rank[0],
-                        "gpu_count": _verda_gpu_count(instance_type),
-                        "price_per_hour": price.get("price_per_hour"),
-                        "spot_price": price.get("spot_price"),
-                        "currency": price.get("currency") or "usd",
-                        "gpu_memory_gb": price.get("gpu_memory_gb"),
-                        "ram_gb": price.get("ram_gb"),
-                        "hardware_name": price.get("name") or "",
-                    })
-        except Exception as exc:
-            errors[location] = str(exc)
+                    loc = str(row.get("location_code") or location)
+                    for instance_type in row.get("instance_types") or []:
+                        instance_type = str(instance_type)
+                        if instance_type.upper().startswith("CPU"):
+                            continue
+                        rank = _verda_gpu_rank(instance_type, preference)
+                        price = prices.get(instance_type) or {}
+                        options.append({
+                            "location": loc,
+                            "instance_type": instance_type,
+                            "contract": c,
+                            "label": _verda_instance_label(loc, instance_type, price),
+                            "rank": rank[0],
+                            "gpu_count": _verda_gpu_count(instance_type),
+                            "price_per_hour": price.get("price_per_hour"),
+                            "spot_price": price.get("spot_price"),
+                            "currency": price.get("currency") or "usd",
+                            "gpu_memory_gb": price.get("gpu_memory_gb"),
+                            "ram_gb": price.get("ram_gb"),
+                            "hardware_name": price.get("name") or "",
+                        })
+            except Exception as exc:
+                errors[f"{location}/{c}"] = str(exc)
 
-    dedup: dict[tuple[str, str], dict] = {}
+    dedup: dict[tuple[str, str, str], dict] = {}
     for option in options:
-        dedup[(option["location"], option["instance_type"])] = option
+        dedup[(option["location"], option["instance_type"], option["contract"])] = option
     ranked = sorted(dedup.values(), key=lambda item: (
         _verda_gpu_rank(item["instance_type"], preference),
+        item["contract"],
         item["location"],
         item["instance_type"],
     ))
@@ -2191,8 +2197,9 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
         <div class="fg" style="margin-bottom:0">
           <label>Contract</label>
           <select id="v-contract" onchange="loadVerdaAvailability(); refreshVerdaCostEstimate()">
-            <option value="pay_as_go">On-demand</option>
-            <option value="spot">Spot</option>
+            <option value="both">On-demand + Spot</option>
+            <option value="pay_as_go">On-demand only</option>
+            <option value="spot">Spot only</option>
           </select>
         </div>
         <div class="fg" style="margin-bottom:0">
@@ -2847,15 +2854,32 @@ async function loadVerdaAvailability() {
       return r.json();
     });
     const allItems = payload.all_items || payload.items || [];
-    const items = optionLimit === 'all' ? allItems : allItems.slice(0, Number(optionLimit) || 5);
-    if (!items.length) {
+    const limit = optionLimit === 'all' ? Infinity : (Number(optionLimit) || 5);
+    // Each option carries its contract so the deploy uses the right one even
+    // when both are listed together.
+    const optHtml = item =>
+      `<option value="${esc(`${item.location}|${item.instance_type}|${item.contract || contract}`)}">${esc(item.label)}</option>`;
+    let html = '', total = 0;
+    if (contract === 'both') {
+      // Two labelled groups in one dropdown — on-demand and spot, separately.
+      for (const [key, groupLabel] of [['pay_as_go', 'On-demand'], ['spot', 'Spot']]) {
+        const groupItems = allItems
+          .filter(i => (i.contract || 'pay_as_go') === key)
+          .slice(0, limit === Infinity ? undefined : limit);
+        if (!groupItems.length) continue;
+        total += groupItems.length;
+        html += `<optgroup label="${groupLabel}">${groupItems.map(optHtml).join('')}</optgroup>`;
+      }
+    } else {
+      const items = allItems.slice(0, limit === Infinity ? undefined : limit);
+      total = items.length;
+      html = items.map(optHtml).join('');
+    }
+    if (!total) {
       status.textContent = 'No GPU capacity found';
       return;
     }
-    sel.innerHTML = items.map(item => {
-      const value = `${item.location}|${item.instance_type}`;
-      return `<option value="${esc(value)}">${esc(item.label)}</option>`;
-    }).join('');
+    sel.innerHTML = html;
     applyVerdaSelection();
     const label = {
       single: 'single-GPU',
@@ -2863,18 +2887,28 @@ async function loadVerdaAvailability() {
       four_plus: '4+ GPU sprint',
       any: 'GPU',
     }[preference] || 'GPU';
-    status.textContent = `${items.length} of ${allItems.length} ${label} option(s)`;
+    status.textContent = `${total} of ${allItems.length} ${label} option(s)`;
   } catch (e) {
     status.textContent = `Availability unavailable: ${e}`;
   }
 }
 
+// Contract of the currently-selected instance option. When the Contract box is
+// "both", the chosen option (not the box) decides on-demand vs spot.
+let verdaSelectedContract = 'pay_as_go';
+
+function verdaContract() {
+  const c = document.getElementById('v-contract')?.value || 'pay_as_go';
+  return c === 'both' ? verdaSelectedContract : c;
+}
+
 function applyVerdaSelection() {
   const sel = document.getElementById('v-instance-select');
   if (!sel || !sel.value) return;
-  const [location, instanceType] = sel.value.split('|');
+  const [location, instanceType, contract] = sel.value.split('|');
   if (location) document.getElementById('v-location').value = location;
   if (instanceType) document.getElementById('v-instance-type').value = instanceType;
+  if (contract) verdaSelectedContract = contract;
   refreshVerdaCostEstimate();
   validateVerdaExistingVolumes();
 }
@@ -2900,36 +2934,31 @@ function autofillVerdaVolumeIds() {
   const loc = (document.getElementById('v-location').value || '').trim();
   const osInput = document.getElementById('v-os-volume');
   const dataInput = document.getElementById('v-data-volume');
-  const ids = new Set(verdaVolumes.map(v => v.id));
+  const byId = new Map(verdaVolumes.map(v => [v.id, v]));
   const detached = v => String(v.status || '').toLowerCase() === 'detached';
   const byNewest = (a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''));
-  const candidatesFor = location => verdaVolumes
-    .filter(v => !location || v.location === location)
-    .slice()
-    .sort(byNewest);
-  const findPair = volumes => {
-    const os = volumes.find(v => detached(v) && v.is_os_volume);
-    const data = volumes.find(v => detached(v) && !v.is_os_volume);
-    return os && data && os.location === data.location ? {os, data} : null;
+  // Only ever suggest volumes that live in the location the user chose. We must
+  // NOT reach into another region nor rewrite their location — Verda volumes
+  // are region-bound, and silently snapping FIN-03 back to FIN-01 is exactly
+  // the confusing behaviour we're fixing. If the chosen region has no volumes,
+  // we clear stale cross-region ids and let validation explain why.
+  const candidates = verdaVolumes
+    .filter(v => !loc || v.location === loc)
+    .slice().sort(byNewest);
+  const osCandidate = candidates.find(v => detached(v) && v.is_os_volume) || candidates.find(v => v.is_os_volume);
+  const dataCandidate = candidates.find(v => detached(v) && !v.is_os_volume) || candidates.find(v => !v.is_os_volume);
+  const fill = (input, candidate) => {
+    if (!input) return;
+    const cur = input.value.trim();
+    const curVol = byId.get(cur);
+    // Replace only when the field is empty, holds an unknown id, or points at a
+    // volume in a different region — never clobber a valid same-region choice.
+    if (!cur || !curVol || (loc && curVol.location !== loc)) {
+      input.value = candidate ? candidate.id : '';
+    }
   };
-  const sameLocationPair = findPair(candidatesFor(loc));
-  const locations = [...new Set(verdaVolumes.map(v => v.location).filter(Boolean))];
-  const anyLocationPair = locations
-    .map(location => findPair(candidatesFor(location)))
-    .find(Boolean);
-  const pair = sameLocationPair || anyLocationPair;
-  const candidates = candidatesFor(loc);
-  const osCandidate = pair?.os || candidates.find(v => v.is_os_volume) || verdaVolumes.find(v => v.is_os_volume);
-  const dataCandidate = pair?.data || candidates.find(v => !v.is_os_volume) || verdaVolumes.find(v => !v.is_os_volume);
-  if (pair && pair.os.location && pair.os.location !== loc) {
-    document.getElementById('v-location').value = pair.os.location;
-  }
-  if (osInput && osCandidate && (!osInput.value.trim() || !ids.has(osInput.value.trim()))) {
-    osInput.value = osCandidate.id;
-  }
-  if (dataInput && dataCandidate && (!dataInput.value.trim() || !ids.has(dataInput.value.trim()))) {
-    dataInput.value = dataCandidate.id;
-  }
+  fill(osInput, osCandidate);
+  fill(dataInput, dataCandidate);
 }
 
 function validateVerdaExistingVolumes() {
@@ -2939,7 +2968,15 @@ function validateVerdaExistingVolumes() {
   const osId = (document.getElementById('v-os-volume').value || '').trim();
   const dataId = (document.getElementById('v-data-volume').value || '').trim();
   if (!osId || !dataId) {
-    status.textContent = 'Choose detached OS and model/data volumes.';
+    const here = (Array.isArray(verdaVolumes) ? verdaVolumes : []).filter(v => !loc || v.location === loc);
+    const isDetached = v => String(v.status || '').toLowerCase() === 'detached';
+    const hasOs = here.some(v => v.is_os_volume && isDetached(v));
+    const hasData = here.some(v => !v.is_os_volume && isDetached(v));
+    if (loc && Array.isArray(verdaVolumes) && verdaVolumes.length && (!hasOs || !hasData)) {
+      status.textContent = `No detached OS+data volume pair in ${loc}. Use fresh-install mode (creates new volumes there) or replicate your volumes to ${loc}.`;
+    } else {
+      status.textContent = 'Choose detached OS and model/data volumes.';
+    }
     status.style.color = '#fbbf24';
     return false;
   }
@@ -2995,7 +3032,7 @@ async function refreshVerdaCostEstimate() {
     return;
   }
   const fresh = document.getElementById('v-mode').value === 'fresh';
-  const contract = document.getElementById('v-contract')?.value || 'pay_as_go';
+  const contract = verdaContract();
   const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 100) : 0;
   const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 250) : 0;
   const params = new URLSearchParams({
@@ -3161,7 +3198,7 @@ async function quickDeployVerda() {
         fresh,
         location: (document.getElementById('v-location').value || 'FIN-01').trim(),
         instance_type: (document.getElementById('v-instance-type').value || '2A100.44V').trim(),
-        contract: document.getElementById('v-contract')?.value || 'pay_as_go',
+        contract: verdaContract(),
         os_volume_id: (document.getElementById('v-os-volume').value || '').trim(),
         data_volume_id: (document.getElementById('v-data-volume').value || '').trim(),
         ssh_key_id: (document.getElementById('v-ssh-key').value || '').trim(),
