@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     worker_name: str | None = Field(default=None, alias="WORKER_NAME")
     worker_public_url: str | None = Field(default=None, alias="WORKER_PUBLIC_URL")
     worker_provider: str = Field(default="dedicated_worker", alias="WORKER_PROVIDER")
+    worker_instance_id: str | None = Field(default=None, alias="WORKER_INSTANCE_ID")
     worker_gpu_name: str | None = Field(default=None, alias="WORKER_GPU_NAME")
     worker_vram_gb: float | None = Field(default=None, alias="WORKER_VRAM_GB")
     worker_capabilities: str | None = Field(default=None, alias="WORKER_CAPABILITIES")

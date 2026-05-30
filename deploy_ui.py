@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
@@ -514,6 +515,7 @@ def _verda_hosts_with_live_vms() -> list[dict]:
         add_host({
             "name": name,
             "ssh_command": _verda_ssh_command_for_ip(ip),
+            "ip": ip,
             "source": "live",
             "instance_id": instance_id,
             "status": vm.get("status"),
@@ -1207,6 +1209,23 @@ async def list_workers():
             return payload.get("items", []) if isinstance(payload, dict) else payload
     except Exception:
         return []
+
+
+@app.delete("/api/workers/{worker_id}")
+async def delete_worker(worker_id: str):
+    # Same-origin proxy so the browser can purge a phantom broker worker
+    # (its instance no longer exists). Forwards to the backend's broker API.
+    req = urllib.request.Request(
+        f"http://127.0.0.1:8000/api/render-broker/workers/{worker_id}",
+        method="DELETE",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return {"ok": True, "status": r.status}
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "status": exc.code}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 
 
 @app.post("/api/deploy")
@@ -2016,6 +2035,7 @@ header h1{font-size:15px;font-weight:600;color:#a78bfa}
 .b-loading{background:#0f2744;color:#60a5fa;border:1px solid #1a3a5f}.b-loading .dot{background:#60a5fa;animation:pulse 1s infinite}
 .b-generating{background:#0d2b1e;color:#34d399;border:1px solid #1a4d35}
 .b-idle{background:#1c1f2a;color:#94a3b8;border:1px solid #2d3148}.b-idle .dot{background:#64748b}
+.b-gone{background:#2b0d0d;color:#f87171;border:1px solid #4d1a1a}.b-gone .dot{background:#f87171}
 .eq{display:inline-flex;align-items:flex-end;gap:1px;height:9px}
 .eq i{display:block;width:2px;height:30%;background:#34d399;border-radius:1px;animation:eqbar .9s ease-in-out infinite}
 .eq i:nth-child(2){animation-delay:.18s}.eq i:nth-child(3){animation-delay:.36s}.eq i:nth-child(4){animation-delay:.12s}
@@ -2388,6 +2408,26 @@ let currentLogSrc = 'deploy';
 let remoteEvt = null;
 const MAX_LOG_LINES = 2000;
 
+// Live cloud instances per provider, populated by the instance panels. Used by
+// loadWorkers to decide if a registered worker's box still exists. `loaded`
+// flips true only after a successful fetch, so a transient CLI error never
+// makes us treat a live worker as orphaned.
+const liveInfra = {
+  vast:   { loaded: false, ips: new Set(), ids: new Set() },
+  runpod: { loaded: false, ips: new Set(), ids: new Set() },
+  verda:  { loaded: false, ips: new Set(), ids: new Set() },
+};
+
+function recordInfra(provider, items, ipFn, idFn) {
+  const b = liveInfra[provider];
+  const ips = new Set(), ids = new Set();
+  for (const it of items || []) {
+    const ip = ipFn(it); if (ip) ips.add(String(ip));
+    const id = idFn(it); if (id) ids.add(String(id));
+  }
+  b.ips = ips; b.ids = ids; b.loaded = true;
+}
+
 const LOG_LABELS = {
   deploy: 'Deploy', downloads: 'Downloads',
   worker: 'GPU Worker', comfy: 'ComfyUI', tunnel: 'Tunnel',
@@ -2517,6 +2557,7 @@ async function loadInstances() {
   el.innerHTML = '<span class="muted text-xs">Loading…</span>';
   try {
     const list = await fetch('/api/instances').then(r => r.json());
+    recordInfra('vast', list, i => i.public_ipaddr, i => i.id);
     if (!list.length) {
       el.innerHTML = '<p class="muted text-xs">No instances — use Create &amp; Deploy below.</p>';
       return [];
@@ -2524,6 +2565,7 @@ async function loadInstances() {
     el.innerHTML = list.map(inst => renderInstCard(inst)).join('');
     return list;
   } catch (e) {
+    liveInfra.vast.loaded = false;
     el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load instances.</p>';
     return [];
   }
@@ -2598,6 +2640,7 @@ async function loadRunpodPods() {
   if (!hasCards) el.innerHTML = '<span class="muted text-xs">Loading…</span>';
   try {
     const list = await fetch('/api/runpod/pods').then(r => r.json());
+    recordInfra('runpod', list, p => p.ssh_ip, p => p.id);
     if (!list.length) {
       el.innerHTML = '<p class="muted text-xs">No pods — use Create &amp; Deploy below.</p>';
       return;
@@ -2605,6 +2648,7 @@ async function loadRunpodPods() {
     const next = list.map(pod => renderRunpodCard(pod)).join('');
     if (el.innerHTML !== next) el.innerHTML = next;
   } catch (e) {
+    liveInfra.runpod.loaded = false;
     if (!hasCards) el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load pods.</p>';
   }
 }
@@ -2660,6 +2704,9 @@ async function loadVerdaHosts() {
   const el = document.getElementById('verda-out');
   try {
     const hosts = await fetch('/api/verda/hosts').then(r => r.json());
+    // Only 'live' hosts come from `verda vm list` (confirmed-present VMs);
+    // manually-added hosts are just SSH targets and don't prove an instance.
+    recordInfra('verda', hosts.filter(h => h.source === 'live'), h => h.ip, h => h.instance_id);
     if (!hosts.length) {
       el.innerHTML = '<span class="muted text-xs">No Verda hosts — add one below.</span>';
       return;
@@ -2697,6 +2744,7 @@ async function loadVerdaHosts() {
       </div>`;
     }).join('');
   } catch (e) {
+    liveInfra.verda.loaded = false;
     el.innerHTML = '<p class="muted text-xs" style="color:#f87171">Failed to load Verda hosts.</p>';
   }
 }
@@ -3212,6 +3260,9 @@ async function deployToInst(ssh, instId, options = {}) {
   const env = getEnv();
   Object.assign(env, options.env || {});
   env.WORKER_PROVIDER = provider;
+  // Stamp the cloud instance id so the worker reports it on heartbeat and the
+  // Workers panel can cross-check it against this provider's live instances.
+  if (instId) env.WORKER_INSTANCE_ID = String(instId);
   env.WORKER_GPU_NAME = options.gpuName || document.getElementById('c-gpu').value;
   delete env.RENDER_BROKER_WORKER_ID;
   if (!env.FILMFORGE_BACKEND_URL || env.FILMFORGE_BACKEND_URL.includes('localhost')) {
@@ -3356,6 +3407,30 @@ function disableActions(on) {
 }
 
 // ── Workers ───────────────────────────────────────────────────────────────────
+function workerIp(w) {
+  try { return new URL(w.base_url || '').hostname || null; } catch (e) { return null; }
+}
+
+// Is this worker's cloud instance still present in its provider account?
+// true = present, false = confirmed gone, null = can't tell yet (relevant
+// provider list hasn't loaded), so we don't act on it.
+function workerInstancePresent(w) {
+  const md = w.metadata || {};
+  const prov = String(md.provider || '').toLowerCase();
+  const iid = md.instance_id ? String(md.instance_id) : null;
+  const ip = workerIp(w);
+  // If the worker names a known provider, check only that one; otherwise (older
+  // worker without provider metadata) fall back to matching IP across all.
+  const buckets = liveInfra[prov] ? [liveInfra[prov]] : Object.values(liveInfra);
+  const loaded = buckets.filter(b => b.loaded);
+  if (!loaded.length) return null;
+  for (const b of loaded) {
+    if (iid && b.ids.has(iid)) return true;
+    if (ip && b.ips.has(ip)) return true;
+  }
+  return false;
+}
+
 async function loadWorkers() {
   const el = document.getElementById('workers-out');
   const list = await fetch('/api/workers').then(r => r.json()).catch(() => []);
@@ -3363,6 +3438,7 @@ async function loadWorkers() {
     el.innerHTML = '<span class="muted text-xs" style="padding:10px 16px;display:block">No workers registered. (Is the backend running?)</span>';
     return;
   }
+  const orphaned = [];
   el.innerHTML = list.map(w => {
     // is_live is computed server-side from heartbeat freshness. Do NOT also
     // trust w.status — the broker stamps it 'online' at registration and never
@@ -3371,15 +3447,23 @@ async function loadWorkers() {
     const age = timeAgo(w.last_heartbeat_at || w.last_seen_at);
     const caps = (w.capabilities || w.supported_asset_groups || []).join(', ');
     const eta = formatWorkerEta(w.eta_by_asset_group || {});
+    const md = w.metadata || {};
+    const provLine = [md.provider, md.instance_id].filter(Boolean).join(' · ');
+    const present = workerInstancePresent(w);
     // ComfyUI queue depth is ground truth for "is the GPU generating right now".
     // It rides the worker heartbeat metadata; null means the worker isn't
     // reporting it (older build) so we fall back to plain Online/Offline.
-    const running = (w.metadata && typeof w.metadata.comfy_queue_running === 'number')
-      ? w.metadata.comfy_queue_running : null;
-    const pending = (w.metadata && typeof w.metadata.comfy_queue_pending === 'number')
-      ? w.metadata.comfy_queue_pending : 0;
+    const running = (typeof md.comfy_queue_running === 'number') ? md.comfy_queue_running : null;
+    const pending = (typeof md.comfy_queue_pending === 'number') ? md.comfy_queue_pending : 0;
     let badgeClass, badgeText, badgeIcon = '<span class="dot"></span>';
-    if (!alive) { badgeClass = 'b-exited'; badgeText = 'Offline'; }
+    if (present === false) {
+      // The cloud instance is gone from the provider account — authoritative.
+      badgeClass = 'b-gone'; badgeText = 'No instance';
+      // Auto-remove only when also heartbeat-stale, so a live worker is never
+      // purged on a transient mismatch.
+      if (!alive) orphaned.push(w.id);
+    }
+    else if (!alive) { badgeClass = 'b-exited'; badgeText = 'Offline'; }
     else if (running === null) { badgeClass = 'b-running'; badgeText = 'Online'; }
     else if (running > 0) {
       badgeClass = 'b-generating';
@@ -3391,6 +3475,7 @@ async function loadWorkers() {
       <div class="flex1" style="min-width:0">
         <div class="wname">${esc(w.worker_name || w.id || '?')}</div>
         <div class="wurl" title="${esc(w.base_url || '')}">${esc(w.base_url || '—')}</div>
+        ${provLine ? `<div class="wurl" title="${esc(provLine)}">${esc(provLine)}</div>` : ''}
         <div class="wurl" title="${esc(caps)}">${esc(caps || 'no capabilities')}</div>
         ${eta ? `<div class="wurl" title="${esc(eta)}">${esc(eta)}</div>` : ''}
       </div>
@@ -3400,6 +3485,13 @@ async function loadWorkers() {
       <span class="muted text-xs" style="flex-shrink:0;min-width:44px;text-align:right">${age}</span>
     </div>`;
   }).join('');
+
+  // Purge confirmed-orphaned workers (instance gone AND heartbeat-stale).
+  if (orphaned.length) {
+    await Promise.all(orphaned.map(id =>
+      fetch(`/api/workers/${id}`, { method: 'DELETE' }).catch(() => {})));
+    setTimeout(loadWorkers, 1200);
+  }
 }
 
 function formatWorkerEta(etaByAssetGroup) {

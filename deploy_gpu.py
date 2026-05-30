@@ -420,6 +420,7 @@ ENV_VARS+=(COMFY_INPUT_DIR="$COMFY_INPUT_DIR")
 ENV_VARS+=(COMFY_STOP_CMD="$COMFY_STOP_CMD")
 ENV_VARS+=(COMFY_START_CMD="$COMFY_START_CMD")
 ENV_VARS+=(WORKER_PROVIDER="${{WORKER_PROVIDER:-dedicated_worker}}")
+test -n "${{WORKER_INSTANCE_ID:-}}" && ENV_VARS+=(WORKER_INSTANCE_ID="${{WORKER_INSTANCE_ID}}")
 ENV_VARS+=(WORKER_MAX_CONCURRENT_JOBS="${{WORKER_MAX_CONCURRENT_JOBS:-1}}")
 ENV_VARS+=(WORKER_HEARTBEAT_SECONDS="${{WORKER_HEARTBEAT_SECONDS:-60}}")
 
@@ -725,6 +726,9 @@ UNIT
   fi
   if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
     echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_INSTANCE_ID:-}}"; then
+    echo "Environment=WORKER_INSTANCE_ID=${{WORKER_INSTANCE_ID}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
   if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
     echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
@@ -1618,6 +1622,9 @@ UNIT
 
   if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
     echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+  if test -n "${{WORKER_INSTANCE_ID:-}}"; then
+    echo "Environment=WORKER_INSTANCE_ID=${{WORKER_INSTANCE_ID}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
   if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
     echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"

@@ -254,6 +254,9 @@ def _broker_worker_payload() -> dict[str, object]:
             "comfy_reachable": is_comfy_healthy(),
             "comfy_queue_running": comfy_queue["running"] if comfy_queue else None,
             "comfy_queue_pending": comfy_queue["pending"] if comfy_queue else None,
+            # Cloud provider + instance id let the deploy UI cross-check this
+            "provider": settings.worker_provider,
+            "instance_id": settings.worker_instance_id,
             "performance": _performance_snapshot(),
             "performance_window": _STATS_WINDOW,
             "active_jobs": active_jobs,
