@@ -39,8 +39,8 @@ DEFAULT_VERDA_OS_VOLUME_ID = "34ec939d-a8c1-4ee2-9637-533e324dfe39"
 DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
 DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
 DEFAULT_VERDA_HOSTNAME = "filmforge-verda-worker"
-DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
-DEFAULT_VERDA_FRESH_STORAGE_SIZE = 250
+DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 50
+DEFAULT_VERDA_FRESH_STORAGE_SIZE = 150
 DEFAULT_VERDA_CONTRACT = "pay_as_go"
 DEFAULT_WORKER_REPO_URL = "https://github.com/taxydriver/gpu_worker.git"
 DEFAULT_COMFY_REPO_URL = "https://github.com/comfyanonymous/ComfyUI.git"
@@ -598,8 +598,8 @@ elif test -x "$COMFY_ROOT/venv/bin/python"; then
   COMFY_PYTHON="$COMFY_ROOT/venv/bin/python"
 fi
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
-VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | awk 'NR==1' | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk 'NR==1 {{printf "%.0f", $1 / 1024}}')"
 PUBLIC_URLS="${{WORKER_PUBLIC_URLS:-}}"
 mkdir -p /etc/systemd/system
 
@@ -714,7 +714,8 @@ UNIT
   if test -n "$worker_public_url"; then
     echo "Environment=WORKER_PUBLIC_URL=$worker_public_url" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
-  if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
+  # Only GPU 0 registers with backend to avoid duplicate entries
+  if test -n "${{FILMFORGE_BACKEND_URL:-}}" && test "${{idx}}" -eq 0; then
     echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
   if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
@@ -1497,6 +1498,32 @@ if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
   exit 1
 fi
 
+# Confidential Computing instances (Verda *.CC) boot with the GPU in a
+# "not-ready" state that blocks all CUDA init (cudaError 802 "system not yet
+# initialized"). On NVSwitch boxes fabric manager clears this; single-GPU CC
+# boxes have no NVSwitch (FM exits "Nothing to do"), so we set the ready state
+# ourselves — now, so this deploy's CUDA check passes, and via a boot-time
+# oneshot, since the state resets on every reboot. No-op on non-CC instances.
+if nvidia-smi conf-compute -grs 2>/dev/null | grep -qi "not-ready"; then
+  nvidia-smi conf-compute -srs 1 || true
+fi
+cat > /etc/systemd/system/nvidia-cc-ready.service <<'UNIT'
+[Unit]
+Description=Set NVIDIA Confidential Compute GPU ready state
+After=nvidia-persistenced.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'nvidia-smi conf-compute -grs 2>/dev/null | grep -qi not-ready && nvidia-smi conf-compute -srs 1 || true'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable nvidia-cc-ready.service || true
+
 if nvidia-smi | grep -q "CUDA Version: 13" && \
    ! "$COMFY_ROOT/.venv/bin/python" - <<'PY' >/dev/null 2>&1
 import torch
@@ -1539,8 +1566,8 @@ if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
   exit 1
 fi
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
-VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | awk 'NR==1' | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | awk 'NR==1 {{printf "%.0f", $1 / 1024}}')"
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   comfy_port=$((COMFY_PORT_BASE + idx))
@@ -1551,8 +1578,8 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
 [Unit]
 Description=ComfyUI GPU ${{idx}}
-After=network-online.target
-Wants=network-online.target
+After=network-online.target nvidia-cc-ready.service
+Wants=network-online.target nvidia-cc-ready.service
 
 [Service]
 Type=simple
@@ -1598,7 +1625,8 @@ Environment=WORKER_HEARTBEAT_SECONDS=30
 Environment=RENDER_BROKER_HEARTBEAT_SEC=30
 UNIT
 
-  if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
+  # Only GPU 0 registers with backend to avoid duplicate entries (all GPUs behind same IP)
+  if test -n "${{FILMFORGE_BACKEND_URL:-}}" && test "${{idx}}" -eq 0; then
     echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
   if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
@@ -1718,6 +1746,29 @@ apt_retry() {{
   apt-get "$@"
 }}
 
+# Clone REPO_URL into DEST, or update it if a complete clone already exists.
+# A `.git` dir alone is not proof of a healthy clone: an interrupted clone
+# leaves `.git` + remote but no checked-out commit ("No commits yet"), which
+# later breaks `pip install -r requirements.txt`. Verify a real HEAD before
+# trusting the existing checkout; otherwise re-clone, preserving any .venv so
+# large deps (torch) are not re-downloaded.
+ensure_repo() {{
+  local repo_url="$1" dest="$2"
+  if test -d "$dest/.git" && git -C "$dest" rev-parse HEAD >/dev/null 2>&1; then
+    git -C "$dest" pull --ff-only || true
+    return 0
+  fi
+  if test -d "$dest/.venv"; then
+    rm -rf "$dest.venv_keep"
+    mv "$dest/.venv" "$dest.venv_keep"
+  fi
+  rm -rf "$dest"
+  GIT_TERMINAL_PROMPT=0 git clone "$repo_url" "$dest"
+  if test -d "$dest.venv_keep"; then
+    mv "$dest.venv_keep" "$dest/.venv"
+  fi
+}}
+
 apt_retry update
 apt_retry install -y --no-install-recommends \\
   ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv \\
@@ -1751,12 +1802,7 @@ if test -b /dev/vdb; then
   done
 fi
 
-if test -d "$WORKER_ROOT/.git"; then
-  git -C "$WORKER_ROOT" pull --ff-only || true
-else
-  rm -rf "$WORKER_ROOT"
-  GIT_TERMINAL_PROMPT=0 git clone "$WORKER_REPO_URL" "$WORKER_ROOT"
-fi
+ensure_repo "$WORKER_REPO_URL" "$WORKER_ROOT"
 ln -sfn "$WORKER_ROOT" /opt/gpu_worker
 
 if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
@@ -1765,12 +1811,7 @@ fi
 "$WORKER_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools
 "$WORKER_ROOT/.venv/bin/python" -m pip install -r "$WORKER_ROOT/requirements.txt"
 
-if test -d "$COMFY_ROOT/.git"; then
-  git -C "$COMFY_ROOT" pull --ff-only || true
-else
-  rm -rf "$COMFY_ROOT"
-  GIT_TERMINAL_PROMPT=0 git clone "$COMFY_REPO_URL" "$COMFY_ROOT"
-fi
+ensure_repo "$COMFY_REPO_URL" "$COMFY_ROOT"
 
 if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
   python3 -m venv "$COMFY_ROOT/.venv"
