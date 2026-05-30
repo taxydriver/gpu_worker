@@ -119,8 +119,8 @@ class VerdaProvisionRequest(BaseModel):
     worker_port: int = 9000
     comfy_port: int = 8188
     remote_root: str = "/workspace/filmforge_gpu_worker"
-    fresh_os_volume_size: int = 50
-    fresh_storage_size: int = 150
+    fresh_os_volume_size: int = 100
+    fresh_storage_size: int = 250
     fresh_os_volume_name: str = ""
     fresh_storage_name: str = ""
     skip_warmup: bool = True
@@ -774,51 +774,6 @@ fi
 """
     return f"""set -euo pipefail
 {systemd_branch}paths=({quoted_paths})
-
-# Prefer per-GPU files when they exist (vast multi-GPU layout). This must come
-# BEFORE the singular check, because an old tail-script run may have left an
-# empty singular file (`touch`) that would otherwise shadow the real per-GPU
-# logs. Non-vast (runpod) paths never write per-GPU files, so the glob is empty
-# and we fall through to the singular path — preserving legacy behavior.
-# Stale guard: when a multi-GPU deploy is replaced by a single-worker deploy,
-# the old gpu_worker_gpuN.log files linger. Only count per-GPU files whose
-# mtime is >= the singular log's mtime; otherwise they're leftover and should
-# be ignored.
-singular_mtime=0
-for path in "${{paths[@]}}"; do
-  if test -s "$path"; then
-    pm=$(stat -c %Y "$path" 2>/dev/null || echo 0)
-    test "$pm" -gt "$singular_mtime" && singular_mtime=$pm
-  fi
-done
-multi=()
-for path in "${{paths[@]}}"; do
-  base="${{path%.log}}"
-  for m in "${{base}}"_gpu[0-9]*.log; do
-    test -e "$m" || continue
-    mm=$(stat -c %Y "$m" 2>/dev/null || echo 0)
-    if test "$mm" -ge "$singular_mtime"; then
-      multi+=("$m")
-    fi
-  done
-done
-if test "${{#multi[@]}}" -eq 1; then
-  echo "[remote-log] tailing {quoted_label}: ${{multi[0]}}"
-  exec tail -n 200 -F "${{multi[0]}}"
-fi
-if test "${{#multi[@]}}" -gt 1; then
-  echo "[remote-log] tailing {quoted_label} (multi-GPU): ${{multi[*]}}"
-  pids=""
-  for m in "${{multi[@]}}"; do
-    tag=$(echo "$m" | grep -oE 'gpu[0-9]+' | head -n 1)
-    stdbuf -oL tail -n 200 -F "$m" | stdbuf -oL awk -v t="[$tag]" '{{print t" "$0; fflush()}}' &
-    pids="$pids $!"
-  done
-  trap "kill $pids 2>/dev/null || true" EXIT INT TERM
-  wait
-  exit 0
-fi
-
 found=""
 for path in "${{paths[@]}}"; do
   if test -e "$path"; then
@@ -826,15 +781,13 @@ for path in "${{paths[@]}}"; do
     break
   fi
 done
-if test -n "$found"; then
-  echo "[remote-log] tailing {quoted_label}: $found"
-  exec tail -n 200 -F "$found"
+if test -z "$found"; then
+  found={primary}
+  mkdir -p "$(dirname "$found")" 2>/dev/null || true
+  touch "$found" 2>/dev/null || true
+  echo "[remote-log] waiting for {quoted_label} log at $found"
 fi
-
-found={primary}
-mkdir -p "$(dirname "$found")" 2>/dev/null || true
-touch "$found" 2>/dev/null || true
-echo "[remote-log] waiting for {quoted_label} log at $found"
+echo "[remote-log] tailing {quoted_label}: $found"
 tail -n 200 -F "$found"
 """
 
@@ -856,29 +809,6 @@ if command -v systemctl >/dev/null 2>&1; then
     wait
     exit 0
   fi
-fi
-
-# Prefer per-GPU files when they exist. See _remote_tail_script for why
-# this must precede the singular check.
-multi=()
-for m in /tmp/comfyui_gpu[0-9]*.log /workspace/ComfyUI/comfyui_gpu[0-9]*.log; do
-  test -e "$m" && multi+=("$m")
-done
-if test "${#multi[@]}" -eq 1; then
-  echo "[comfy] tailing file: ${multi[0]}"
-  exec tail -n 200 -F "${multi[0]}"
-fi
-if test "${#multi[@]}" -gt 1; then
-  echo "[comfy] tailing multi-GPU files: ${multi[*]}"
-  pids=""
-  for m in "${multi[@]}"; do
-    tag=$(echo "$m" | grep -oE 'gpu[0-9]+' | head -n 1)
-    stdbuf -oL tail -n 200 -F "$m" | stdbuf -oL awk -v t="[$tag]" '{print t" "$0; fflush()}' &
-    pids="$pids $!"
-  done
-  trap "kill $pids 2>/dev/null || true" EXIT INT TERM
-  wait
-  exit 0
 fi
 
 candidates=(
@@ -926,56 +856,16 @@ sleep 2
 
 def _remote_downloads_script() -> str:
     return r"""set -euo pipefail
-# Discover worker logs: prefer the singular path (runpod / single-GPU / legacy);
-# only fan out with [gpuN] tags when 2+ per-GPU files exist (multi-GPU vast).
-worker_logs=()
-multi=0
-# Prefer per-GPU files. See _remote_tail_script for why this must precede the
-# singular check (stale empty singular files left by old tail invocations).
-# Stale guard: ignore per-GPU files older than the singular log — they're
-# leftovers from a previous multi-GPU deploy that was replaced by a single one.
-singular_mtime=0
-if test -s /tmp/gpu_worker.log; then
-  singular_mtime=$(stat -c %Y /tmp/gpu_worker.log 2>/dev/null || echo 0)
-fi
-for m in /tmp/gpu_worker_gpu[0-9]*.log; do
-  test -e "$m" || continue
-  mm=$(stat -c %Y "$m" 2>/dev/null || echo 0)
-  test "$mm" -ge "$singular_mtime" && worker_logs+=("$m")
-done
-if test "${#worker_logs[@]}" -gt 1; then
-  multi=1
-fi
-if test "${#worker_logs[@]}" -eq 0; then
-  worker_logs=(/tmp/gpu_worker.log)
-fi
-mkdir -p /tmp 2>/dev/null || true
-for wl in "${worker_logs[@]}"; do touch "$wl" 2>/dev/null || true; done
-echo "[downloads] tailing logs: ${worker_logs[*]}"
+worker_log=/tmp/gpu_worker.log
+mkdir -p "$(dirname "$worker_log")" 2>/dev/null || true
+touch "$worker_log" 2>/dev/null || true
 echo "[downloads] recent worker download lines"
-for wl in "${worker_logs[@]}"; do
-  prefix="[downloads]"
-  if test "$multi" = "1"; then
-    tag=$(echo "$wl" | grep -oE 'gpu[0-9]+' | head -n 1)
-    test -n "$tag" && prefix="[$tag] [downloads]"
-  fi
-  grep -iE "download|asset|aria2|model|ensure|failed|error" "$wl" 2>/dev/null \
-    | tail -n 120 \
-    | awk -v p="$prefix" '{print p" "$0}' || true
-done
-tail_pids=""
-for wl in "${worker_logs[@]}"; do
-  prefix="[downloads] log"
-  if test "$multi" = "1"; then
-    tag=$(echo "$wl" | grep -oE 'gpu[0-9]+' | head -n 1)
-    test -n "$tag" && prefix="[$tag] [downloads] log"
-  fi
-  (stdbuf -oL tail -n 0 -F "$wl" 2>/dev/null \
-    | grep --line-buffered -iE "download|asset|aria2|model|ensure|failed|error" \
-    | stdbuf -oL awk -v p="$prefix" '{print p" "$0; fflush()}') &
-  tail_pids="$tail_pids $!"
-done
-trap 'kill $tail_pids 2>/dev/null || true' EXIT
+grep -iE "download|asset|aria2|model|ensure|failed|error" "$worker_log" 2>/dev/null | tail -n 120 || true
+(tail -n 0 -F "$worker_log" 2>/dev/null \
+  | grep --line-buffered -iE "download|asset|aria2|model|ensure|failed|error" \
+  | sed 's/^/[downloads] log /') &
+tail_pid=$!
+trap 'kill "$tail_pid" 2>/dev/null || true' EXIT
 while true; do
   echo "[downloads] $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   if pgrep -fa aria2c >/tmp/filmforge_aria2c_processes.txt 2>/dev/null; then
@@ -1317,65 +1207,6 @@ async def list_workers():
             return payload.get("items", []) if isinstance(payload, dict) else payload
     except Exception:
         return []
-
-
-def _fetch_json(url: str, timeout: float = 2.0):
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read())
-    except Exception:
-        return None
-
-
-@app.get("/api/worker-telemetry")
-async def worker_telemetry():
-    """Roster merged with each worker's live /health and /stats (fail-soft)."""
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8000/api/render-broker/workers", timeout=3) as r:
-            payload = json.loads(r.read())
-            roster = payload.get("items", []) if isinstance(payload, dict) else payload
-    except Exception:
-        roster = []
-
-    async def enrich(w: dict) -> dict:
-        base = (w.get("base_url") or w.get("public_url") or "").rstrip("/")
-        out = {
-            "worker_name": w.get("worker_name") or w.get("id") or "?",
-            "base_url": base,
-            "capabilities": w.get("capabilities") or w.get("supported_asset_groups") or [],
-            "gpu_name": w.get("gpu_name"),
-            "vram_gb": w.get("vram_gb"),
-            "active_jobs": int(w.get("active_jobs") or 0),
-            "max_concurrent": int(w.get("max_concurrent_jobs") or w.get("max_concurrency") or 1),
-            "reachable": False,
-            "stats": [],
-        }
-        if not base:
-            return out
-        health, stats = await asyncio.gather(
-            asyncio.to_thread(_fetch_json, f"{base}/health"),
-            asyncio.to_thread(_fetch_json, f"{base}/stats"),
-        )
-        if health:
-            out["reachable"] = True
-            out["active_jobs"] = int(health.get("active_jobs", out["active_jobs"]))
-            out["max_concurrent"] = int(health.get("max_concurrent_jobs", out["max_concurrent"]))
-            out["gpu_name"] = health.get("gpu_name") or out["gpu_name"]
-            out["vram_gb"] = health.get("vram_gb") or out["vram_gb"]
-            out["comfy_reachable"] = bool(health.get("comfy_reachable", True))
-        if stats and isinstance(stats.get("groups"), list):
-            out["stats"] = [
-                {
-                    "group": g.get("asset_group"),
-                    "avg_total_sec": g.get("avg_total_sec"),
-                    "avg_comfy_run_sec": g.get("avg_comfy_run_sec"),
-                    "samples": g.get("sample_count"),
-                }
-                for g in stats["groups"]
-            ]
-        return out
-
-    return await asyncio.gather(*[enrich(w) for w in roster])
 
 
 @app.post("/api/deploy")
@@ -1978,46 +1809,6 @@ PY
   fi
   fetch_stats "filmforge-worker-gpu${idx}" "$port"
 done
-
-# Single-worker Vast deploy (no systemd, no multi-GPU health files).
-# deploy_gpu.py writes /tmp/gpu_worker_health.json and runs uvicorn on $WORKER_PORT (default 9000).
-if test -s /tmp/gpu_worker_health.json && ! ls /tmp/filmforge_worker_gpu*_health.json >/dev/null 2>&1; then
-  port=$(python3 - <<'PY' 2>/dev/null || true
-import json
-try:
-    data = json.load(open("/tmp/gpu_worker_health.json"))
-    print(data.get("worker_port") or data.get("port") or 9000)
-except Exception:
-    print(9000)
-PY
-)
-  test -z "$port" && port=9000
-  name=$(python3 - <<'PY' 2>/dev/null || true
-import json
-try:
-    print(json.load(open("/tmp/gpu_worker_health.json")).get("worker_name") or "")
-except Exception:
-    pass
-PY
-)
-  url=$(python3 - <<'PY' 2>/dev/null || true
-import json
-try:
-    print(json.load(open("/tmp/gpu_worker_health.json")).get("public_url") or "")
-except Exception:
-    pass
-PY
-)
-  if test -z "$url"; then
-    url=$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/filmforge_gpu_worker_tunnel.log 2>/dev/null | tail -n 1 || true)
-  fi
-  if test -n "$url"; then
-    printf 'WORKER_URL\tfilmforge-worker\tactive\t%s\t%s\n' "$url" "$name"
-  elif ss -ltn 2>/dev/null | grep -q ":${port} "; then
-    printf 'WORKER_PORT\tfilmforge-worker\tactive\t%s\t%s\n' "$port" "$name"
-  fi
-  fetch_stats "filmforge-worker" "$port"
-fi
 """
     proc = subprocess.run(
         [*ssh_cmd, "bash", "-s"],
@@ -2304,21 +2095,6 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
 .muted{color:#3d4461}.text-xs{font-size:11px}
 .flex{display:flex}.gap6{gap:6px}.gap8{gap:8px}.items-center{align-items:center}.flex1{flex:1}
 .mt10{margin-top:10px}.mb0{margin-bottom:0}
-
-/* GPU heartbeat meter + speed matrix */
-.wrow{align-items:flex-start}
-.wmeter{flex-shrink:0;background:#080b14;border:1px solid #1e2130;border-radius:5px;width:64px;height:34px}
-.wlamp{display:inline-block;width:7px;height:7px;border-radius:50%;background:#3d4461;margin-left:6px;vertical-align:middle}
-.wlamp.busy{background:#22c55e;box-shadow:0 0 6px #22c55e}
-.wlamp.down{background:#ef4444;box-shadow:0 0 6px #ef4444}
-.wstate{font-size:9px;color:#475569;margin-left:6px;text-transform:uppercase;letter-spacing:.5px}
-.wmx{margin-top:6px;font-family:monospace;font-size:9px;color:#94a3b8;max-width:240px}
-.wmx-row{display:grid;grid-template-columns:48px 44px 44px 30px;gap:5px;line-height:1.5}
-.wmx-head{color:#475569}
-.wmx-g{color:#cbd5e1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.wmx-v{text-align:right}
-.wmx-n{text-align:right;color:#475569}
-.wmx-empty{font-size:9px;color:#475569;font-style:italic;margin-top:4px;display:block}
 </style>
 </head>
 <body>
@@ -2430,8 +2206,8 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       </div>
       <div id="v-fresh-fields" style="display:none">
         <div class="grid2">
-          <div class="fg"><label>OS GB</label><input id="v-fresh-os-size" type="number" value="50" min="50" onchange="refreshVerdaCostEstimate()"></div>
-          <div class="fg"><label>Storage GB</label><input id="v-fresh-storage-size" type="number" value="150" min="100" onchange="refreshVerdaCostEstimate()"></div>
+          <div class="fg"><label>OS GB</label><input id="v-fresh-os-size" type="number" value="100" min="50" onchange="refreshVerdaCostEstimate()"></div>
+          <div class="fg"><label>Storage GB</label><input id="v-fresh-storage-size" type="number" value="250" min="100" onchange="refreshVerdaCostEstimate()"></div>
         </div>
         <div class="fg"><label>Preload Models</label>
           <select id="v-fresh-warm">
@@ -3166,8 +2942,8 @@ async function refreshVerdaCostEstimate() {
   }
   const fresh = document.getElementById('v-mode').value === 'fresh';
   const contract = document.getElementById('v-contract')?.value || 'pay_as_go';
-  const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 50) : 0;
-  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 150) : 0;
+  const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 100) : 0;
+  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 250) : 0;
   const params = new URLSearchParams({
     instance_type: instanceType,
     location,
@@ -3340,8 +3116,8 @@ async function quickDeployVerda() {
         worker_port: +(document.getElementById('c-port').value) || 9000,
         comfy_port: +(document.getElementById('v-comfy-port').value) || 8188,
         remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
-        fresh_os_volume_size: +(document.getElementById('v-fresh-os-size').value) || 50,
-        fresh_storage_size: +(document.getElementById('v-fresh-storage-size').value) || 150,
+        fresh_os_volume_size: +(document.getElementById('v-fresh-os-size').value) || 100,
+        fresh_storage_size: +(document.getElementById('v-fresh-storage-size').value) || 250,
         skip_warmup: fresh ? !document.getElementById('v-fresh-warm').value : true,
         warm_asset_groups: fresh
           ? document.getElementById('v-fresh-warm').value.split(',').map(s => s.trim()).filter(Boolean)
@@ -3708,7 +3484,7 @@ function formatWorkerStats(stats) {
   if (!Array.isArray(stats) || !stats.length) return '';
   const parts = stats.map(g => {
     const ag = g.asset_group || '?';
-    const sec = (g.avg_comfy_run_sec ?? g.avg_total_sec ?? 0);
+    const sec = (g.avg_total_sec ?? g.avg_comfy_run_sec ?? 0);
     return `${ag} ${Number(sec).toFixed(1)}s`;
   });
   const totalSamples = stats.reduce((acc, g) => acc + (g.sample_count || 0), 0);
@@ -3719,7 +3495,7 @@ function appendLog(line, src = currentLogSrc, instId = selectedInstId) {
   if (!line || !instId) return;
   const idata = getInstData(instId);
   if (!idata.logBuffers[src]) idata.logBuffers[src] = [];
-  const isNoise = / - "(get|head)\s+\/(jobs|stats|files|health|metrics)\b/i.test(line);
+  const isNoise = /"\s*(get|head)\s+\//i.test(line) || /http\/1\.1"\s+200/i.test(line);
   if (isNoise) return;
   const downloadChanged = updateDownloadStatusFromLine(line, idata);
   idata.logBuffers[src].push(line);

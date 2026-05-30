@@ -57,8 +57,8 @@ MODES
       Options (passed to deploy_gpu.py):
         --verda-location FIN-01
         --verda-instance-type 2A100.44V
-        --verda-fresh-os-volume-size 50
-        --verda-fresh-storage-size 150
+        --verda-fresh-os-volume-size 100
+        --verda-fresh-storage-size 250
         --warm-asset-group stable_audio_v1
         --skip-warmup
 
