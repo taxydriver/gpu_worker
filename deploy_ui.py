@@ -121,7 +121,7 @@ class VerdaProvisionRequest(BaseModel):
     comfy_port: int = 8188
     remote_root: str = "/workspace/filmforge_gpu_worker"
     fresh_os_volume_size: int = 100
-    fresh_storage_size: int = 250
+    fresh_storage_size: int = 300
     fresh_os_volume_name: str = ""
     fresh_storage_name: str = ""
     skip_warmup: bool = True
@@ -344,6 +344,8 @@ VERDA_CLI = Path.home() / ".verda" / "bin" / "verda"
 VERDA_AVAILABILITY_LOCATIONS = ("FIN-01", "FIN-02", "FIN-03")
 _VERDA_INSTANCE_TYPES_CACHE: dict[str, object] = {"loaded_at": 0.0, "prices": {}}
 _VERDA_INSTANCE_TYPES_TTL_SEC = 600
+_VERDA_AVAILABILITY_CACHE: dict[str, dict] = {}  # key: "location/contract" → {rows, loaded_at}
+_VERDA_AVAILABILITY_TTL_SEC = 45
 
 
 def _normalize_ssh_command(cmd: str) -> str:
@@ -765,7 +767,7 @@ def _remote_tail_script(paths: tuple[str, ...], label: str) -> str:
     pids=""
     for u in $units; do
       tag=$(echo "$u" | grep -oE 'gpu[0-9]+')
-      journalctl -n 100 -f -u "$u" | awk -v t="[$tag]" '{{print t" "$0; fflush()}}' &
+      journalctl -n 50 -f -u "$u" | awk -v t="[$tag]" '{{print t" "$0; fflush()}}' &
       pids="$pids $!"
     done
     trap "kill $pids 2>/dev/null || true" EXIT INT TERM
@@ -790,7 +792,7 @@ if test -z "$found"; then
   echo "[remote-log] waiting for {quoted_label} log at $found"
 fi
 echo "[remote-log] tailing {quoted_label}: $found"
-tail -n 200 -F "$found"
+tail -n 80 -F "$found"
 """
 
 
@@ -804,7 +806,7 @@ if command -v systemctl >/dev/null 2>&1; then
     pids=""
     for u in $units; do
       tag=$(echo "$u" | grep -oE 'gpu[0-9]+')
-      journalctl -n 100 -f -u "$u" | awk -v t="[$tag]" '{print t" "$0; fflush()}' &
+      journalctl -n 50 -f -u "$u" | awk -v t="[$tag]" '{print t" "$0; fflush()}' &
       pids="$pids $!"
     done
     trap "kill $pids 2>/dev/null || true" EXIT INT TERM
@@ -825,7 +827,7 @@ for pattern in "${candidates[@]}"; do
   for path in $pattern; do
     if test -e "$path"; then
       echo "[comfy] tailing file: $path"
-      exec tail -n 200 -F "$path"
+      exec tail -n 80 -F "$path"
     fi
   done
 done
@@ -844,7 +846,7 @@ if command -v docker >/dev/null 2>&1; then
     | awk '{print $1}')"
   if test -n "$container_id"; then
     echo "[comfy] streaming docker logs for container $container_id"
-    exec docker logs --tail 200 -f "$container_id" 2>&1
+    exec docker logs --tail 80 -f "$container_id" 2>&1
   fi
 fi
 
@@ -862,7 +864,7 @@ worker_log=/tmp/gpu_worker.log
 mkdir -p "$(dirname "$worker_log")" 2>/dev/null || true
 touch "$worker_log" 2>/dev/null || true
 echo "[downloads] recent worker download lines"
-grep -iE "download|asset|aria2|model|ensure|failed|error" "$worker_log" 2>/dev/null | tail -n 120 || true
+grep -iE "download|asset|aria2|model|ensure|failed|error" "$worker_log" 2>/dev/null | tail -n 60 || true
 (tail -n 0 -F "$worker_log" 2>/dev/null \
   | grep --line-buffered -iE "download|asset|aria2|model|ensure|failed|error" \
   | sed 's/^/[downloads] log /') &
@@ -880,7 +882,7 @@ while true; do
     | sort -nr \
     | head -n 20 \
     | awk '{ts=$2; size=$3; $1=$2=$3=""; sub(/^   /,""); printf("[downloads] file %s bytes=%s path=%s\n", ts, size, $0)}'
-  sleep 5
+  sleep 15
 done
 """
 
@@ -912,7 +914,7 @@ async def backend_env():
 
 @app.get("/api/instances")
 async def list_instances():
-    data = _vastai("show", "instances")
+    data = await asyncio.to_thread(_vastai, "show", "instances")
     return data if isinstance(data, list) else []
 
 
@@ -921,58 +923,79 @@ async def verda_availability(preference: str = "single", contract: str = "pay_as
     if not VERDA_CLI.exists():
         raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
 
-    options: list[dict] = []
-    errors: dict[str, str] = {}
-    prices = _verda_instance_type_prices()
     contract = str(contract or "pay_as_go").lower()
     # "both" surfaces on-demand and spot together so the UI can list them in one
     # dropdown (separated by group) without forcing the user to toggle first.
     contracts = ["pay_as_go", "spot"] if contract == "both" else [contract]
-    for c in contracts:
+
+    def _fetch(location: str, c: str) -> tuple[str, str, list, str | None]:
+        cache_key = f"{location}/{c}"
+        cached = _VERDA_AVAILABILITY_CACHE.get(cache_key)
+        if cached and time.time() - float(cached.get("loaded_at", 0)) < _VERDA_AVAILABILITY_TTL_SEC:
+            return location, c, cached["rows"], None
+
         use_spot = c == "spot"
-        for location in VERDA_AVAILABILITY_LOCATIONS:
-            try:
-                command = [str(VERDA_CLI), "--agent", "availability", "--location", location]
-                if use_spot:
-                    command.append("--spot")
-                proc = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=45,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    errors[f"{location}/{c}"] = (proc.stderr or proc.stdout).strip()
+        command = [str(VERDA_CLI), "--agent", "availability", "--location", location]
+        if use_spot:
+            command.append("--spot")
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return location, c, [], (proc.stderr or proc.stdout).strip()
+            payload = json.loads(proc.stdout or "[]")
+            rows = payload if isinstance(payload, list) else []
+            _VERDA_AVAILABILITY_CACHE[cache_key] = {"rows": rows, "loaded_at": time.time()}
+            return location, c, rows, None
+        except Exception as exc:
+            return location, c, [], str(exc)
+
+    # Run instance-types (cached) and all availability calls in parallel threads
+    # so the event loop is never blocked and other buttons stay responsive.
+    prices, *avail_results = await asyncio.gather(
+        asyncio.to_thread(_verda_instance_type_prices),
+        *[
+            asyncio.to_thread(_fetch, location, c)
+            for c in contracts
+            for location in VERDA_AVAILABILITY_LOCATIONS
+        ],
+    )
+
+    options: list[dict] = []
+    errors: dict[str, str] = {}
+    for location, c, rows, error in avail_results:
+        if error is not None:
+            errors[f"{location}/{c}"] = error
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            loc = str(row.get("location_code") or location)
+            for instance_type in row.get("instance_types") or []:
+                instance_type = str(instance_type)
+                if instance_type.upper().startswith("CPU"):
                     continue
-                payload = json.loads(proc.stdout or "[]")
-                rows = payload if isinstance(payload, list) else []
-                for row in rows:
-                    if not isinstance(row, dict):
-                        continue
-                    loc = str(row.get("location_code") or location)
-                    for instance_type in row.get("instance_types") or []:
-                        instance_type = str(instance_type)
-                        if instance_type.upper().startswith("CPU"):
-                            continue
-                        rank = _verda_gpu_rank(instance_type, preference)
-                        price = prices.get(instance_type) or {}
-                        options.append({
-                            "location": loc,
-                            "instance_type": instance_type,
-                            "contract": c,
-                            "label": _verda_instance_label(loc, instance_type, price),
-                            "rank": rank[0],
-                            "gpu_count": _verda_gpu_count(instance_type),
-                            "price_per_hour": price.get("price_per_hour"),
-                            "spot_price": price.get("spot_price"),
-                            "currency": price.get("currency") or "usd",
-                            "gpu_memory_gb": price.get("gpu_memory_gb"),
-                            "ram_gb": price.get("ram_gb"),
-                            "hardware_name": price.get("name") or "",
-                        })
-            except Exception as exc:
-                errors[f"{location}/{c}"] = str(exc)
+                rank = _verda_gpu_rank(instance_type, preference)
+                price = prices.get(instance_type) or {}
+                options.append({
+                    "location": loc,
+                    "instance_type": instance_type,
+                    "contract": c,
+                    "label": _verda_instance_label(loc, instance_type, price),
+                    "rank": rank[0],
+                    "gpu_count": _verda_gpu_count(instance_type),
+                    "price_per_hour": price.get("price_per_hour"),
+                    "spot_price": price.get("spot_price"),
+                    "currency": price.get("currency") or "usd",
+                    "gpu_memory_gb": price.get("gpu_memory_gb"),
+                    "ram_gb": price.get("ram_gb"),
+                    "hardware_name": price.get("name") or "",
+                })
 
     dedup: dict[tuple[str, str, str], dict] = {}
     for option in options:
@@ -1010,7 +1033,9 @@ async def verda_cost_estimate(
         command.extend(["--storage", str(storage_gb), "--storage-type", storage_type or "NVMe"])
     if contract == "spot":
         command.append("--spot")
-    proc = subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
+    proc = await asyncio.to_thread(
+        subprocess.run, command, capture_output=True, text=True, timeout=45, check=False
+    )
     if proc.returncode != 0:
         raise HTTPException(502, (proc.stderr or proc.stdout or "Verda cost estimate failed").strip())
     try:
@@ -1022,7 +1047,7 @@ async def verda_cost_estimate(
 
 @app.get("/api/templates")
 async def list_templates(q: str = "comfy"):
-    return _vast_templates(q)
+    return await asyncio.to_thread(_vast_templates, q)
 
 
 @app.post("/api/instances")
@@ -1280,7 +1305,10 @@ fi
 cd "$REMOTE_ROOT"
 if test -d gpu_worker/.git; then
   echo "[deploy] Updating existing gpu_worker clone..."
-  cd gpu_worker && git pull origin main && cd ..
+  cd gpu_worker
+  git fetch origin main
+  git merge --ff-only FETCH_HEAD
+  cd ..
 else
   rm -rf gpu_worker
   echo "[deploy] Cloning gpu_worker from GitHub..."
@@ -1660,22 +1688,17 @@ async def stream_logs(job_id: str):
     job = _jobs[job_id]
 
     async def generate() -> AsyncGenerator[str, None]:
-        q = job["queue"]
-        if job["status"] != "running":
-            for line in job["logs"]:
-                yield f"data: {json.dumps(line)}\n\n"
-            yield "data: __DONE__\n\n"
-            return
+        # Poll job["logs"] by index so late-connecting or reconnecting browsers
+        # always receive the full output, not just what arrives after connect.
+        logs = job["logs"]
+        idx = 0
         while True:
-            while True:
-                try:
-                    item = q.get_nowait()
-                    if item is None:
-                        yield "data: __DONE__\n\n"
-                        return
-                    yield f"data: {json.dumps(item)}\n\n"
-                except queue.Empty:
-                    break
+            while idx < len(logs):
+                yield f"data: {json.dumps(logs[idx])}\n\n"
+                idx += 1
+            if job["status"] != "running":
+                yield "data: __DONE__\n\n"
+                return
             await asyncio.sleep(0.2)
 
     return StreamingResponse(generate(), media_type="text/event-stream",
@@ -1711,7 +1734,7 @@ async def stream_remote_log(source: str, ssh: str | None = None):
             from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
             ssh_cmd, _, _ = parse_ssh_command(ssh_command)
             ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
-            ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", *ssh_cmd[1:]]
+            ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", *ssh_cmd[1:]]
         except Exception as exc:
             yield f"data: {json.dumps(f'[remote-log] ERROR: {exc}')}\n\n"
             yield "data: __DONE__\n\n"
@@ -1835,13 +1858,10 @@ PY
   fetch_stats "filmforge-worker-gpu${idx}" "$port"
 done
 """
-    proc = subprocess.run(
-        [*ssh_cmd, "bash", "-s"],
-        input=script,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
+    _ssh_cmd = ssh_cmd  # capture for lambda
+    proc = await asyncio.to_thread(
+        subprocess.run, [*_ssh_cmd, "bash", "-s"],
+        input=script, capture_output=True, text=True, timeout=20, check=False
     )
     if proc.returncode != 0:
         raise HTTPException(502, (proc.stderr or proc.stdout or "Remote summary failed").strip())
@@ -1877,6 +1897,63 @@ done
     return {"worker_urls": worker_urls, "download_line": download_line}
 
 
+@app.get("/api/comfy-activity")
+async def comfy_activity(ssh: str):
+    """Live ComfyUI queue depth read straight from the box over SSH.
+
+    ``queue_running`` is what ComfyUI is executing this instant (the same engine
+    that prints "got prompt" / "Prompt executed in N seconds" in the logs), so it
+    is the ground truth for whether the GPU is generating right now. We read it
+    directly here so the deploy UI's generating indicator needs no backend or
+    worker heartbeat — it only needs the SSH access it already has.
+    """
+    try:
+        from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
+        ssh_cmd, _, _ = parse_ssh_command(ssh)
+        ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
+        ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", *ssh_cmd[1:]]
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
+
+    # Derive the ComfyUI port(s) from the worker units' COMFY_BASE_URL so this
+    # works for multi-GPU boxes; fall back to the default 8188.
+    script = r"""set -uo pipefail
+ports=""
+if command -v systemctl >/dev/null 2>&1; then
+  for unit in $(systemctl list-units --type=service --all --no-legend 'filmforge-worker-gpu*.service' 2>/dev/null | awk '{print $1}'); do
+    p=$(systemctl cat "$unit" 2>/dev/null | sed -n 's#^Environment=COMFY_BASE_URL=##p' | tail -n 1 | sed 's/^"//;s/"$//' | grep -oE '[0-9]+$' || true)
+    test -n "$p" && ports="$ports $p"
+  done
+fi
+test -n "$ports" || ports="8188"
+running=0; pending=0
+for p in $ports; do
+  q=$(curl -fsS --max-time 2 "http://127.0.0.1:${p}/queue" 2>/dev/null || true)
+  test -n "$q" || continue
+  c=$(printf '%s' "$q" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("queue_running") or []), len(d.get("queue_pending") or []))' 2>/dev/null || true)
+  test -n "$c" || continue
+  running=$((running + ${c% *})); pending=$((pending + ${c#* }))
+done
+printf 'COMFY\t%s\t%s\n' "$running" "$pending"
+"""
+    proc = await asyncio.to_thread(
+        subprocess.run, [*ssh_cmd, "bash", "-s"],
+        input=script, capture_output=True, text=True, timeout=12, check=False
+    )
+    running = pending = 0
+    reachable = False
+    for line in proc.stdout.splitlines():
+        if line.startswith("COMFY\t"):
+            parts = line.split("\t")
+            if len(parts) == 3:
+                reachable = True
+                try:
+                    running, pending = int(parts[1]), int(parts[2])
+                except ValueError:
+                    pass
+    return {"reachable": reachable, "running": running, "pending": pending}
+
+
 @app.get("/api/verda/hosts")
 async def list_verda_hosts():
     return _verda_hosts_with_live_vms()
@@ -1887,7 +1964,7 @@ async def list_verda_volumes():
     if not VERDA_CLI.exists():
         raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
     try:
-        return _verda_list_volumes()
+        return await asyncio.to_thread(_verda_list_volumes)
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
 
@@ -1897,7 +1974,7 @@ async def list_verda_vms():
     if not VERDA_CLI.exists():
         raise HTTPException(503, f"Verda CLI not found at {VERDA_CLI}")
     try:
-        return _verda_list_vms()
+        return await asyncio.to_thread(_verda_list_vms)
     except RuntimeError as exc:
         raise HTTPException(502, str(exc)) from exc
 
@@ -2240,7 +2317,7 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
       <div id="v-fresh-fields" style="display:none">
         <div class="grid2">
           <div class="fg"><label>OS GB</label><input id="v-fresh-os-size" type="number" value="100" min="50" onchange="refreshVerdaCostEstimate()"></div>
-          <div class="fg"><label>Storage GB</label><input id="v-fresh-storage-size" type="number" value="250" min="100" onchange="refreshVerdaCostEstimate()"></div>
+          <div class="fg"><label>Storage GB</label><input id="v-fresh-storage-size" type="number" value="300" min="100" onchange="refreshVerdaCostEstimate()"></div>
         </div>
         <div class="fg"><label>Preload Models</label>
           <select id="v-fresh-warm">
@@ -2473,7 +2550,31 @@ function selectInstance(id, ssh) {
   updateInstHeader();
   renderLog(currentLogSrc);
   refreshSelectedInstanceSummary();
+  refreshComfyActivity();
   if (currentLogSrc !== 'deploy') reconnectRemoteLog(currentLogSrc);
+}
+
+// Poll ComfyUI's live queue depth for the selected instance straight from the
+// box. running > 0 means the GPU is generating right now (ground truth, same
+// signal as the "got prompt"/"Prompt executed" log lines).
+async function refreshComfyActivity() {
+  if (!selectedInstId) return;
+  const capturedInstId = selectedInstId;
+  const idata = getInstData(capturedInstId);
+  if (!idata.ssh) return;
+  try {
+    const a = await fetch(`/api/comfy-activity?ssh=${encodeURIComponent(idata.ssh)}`)
+      .then(r => (r.ok ? r.json() : null));
+    if (!a) return;
+    idata.comfyReachable = a.reachable;
+    idata.comfyRunning = a.running;
+    idata.comfyPending = a.pending;
+    // Remember the last time the GPU was actually executing, so the badge can
+    // ride through the brief queue-empty gaps between consecutive prompts in a
+    // render session instead of flickering to "Idle".
+    if (a.running > 0 || a.pending > 0) idata.comfyLastBusy = Date.now();
+    if (capturedInstId === selectedInstId) updateInstHeader();
+  } catch (e) { /* transient SSH/network blip — keep last known state */ }
 }
 
 function updateInstHeader() {
@@ -2486,6 +2587,18 @@ function updateInstHeader() {
   const statusHtml = idata.status
     ? `<span class="badge ${idata.status === 'done' ? 'b-running' : 'b-exited'}" style="font-size:10px"><span class="dot"></span>${esc(idata.status)}</span>`
     : '';
+  // Live ComfyUI generation state — equalizer bars while the GPU is rendering.
+  // Hysteresis: treat the box as still generating for a short grace window after
+  // the queue drains, so the badge doesn't flicker to "Idle" in the 1-2s gaps
+  // between prompts in a multi-shot render session.
+  const COMFY_GRACE_MS = 30000;
+  const busyNow = (idata.comfyRunning || 0) > 0;
+  const recentlyBusy = idata.comfyLastBusy && (Date.now() - idata.comfyLastBusy) < COMFY_GRACE_MS;
+  const genHtml = (busyNow || recentlyBusy)
+    ? `<span class="badge b-generating" style="font-size:10px"><span class="eq"><i></i><i></i><i></i><i></i></span>${busyNow && (idata.comfyPending || 0) > 0 ? 'Generating +' + idata.comfyPending : 'Generating'}</span>`
+    : (idata.comfyReachable
+        ? `<span class="badge b-idle" style="font-size:10px"><span class="dot"></span>Idle</span>`
+        : '');
   const urls = normalizedWorkerUrls(idata);
   const statsByUrl = idata.workerStats || {};
   const urlHtml = urls.length
@@ -2511,6 +2624,7 @@ function updateInstHeader() {
     <span class="inst-header-name">Instance #${esc(selectedInstId)}</span>
     ${idata.ssh ? `<span class="inst-header-meta">${esc(idata.ssh)}</span>` : ''}
     ${statusHtml}
+    ${genHtml}
   </div>
   ${urlHtml}
   ${downloadHtml}`;
@@ -2845,10 +2959,12 @@ async function teardownVerda(name, ssh, deleteVolumes) {
 async function loadVerdaAvailability() {
   const sel = document.getElementById('v-instance-select');
   const status = document.getElementById('v-availability-status');
+  const btn = document.getElementById('verda-provision-btn');
   const preference = document.getElementById('v-gpu-preference')?.value || 'single';
   const optionLimit = document.getElementById('v-option-limit')?.value || '5';
   const contract = document.getElementById('v-contract')?.value || 'pay_as_go';
   if (!sel || !status) return;
+  if (btn) { btn.disabled = true; btn.textContent = '⟳ Loading GPUs…'; }
   status.textContent = 'Checking Verda GPUs…';
   try {
     const params = new URLSearchParams({preference, contract});
@@ -2893,6 +3009,8 @@ async function loadVerdaAvailability() {
     status.textContent = `${total} of ${allItems.length} ${label} option(s)`;
   } catch (e) {
     status.textContent = `Availability unavailable: ${e}`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '⚡ Create & Deploy (Verda)'; }
   }
 }
 
@@ -3037,7 +3155,7 @@ async function refreshVerdaCostEstimate() {
   const fresh = document.getElementById('v-mode').value === 'fresh';
   const contract = verdaContract();
   const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 100) : 0;
-  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 250) : 0;
+  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 300) : 0;
   const params = new URLSearchParams({
     instance_type: instanceType,
     location,
@@ -3168,6 +3286,35 @@ async function onRunpodJobDone(jobId, instId) {
   }
 }
 
+async function verdaCostGuard() {
+  const instanceType = (document.getElementById('v-instance-type').value || '').trim();
+  const location = (document.getElementById('v-location').value || 'FIN-01').trim();
+  const fresh = document.getElementById('v-mode').value === 'fresh';
+  const contract = verdaContract();
+  const osGb = fresh ? (+(document.getElementById('v-fresh-os-size').value) || 100) : 0;
+  const storageGb = fresh ? (+(document.getElementById('v-fresh-storage-size').value) || 300) : 0;
+  const gpuCount = parseInt(instanceType) || 1;
+  const COST_LIMIT_PER_GPU = 3.00;
+  let hourlyPerGpu = null;
+  try {
+    const params = new URLSearchParams({instance_type: instanceType, location, contract,
+      os_volume_gb: String(osGb), storage_gb: String(storageGb), storage_type: 'NVMe'});
+    const estimate = await fetch(`/api/verda/cost-estimate?${params.toString()}`).then(r => r.json());
+    const instanceHourly = Number((estimate.instance || estimate.total || {}).hourly);
+    if (Number.isFinite(instanceHourly)) hourlyPerGpu = instanceHourly / gpuCount;
+  } catch (_) {}
+  if (hourlyPerGpu === null || hourlyPerGpu <= COST_LIMIT_PER_GPU) return true;
+  const totalHourly = (hourlyPerGpu * gpuCount).toFixed(3);
+  return confirm(
+    `⚠️  HIGH COST WARNING\n\n` +
+    `Instance: ${instanceType}  (${gpuCount} GPU${gpuCount !== 1 ? 's' : ''})\n` +
+    `Cost: $${totalHourly}/hr total  ·  $${hourlyPerGpu.toFixed(3)}/hr per GPU\n\n` +
+    `Per-GPU cost exceeds $${COST_LIMIT_PER_GPU.toFixed(2)}/hr.\n` +
+    `This will incur significant charges.\n\n` +
+    `Proceed with provisioning?`
+  );
+}
+
 async function quickDeployVerda() {
   const hostname = (document.getElementById('v-hostname').value || 'filmforge-verda-worker').trim();
   const fresh = document.getElementById('v-mode').value === 'fresh';
@@ -3178,6 +3325,7 @@ async function quickDeployVerda() {
       return;
     }
   }
+  if (!await verdaCostGuard()) return;
   const provId = `verda:${hostname}`;
   selectInstance(provId, '');
   selectLog('deploy');
@@ -3211,7 +3359,7 @@ async function quickDeployVerda() {
         comfy_port: +(document.getElementById('v-comfy-port').value) || 8188,
         remote_root: document.getElementById('remote-root').value || '/workspace/filmforge_gpu_worker',
         fresh_os_volume_size: +(document.getElementById('v-fresh-os-size').value) || 100,
-        fresh_storage_size: +(document.getElementById('v-fresh-storage-size').value) || 250,
+        fresh_storage_size: +(document.getElementById('v-fresh-storage-size').value) || 300,
         skip_warmup: fresh ? !document.getElementById('v-fresh-warm').value : true,
         warm_asset_groups: fresh
           ? document.getElementById('v-fresh-warm').value.split(',').map(s => s.trim()).filter(Boolean)
@@ -3570,6 +3718,7 @@ function timeAgo(iso) {
 
 // ── Log ───────────────────────────────────────────────────────────────────────
 function selectLog(src) {
+  if (src === currentLogSrc && (src === 'deploy' || remoteEvt)) return;
   currentLogSrc = src;
   document.querySelectorAll('.ltab').forEach(b => b.classList.toggle('active', b.dataset.src === src));
   if (remoteEvt) { remoteEvt.close(); remoteEvt = null; }
@@ -3662,7 +3811,33 @@ function appendLog(line, src = currentLogSrc, instId = selectedInstId) {
   }
   if (downloadChanged && instId === selectedInstId) updateInstHeader();
   if (instId !== selectedInstId || src !== currentLogSrc) return;
-  renderLog(src);
+  appendVisibleLogLine(line);
+}
+
+function logLineElement(line) {
+  const lo = line.toLowerCase();
+  const d = document.createElement('div');
+  const sev = lo.includes('error') || lo.includes('failed') ? 'err'
+    : lo.includes('✓') || lo.includes(' done') ? 'ok'
+    : lo.startsWith('[deploy]') || lo.startsWith('[vast]') || lo.startsWith('[runpod]') || lo.startsWith('[verda]') ? 'info'
+    : lo.includes('download') || lo.includes('asset') || lo.includes('comfy') ? 'signal'
+    : lo.includes('warn') ? 'warn' : '';
+  const gpuMatch = line.match(/^\[(gpu\d+)\]/);
+  const gpu = gpuMatch ? gpuMatch[1] : '';
+  d.className = 'll' + (sev ? ' ' + sev : '') + (gpu ? ' ' + gpu : '');
+  d.textContent = line;
+  return d;
+}
+
+function appendVisibleLogLine(line) {
+  const el = document.getElementById('log');
+  const shouldStick = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  if (!el.querySelector('.ll')) el.innerHTML = '';
+  el.appendChild(logLineElement(line));
+  while (el.children.length > MAX_LOG_LINES) {
+    el.removeChild(el.firstChild);
+  }
+  if (shouldStick) el.scrollTop = el.scrollHeight;
 }
 
 function renderLog(src = currentLogSrc) {
@@ -3676,21 +3851,10 @@ function renderLog(src = currentLogSrc) {
     el.innerHTML = `<span class="muted text-xs">No ${LOG_LABELS[src] || src} log yet for instance #${esc(selectedInstId)}.</span>`;
     return;
   }
+  const frag = document.createDocumentFragment();
+  for (const line of lines) frag.appendChild(logLineElement(line));
   el.innerHTML = '';
-  for (const line of lines) {
-    const lo = line.toLowerCase();
-    const d = document.createElement('div');
-    const sev = lo.includes('error') || lo.includes('failed') ? 'err'
-      : lo.includes('✓') || lo.includes(' done') ? 'ok'
-      : lo.startsWith('[deploy]') || lo.startsWith('[vast]') || lo.startsWith('[runpod]') || lo.startsWith('[verda]') ? 'info'
-      : lo.includes('download') || lo.includes('asset') || lo.includes('comfy') ? 'signal'
-      : lo.includes('warn') ? 'warn' : '';
-    const gpuMatch = line.match(/^\[(gpu\d+)\]/);
-    const gpu = gpuMatch ? gpuMatch[1] : '';
-    d.className = 'll' + (sev ? ' ' + sev : '') + (gpu ? ' ' + gpu : '');
-    d.textContent = line;
-    el.appendChild(d);
-  }
+  el.appendChild(frag);
   el.scrollTop = el.scrollHeight;
 }
 
@@ -4039,6 +4203,7 @@ setInterval(loadRunpodPods, 15000);
 setInterval(loadVerdaHosts, 30000);
 setInterval(loadWorkers, 15000);
 setInterval(() => refreshSelectedInstanceSummary(true), 30000);
+setInterval(refreshComfyActivity, 6000);
 </script>
 </body>
 </html>"""
@@ -4059,12 +4224,12 @@ if __name__ == "__main__":
         for pid in pids:
             print(f"Killing existing deploy_ui on port {port} (pid {pid})…")
             try:
-                os.kill(pid, 15)
+                os.kill(pid, 9)
             except ProcessLookupError:
                 pass
         if pids:
             import time as _t
-            _t.sleep(1)
+            _t.sleep(2)
     except FileNotFoundError:
         pass
     print(f"FilmForge GPU Deploy UI → http://localhost:{port}")
