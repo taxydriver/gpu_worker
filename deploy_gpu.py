@@ -1698,11 +1698,11 @@ elif test -n "$_pytorch_index"; then
   # Even when the torch CUDA major matches, torchvision/torchaudio may have
   # been upgraded to a different CUDA build (e.g. cu130 while torch is cu128).
   # Check each package's CUDA suffix and re-pin if mismatched.
-  _tv_ver="$("$COMFY_ROOT/.venv/bin/pip" show torchvision 2>/dev/null | grep '^Version:' | awk '{print $2}')"
-  _ta_ver="$("$COMFY_ROOT/.venv/bin/pip" show torchaudio 2>/dev/null | grep '^Version:' | awk '{print $2}')"
+  _tv_ver="$("$COMFY_ROOT/.venv/bin/pip" show torchvision 2>/dev/null | grep '^Version:' | awk '{{print $2}}')"
+  _ta_ver="$("$COMFY_ROOT/.venv/bin/pip" show torchaudio 2>/dev/null | grep '^Version:' | awk '{{print $2}}')"
   _need_repair=0
-  echo "$_tv_ver" | grep -qE "cu${_torch_cuda_ver}" || _need_repair=1
-  echo "$_ta_ver" | grep -qE "cu${_torch_cuda_ver}" || _need_repair=1
+  echo "$_tv_ver" | grep -qE "cu${{_torch_cuda_ver}}" || _need_repair=1
+  echo "$_ta_ver" | grep -qE "cu${{_torch_cuda_ver}}" || _need_repair=1
   if test "$_need_repair" = "1"; then
     echo "[verda] torchvision=$_tv_ver torchaudio=$_ta_ver mismatched with torch cuda=$_torch_cuda_ver — reinstalling from $_pytorch_index..." >&2
     "$COMFY_ROOT/.venv/bin/python" -m pip install --force-reinstall --no-deps \
