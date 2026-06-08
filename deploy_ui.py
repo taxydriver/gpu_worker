@@ -1779,6 +1779,66 @@ async def stream_remote_log(source: str, ssh: str | None = None):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+# ── ComfyUI SSH tunnel ─────────────────────────────────────────────────────────
+
+_comfyui_tunnel_proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+_COMFYUI_LOCAL_PORT = 8188
+
+
+@app.post("/api/comfyui-tunnel")
+async def open_comfyui_tunnel(ssh: str | None = None):
+    """Start an SSH tunnel to the GPU worker's ComfyUI (port 8188).
+
+    ?ssh=<ssh-command>  — optional; falls back to .last_ssh_dest
+    Returns {"url": "http://localhost:8188"} on success.
+    """
+    global _comfyui_tunnel_proc
+
+    # Reuse existing tunnel if still alive
+    if _comfyui_tunnel_proc is not None and _comfyui_tunnel_proc.poll() is None:
+        return {"url": f"http://localhost:{_COMFYUI_LOCAL_PORT}", "status": "already_running"}
+
+    ssh_command = ssh or _last_ssh_command()
+    if not ssh_command:
+        raise HTTPException(400, "No SSH command provided and no saved .last_ssh_dest")
+
+    try:
+        from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
+        ssh_cmd, _, _ = parse_ssh_command(ssh_command)
+        ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
+    except Exception as exc:
+        raise HTTPException(400, f"Could not parse SSH command: {exc}")
+
+    tunnel_cmd = [
+        ssh_cmd[0],
+        "-N",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ExitOnForwardFailure=yes",
+        "-L", f"{_COMFYUI_LOCAL_PORT}:127.0.0.1:8188",
+        *ssh_cmd[1:],
+    ]
+    _comfyui_tunnel_proc = subprocess.Popen(
+        tunnel_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    await asyncio.sleep(1.5)
+
+    if _comfyui_tunnel_proc.poll() is not None:
+        raise HTTPException(502, "SSH tunnel exited immediately — check SSH key / host reachability")
+
+    return {"url": f"http://localhost:{_COMFYUI_LOCAL_PORT}", "status": "started"}
+
+
+@app.delete("/api/comfyui-tunnel")
+async def close_comfyui_tunnel():
+    global _comfyui_tunnel_proc
+    if _comfyui_tunnel_proc is not None and _comfyui_tunnel_proc.poll() is None:
+        _comfyui_tunnel_proc.terminate()
+    _comfyui_tunnel_proc = None
+    return {"status": "closed"}
+
+
 @app.get("/api/remote-summary")
 async def remote_summary(ssh: str):
     try:
@@ -2861,6 +2921,7 @@ async function loadVerdaHosts() {
         <div class="inst-meta" title="${esc(meta)}">${esc(meta)}</div>
         <div class="inst-actions">
           <button class="btn btn-success btn-xs" onclick='event.stopPropagation(); redeployVerdaHost(${nameJson}, ${sshJson}, ${instTypeJson})'>Redeploy</button>
+          <button class="btn btn-primary btn-xs" onclick='event.stopPropagation(); openComfyUI(${sshJson})'>ComfyUI</button>
           <button class="btn btn-warning btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', false)">Delete VM</button>
           <button class="btn btn-danger btn-xs" onclick="event.stopPropagation(); teardownVerda('${safeName}', '${safeSsh.replace(/'/g, "&#39;")}', true)">Delete VM+Volumes</button>
           ${removeButton}
@@ -2875,6 +2936,30 @@ async function loadVerdaHosts() {
 
 function selectVerdaHost(name, ssh) {
   selectInstance(`verda:${name}`, ssh);
+}
+
+async function openComfyUI(ssh) {
+  const btn = event.currentTarget;
+  const orig = btn.textContent;
+  btn.textContent = 'Connecting…';
+  btn.disabled = true;
+  try {
+    const params = ssh ? `?ssh=${encodeURIComponent(ssh)}` : '';
+    const res = await fetch(`/api/comfyui-tunnel${params}`, { method: 'POST' });
+    const data = await res.json();
+    if (res.ok && data.url) {
+      btn.textContent = '🔗 Open ComfyUI';
+      btn.disabled = false;
+      btn.onclick = (e) => { e.stopPropagation(); window.open(data.url, '_blank'); };
+    } else {
+      btn.textContent = '✗ Tunnel failed';
+      btn.disabled = false;
+      console.error('ComfyUI tunnel error:', data.detail || data);
+    }
+  } catch (e) {
+    btn.textContent = '✗ Error';
+    btn.disabled = false;
+  }
 }
 
 async function redeployVerdaHost(name, ssh, instanceType) {

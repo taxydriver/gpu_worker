@@ -176,7 +176,7 @@ Fresh install overrides:
   --verda-location FIN-01 \
   --verda-instance-type 2A100.44V \
   --verda-fresh-os-volume-size 100 \
-  --verda-fresh-storage-size 250 \
+  --verda-fresh-storage-size 300 \
   --warm-asset-group flux_stills_v1 \
   --warm-asset-group wan_i2v_v1 \
   --warm-asset-group stable_audio_v1

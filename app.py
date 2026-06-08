@@ -80,6 +80,8 @@ _ETA_WINDOW = 12
 # ── Active-job tracking (used by watchdog to avoid restarting mid-run) ────────
 _ACTIVE_JOBS_LOCK = threading.Lock()
 _ACTIVE_JOBS: int = 0  # count of jobs currently executing
+_MAX_EXECUTION_SLOTS = max(1, get_settings().resolved_max_concurrent_jobs())
+_EXECUTION_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_EXECUTION_SLOTS)
 
 # ── Warmed asset groups tracking ─────────────────────────────────────────────────
 _WARMED_GROUPS_LOCK = threading.Lock()
@@ -344,6 +346,7 @@ def _preflight_download_all() -> None:
     LOGGER.info("[preflight] downloading %d asset group(s): %s", len(groups), groups)
 
     downloaded_any = False
+    failed_groups: list[str] = []
     for group in groups:
         try:
             result = ensure_asset_group(group)
@@ -359,7 +362,12 @@ def _preflight_download_all() -> None:
             with _WARMED_GROUPS_LOCK:
                 _WARMED_GROUPS.add(group)
         except Exception as exc:
+            failed_groups.append(group)
             LOGGER.error("[preflight] failed to ensure group=%s: %s", group, exc)
+
+    if failed_groups:
+        LOGGER.error("[preflight] incomplete; failed group(s): %s", failed_groups)
+        return
 
     if downloaded_any:
         with _ACTIVE_JOBS_LOCK:
@@ -695,6 +703,15 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             error=_asset_group_mismatch_error(request.asset_group),
         )
 
+    if progress is not None:
+        _set_progress_stage(progress, "starting", message="Waiting for worker capacity", eta_sec=progress.eta_sec)
+        _update_progress_elapsed(
+            progress,
+            total_started_monotonic=total_started,
+            stage_started_monotonic=total_started,
+        )
+
+    _EXECUTION_SEMAPHORE.acquire()
     with _ACTIVE_JOBS_LOCK:
         global _ACTIVE_JOBS
         _ACTIVE_JOBS += 1
@@ -876,6 +893,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     finally:
         with _ACTIVE_JOBS_LOCK:
             _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
+        _EXECUTION_SEMAPHORE.release()
 
 
 def _run_job_async(worker_job_id: str) -> None:

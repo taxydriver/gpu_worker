@@ -1465,7 +1465,81 @@ if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -lt "$
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
 if test "$GPU_COUNT" -lt 1; then
-  echo "No GPUs detected" >&2
+  echo "[verda] ERROR: No GPUs detected by nvidia-smi" >&2
+  exit 1
+fi
+
+# GPU firmware check — must happen before any CUDA call.
+# If GPU Firmware shows N/A the kernel module loaded but the GSP firmware
+# binary is absent. We try a one-shot apt repair (install firmware package +
+# reload the module) before failing hard. Safe here: ComfyUI has not started,
+# no GPU processes are running, so rmmod/modprobe is safe.
+_try_repair_nvidia_firmware() {{
+  local driver_version major fw_dir
+  driver_version="$(modinfo nvidia 2>/dev/null | awk '/^version:/ {{print $2; exit}}')"
+  test -n "$driver_version" || {{ echo "[verda]   Cannot determine driver version" >&2; return 1; }}
+  major="${{driver_version%%.*}}"
+  fw_dir="/lib/firmware/nvidia/$driver_version"
+  echo "[verda]   Driver $driver_version — trying apt-get install nvidia-firmware-${{major}}-open ..." >&2
+  apt-get install -y -q "nvidia-firmware-${{major}}-open" 2>&1 | tail -3 >&2 \
+    || apt-get install -y -q "libnvidia-extra-${{major}}" 2>&1 | tail -3 >&2 \
+    || true
+  ls "$fw_dir"/gsp*.bin >/dev/null 2>&1 \
+    || {{ echo "[verda]   No gsp*.bin in $fw_dir after apt — cannot repair" >&2; return 1; }}
+  echo "[verda]   Firmware files present; reloading NVIDIA kernel module ..." >&2
+  rmmod nvidia_drm 2>/dev/null || true
+  rmmod nvidia_modeset 2>/dev/null || true
+  rmmod nvidia_uvm 2>/dev/null || true
+  rmmod nvidia 2>/dev/null \
+    || {{ echo "[verda]   Cannot unload nvidia module (GPU may be in use)" >&2; return 1; }}
+  sleep 2
+  modprobe nvidia 2>/dev/null \
+    || {{ echo "[verda]   modprobe nvidia failed after unload — driver unrecoverable" >&2; return 1; }}
+  sleep 3
+  modprobe nvidia_uvm 2>/dev/null || true
+  modprobe nvidia_modeset 2>/dev/null || true
+  modprobe nvidia_drm 2>/dev/null || true
+}}
+
+echo "[verda] Checking GPU firmware compatibility..." >&2
+_fw_ok=1
+for _gpu_dir in /proc/driver/nvidia/gpus/*/; do
+  test -f "$_gpu_dir/information" || continue
+  _fw="$(grep "^GPU Firmware:" "$_gpu_dir/information" 2>/dev/null | awk '{{print $3}}')"
+  _model="$(grep "^Model:" "$_gpu_dir/information" 2>/dev/null | sed 's/^Model:[[:space:]]*//')"
+  if test "${{_fw:-N/A}}" = "N/A"; then
+    echo "[verda] ✗ GPU firmware missing: ${{_model:-unknown GPU}} — attempting repair..." >&2
+    if _try_repair_nvidia_firmware; then
+      _fw="$(grep "^GPU Firmware:" "$_gpu_dir/information" 2>/dev/null | awk '{{print $3}}')"
+      if test "${{_fw:-N/A}}" != "N/A"; then
+        echo "[verda] ✓ GPU firmware repaired: ${{_model:-unknown}} (fw=${{_fw}})" >&2
+      else
+        echo "[verda] ✗ Firmware repair did not resolve (still N/A): ${{_model:-unknown GPU}}" >&2
+        echo "[verda]   The installed driver does not support this GPU architecture." >&2
+        echo "[verda]   FIX: Use 1A100.22V, 1H100.80S.32V, or 1B200.30V." >&2
+        _fw_ok=0
+      fi
+    else
+      echo "[verda] ✗ Firmware repair failed: ${{_model:-unknown GPU}}" >&2
+      echo "[verda]   FIX: Use 1A100.22V, 1H100.80S.32V, or 1B200.30V." >&2
+      _fw_ok=0
+    fi
+  else
+    echo "[verda] ✓ GPU firmware OK: ${{_model:-unknown}} (fw=${{_fw}})" >&2
+  fi
+done
+if test "$_fw_ok" -eq 0; then
+  exit 1
+fi
+
+# Confidential Computing check — CC PRODUCTION mode blocks cuInit for all
+# normal CUDA applications (ComfyUI, PyTorch). Detect it early and fail
+# with a clear message rather than burning retries. Instance types ending
+# in ".CC" from Verda are always CC PRODUCTION mode; there is no in-VM toggle.
+if nvidia-smi conf-compute -f 2>/dev/null | grep -q "CC status: ON"; then
+  echo "[verda] ✗ GPU is in Confidential Computing PRODUCTION mode (CC status: ON)" >&2
+  echo "[verda]   Normal CUDA (PyTorch, ComfyUI) cannot run in CC mode." >&2
+  echo "[verda]   FIX: Use a non-CC instance type — 1A100.22V, 1H100.80S.32V, or 1B200.30V." >&2
   exit 1
 fi
 
@@ -1474,9 +1548,6 @@ if ! mountpoint -q /mnt/data; then
   mount /dev/vdb /mnt/data
 fi
 VDB_UUID="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
-if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
-  echo "UUID=$VDB_UUID /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
-fi
 
 # Remove ALL filmforge/comfyui GPU unit files (not just stop them) so a box
 # that previously deployed with more GPUs doesn't leave orphaned gpuN units
@@ -1494,11 +1565,76 @@ systemctl daemon-reload 2>/dev/null || true
 mkdir -p /mnt/data/ComfyUI/models /mnt/data/ComfyUI/input /mnt/data/ComfyUI/output /mnt/data/ComfyUI/temp
 mkdir -p "$COMFY_ROOT"
 
+root_avail_kb() {{
+  df -Pk / | awk 'NR == 2 {{print $4}}'
+}}
+
+require_root_space_kb() {{
+  required="$1"
+  available="$(root_avail_kb)"
+  if test "${{available:-0}}" -lt "$required"; then
+    echo "Root filesystem has only ${{available:-0}} KiB free; need at least $required KiB" >&2
+    df -h / /mnt/data >&2 || true
+    exit 1
+  fi
+}}
+
+cleanup_hidden_comfy_dir() {{
+  src="$1"
+  dst="$2"
+  test -d "$src" || return
+  test -d "$dst" || return
+  mountpoint -q "$dst" || return
+
+  root_view="/mnt/data/.filmforge_root_view"
+  mkdir -p "$root_view"
+  if ! mountpoint -q "$root_view"; then
+    mount --bind / "$root_view"
+  fi
+
+  hidden="$root_view$dst"
+  test -d "$hidden" || return
+  if ! test -n "$(find "$hidden" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+    return
+  fi
+
+  missing=0
+  while IFS= read -r hidden_file; do
+    rel="$(printf '%s\n' "$hidden_file" | sed "s#^$hidden/##")"
+    if ! test -e "$src/$rel"; then
+      missing=1
+      break
+    fi
+  done < <(find "$hidden" -type f -print 2>/dev/null)
+
+  if test "$missing" -eq 0; then
+    echo "Removing hidden OS-volume copy under $dst; active data lives in $src" >&2
+    find "$hidden" -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +
+  else
+    echo "Found hidden files under $dst that are absent from $src; leaving them in place" >&2
+  fi
+}}
+
+move_visible_comfy_dir_to_data() {{
+  src="$1"
+  dst="$2"
+  test -d "$dst" || return
+  mountpoint -q "$dst" && return
+  if ! test -n "$(find "$dst" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
+    return
+  fi
+  echo "Moving existing $dst contents to $src before bind mount" >&2
+  mkdir -p "$src"
+  cp -an "$dst"/. "$src"/
+  find "$dst" -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +
+}}
+
 bind_comfy_dir() {{
   src="$1"
   dst="$2"
   mkdir -p "$src"
   if mountpoint -q "$dst"; then
+    cleanup_hidden_comfy_dir "$src" "$dst"
     return
   fi
   if test -L "$dst"; then
@@ -1506,6 +1642,7 @@ bind_comfy_dir() {{
   elif test -e "$dst" && ! test -d "$dst"; then
     rm -rf "$dst"
   fi
+  move_visible_comfy_dir_to_data "$src" "$dst"
   mkdir -p "$dst"
   mount --bind "$src" "$dst"
 }}
@@ -1513,6 +1650,11 @@ bind_comfy_dir() {{
 for dir in models input output temp; do
   bind_comfy_dir "/mnt/data/ComfyUI/$dir" "$COMFY_ROOT/$dir"
 done
+require_root_space_kb 65536
+
+if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
+  echo "UUID=$VDB_UUID /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+fi
 
 if ! test -f "$COMFY_ROOT/main.py"; then
   echo "ComfyUI not found at $COMFY_ROOT/main.py; OS volume is not worker-ready" >&2
@@ -1523,6 +1665,11 @@ if ! test -x "$COMFY_ROOT/.venv/bin/python"; then
   exit 1
 fi
 
+# Enable persistence mode so the NVIDIA driver stays warm between calls.
+# Without this, Blackwell GPUs can return cudaErrorSystemNotReady (802) on
+# the first CUDA call because compute initialization is still in progress.
+nvidia-smi -pm 1 >/dev/null 2>&1 || true
+
 if nvidia-smi | grep -q "CUDA Version: 13" && \
    ! "$COMFY_ROOT/.venv/bin/python" - <<'PY' >/dev/null 2>&1
 import torch
@@ -1532,6 +1679,21 @@ then
   echo "Repairing ComfyUI PyTorch CUDA wheel for Verda CUDA 13 driver..." >&2
   "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu130 torch torchvision torchaudio
 fi
+
+# Blackwell GPUs can be slow to enter compute-ready state after module load.
+# Retry up to 5× (50s max) before treating unavailability as fatal.
+for _cuda_try in 1 2 3 4 5; do
+  if "$COMFY_ROOT/.venv/bin/python" -c \
+       "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
+     >/dev/null 2>&1; then
+    break
+  fi
+  if test "$_cuda_try" -lt 5; then
+    echo "[verda] CUDA not ready (attempt $_cuda_try/5) — waiting 10s for compute init..." >&2
+    sleep 10
+  fi
+done
+
 if ! "$COMFY_ROOT/.venv/bin/python" - <<'PY'
 import torch
 print("ComfyUI torch=" + torch.__version__ + " cuda=" + str(torch.version.cuda) + " available=" + str(torch.cuda.is_available()))
@@ -1822,7 +1984,27 @@ for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
   fi
 done
 
-# Now that ComfyUI is fully installed, move its asset dirs onto the 150GB
+# ComfyUI-LTXVideo currently imports `pad` from kornia.geometry.transform.pyramid,
+# but kornia 0.8.x no longer exports it there. Patch the custom node to use
+# torch.nn.functional.pad so LTX nodes import after fresh deploys/redeploys.
+if test -f "$COMFY_ROOT/custom_nodes/ComfyUI-LTXVideo/pyramid_blending.py"; then
+  "$COMFY_ROOT/.venv/bin/python" - <<'PY'
+from pathlib import Path
+
+p = Path("/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/pyramid_blending.py")
+if p.exists():
+    s = p.read_text()
+    if "from torch.nn.functional import pad" not in s:
+        s = s.replace(
+            "import torch\nimport torch.nn.functional as F\n",
+            "import torch\nimport torch.nn.functional as F\nfrom torch.nn.functional import pad\n",
+        )
+    s = s.replace("    is_powerof_two,\n    pad,\n)", "    is_powerof_two,\n)")
+    p.write_text(s)
+PY
+fi
+
+# Now that ComfyUI is fully installed, move its asset dirs onto the model/data
 # data volume and bind-mount them back. Doing this AFTER install avoids the
 # rm-on-busy-mount problem (the install needs to `rm -rf "$COMFY_ROOT"` for
 # a clean clone, which fails if the subdirs are bind mounts).
