@@ -1670,14 +1670,26 @@ fi
 # the first CUDA call because compute initialization is still in progress.
 nvidia-smi -pm 1 >/dev/null 2>&1 || true
 
-if nvidia-smi | grep -q "CUDA Version: 13" && \
-   ! "$COMFY_ROOT/.venv/bin/python" - <<'PY' >/dev/null 2>&1
-import torch
-raise SystemExit(0 if str(getattr(torch.version, "cuda", "") or "").startswith("13.") and torch.cuda.is_available() else 1)
-PY
-then
-  echo "Repairing ComfyUI PyTorch CUDA wheel for Verda CUDA 13 driver..." >&2
+# Bidirectional CUDA wheel repair: the OS volume persists torch/torchvision
+# across rehydrates. If the last deploy was on a different CUDA major (e.g.
+# CUDA 13 B200 → CUDA 12 A100 or vice versa), the C++ extensions fail to
+# load and ComfyUI crashes with "operator torchvision::nms does not exist".
+# Detect the mismatch and repair in both directions.
+_cuda_driver_major="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+' | grep -oE '[0-9]+$' | head -1 || echo '')"
+_torch_cuda_ver="$("$COMFY_ROOT/.venv/bin/python" -c \
+  'import torch; v=getattr(torch.version,"cuda","") or ""; print(v.split(".")[0] if v else "")' \
+  2>/dev/null || echo '')"
+_torch_cuda_ver="$(echo "$_torch_cuda_ver" | tr -d '[:space:]')"
+_cuda_driver_major="$(echo "$_cuda_driver_major" | tr -d '[:space:]')"
+
+if test "$_cuda_driver_major" = "13" && test "$_torch_cuda_ver" != "13"; then
+  echo "[verda] CUDA mismatch: driver=13, torch_cuda=$_torch_cuda_ver — repairing to cu130..." >&2
   "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu130 torch torchvision torchaudio
+elif test "$_cuda_driver_major" = "12" && test "$_torch_cuda_ver" = "13"; then
+  echo "[verda] CUDA mismatch: driver=12, torch_cuda=$_torch_cuda_ver — repairing to cu128..." >&2
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+else
+  echo "[verda] CUDA OK: driver=$_cuda_driver_major torch_cuda=$_torch_cuda_ver" >&2
 fi
 
 # Blackwell GPUs can be slow to enter compute-ready state after module load.
