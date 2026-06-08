@@ -1682,12 +1682,23 @@ _torch_cuda_ver="$("$COMFY_ROOT/.venv/bin/python" -c \
 _torch_cuda_ver="$(echo "$_torch_cuda_ver" | tr -d '[:space:]')"
 _cuda_driver_major="$(echo "$_cuda_driver_major" | tr -d '[:space:]')"
 
+case "$_cuda_driver_major" in
+  13) _pytorch_index="https://download.pytorch.org/whl/cu130" ;;
+  12) _pytorch_index="https://download.pytorch.org/whl/cu128" ;;
+  *)  _pytorch_index="" ;;
+esac
+
 if test "$_cuda_driver_major" = "13" && test "$_torch_cuda_ver" != "13"; then
   echo "[verda] CUDA mismatch: driver=13, torch_cuda=$_torch_cuda_ver — repairing to cu130..." >&2
-  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu130 torch torchvision torchaudio
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url "$_pytorch_index" torch torchvision torchaudio
 elif test "$_cuda_driver_major" = "12" && test "$_torch_cuda_ver" = "13"; then
   echo "[verda] CUDA mismatch: driver=12, torch_cuda=$_torch_cuda_ver — repairing to cu128..." >&2
-  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url https://download.pytorch.org/whl/cu128 torch torchvision torchaudio
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade --index-url "$_pytorch_index" torch torchvision torchaudio
+elif test -n "$_pytorch_index" && ! "$COMFY_ROOT/.venv/bin/python" -c \
+     "import torchvision._C" >/dev/null 2>&1; then
+  echo "[verda] torchvision C++ extension missing/broken (custom node clobbered it) — reinstalling from $_pytorch_index..." >&2
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --force-reinstall --no-deps \
+    --index-url "$_pytorch_index" torchvision
 else
   echo "[verda] CUDA OK: driver=$_cuda_driver_major torch_cuda=$_torch_cuda_ver" >&2
 fi
@@ -1995,6 +2006,12 @@ for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
     "$COMFY_ROOT/.venv/bin/python" -m pip install -r "$req" || true
   fi
 done
+# Custom node requirements.txt files often list `torchvision` without an
+# index URL, which lets pip install the CPU-only PyPI wheel and clobber the
+# CUDA version we just installed. Re-pin torch/torchvision/torchaudio after
+# the loop to guarantee the CUDA wheels always win.
+"$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade \
+  --index-url "$PYTORCH_INDEX_URL" torch torchvision torchaudio
 
 # ComfyUI-LTXVideo currently imports `pad` from kornia.geometry.transform.pyramid,
 # but kornia 0.8.x no longer exports it there. Patch the custom node to use
