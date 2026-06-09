@@ -1753,6 +1753,16 @@ then
   echo "ComfyUI PyTorch CUDA validation failed; refusing to register an unusable worker" >&2
   exit 1
 fi
+
+# Pull latest worker code from git so rehydrate always runs the newest version.
+for _wr in /opt/filmforge_gpu_worker /workspace/filmforge_gpu_worker; do
+  if test -d "$_wr/.git"; then
+    echo "[verda] git pull in $_wr..." >&2
+    GIT_TERMINAL_PROMPT=0 git -C "$_wr" pull --ff-only 2>&1 || true
+    break
+  fi
+done
+
 WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
 if test -f "$WORKER_ROOT/app.py"; then
   mkdir -p "$WORKER_MODULE_DIR"
