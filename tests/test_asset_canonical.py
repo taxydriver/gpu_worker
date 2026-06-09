@@ -16,7 +16,7 @@ def test_legacy_aliases_resolve_to_canonical():
     assert canonical_asset_group("wan_i2v") == "wan_i2v_v1"
     assert canonical_asset_group("flux2_stills") == "flux_stills_v1"
     assert canonical_asset_group("stable_audio") == "stable_audio_v1"
-    assert canonical_asset_group("juggernaut_stills") == "juggernaut_stills_v1"
+
 
 
 def test_idempotent():

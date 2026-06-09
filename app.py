@@ -70,7 +70,7 @@ if get_settings().log_prompts_only:
 
 app = FastAPI(title="FilmForge GPU Worker", version="0.1.0")
 
-_STILL_ASSET_GROUPS = {"flux_stills_v1", "juggernaut_stills_v1"}
+_STILL_ASSET_GROUPS = {"flux_stills_v1"}
 _VIDEO_ASSET_GROUPS = {"wan_i2v_v1"}
 _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0

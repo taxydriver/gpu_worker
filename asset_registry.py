@@ -66,23 +66,6 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/ComfyUI-Wiki/t5-base/resolve/main/t5-base.safetensors",
         },
     ],
-    "juggernaut_stills_v1": [
-        {
-            "name": "juggernautxl_checkpoint",
-            "path": "/workspace/ComfyUI/models/checkpoints/JuggernautXL_v9_RunDiffusionPhoto_v2.safetensors",
-            "url": "https://huggingface.co/RunDiffusion/Juggernaut-XL-v9/resolve/a7634331b40541c153687f8b8e80bdbf2c63a0f5/JuggernautXL_v9_RunDiffusionPhoto_v2.safetensors",
-        },
-        {
-            "name": "sdxl_clip_vision_h",
-            "path": "/workspace/ComfyUI/models/clip_vision/CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors",
-            "url": "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors",
-        },
-        {
-            "name": "sdxl_ipadapter_face",
-            "path": "/workspace/ComfyUI/models/ipadapter/ip-adapter-plus-face_sdxl_vit-h.safetensors",
-            "url": "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.safetensors",
-        },
-    ],
     # LTX-2.3 Fast (distilled) — T2V/I2V with native audio. Uses ComfyUI's built-in
     # LTX-2 nodes only (no custom node). Requires a recent ComfyUI build (>= the one
     # shipping LTXAVTextEncoderLoader / the LTX-2.3 AV nodes). The distilled checkpoint
@@ -112,8 +95,6 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "stable_audio": ["stable_audio_v1"],
     "stable_audio1": ["stable_audio_v1"],
     "stable_audio_v1": ["stable_audio_v1"],
-    "juggernaut_stills": ["juggernaut_stills_v1"],
-    "juggernaut_stills_v1": ["juggernaut_stills_v1"],
     "ltx_av": ["ltx_i2v_v1"],
     "ltx_i2v": ["ltx_i2v_v1"],
     "ltx_t2v": ["ltx_i2v_v1"],

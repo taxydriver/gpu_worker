@@ -1822,7 +1822,7 @@ Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=verda
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,juggernaut_stills,wan_i2v,stable_audio}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio}}"
 Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
