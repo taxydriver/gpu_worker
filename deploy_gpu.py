@@ -618,6 +618,12 @@ elif test -x "$COMFY_ROOT/venv/bin/python"; then
   COMFY_PYTHON="$COMFY_ROOT/venv/bin/python"
 fi
 
+# Keep ComfyUI deps current — ComfyUI updates its requirements.txt when it adds
+# new features (e.g. sqlalchemy/alembic for its local DB). Without this, fresh
+# VMs that rehydrate an existing volume can crash-loop with ModuleNotFoundError.
+echo "Installing/updating ComfyUI requirements..." >&2
+"$COMFY_PYTHON" -m pip install -q -r "$COMFY_ROOT/requirements.txt" 2>&1 | tail -5 || true
+
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
 VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
 PUBLIC_URLS="${{WORKER_PUBLIC_URLS:-}}"
