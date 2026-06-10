@@ -20,6 +20,27 @@ from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
 
 LOGGER = logging.getLogger(__name__)
 
+# HuggingFace resolve URL pattern: .../resolve/<revision>/<path_in_repo>
+_HF_URL_RE = re.compile(
+    r"https://huggingface\.co/([^/]+/[^/]+)/resolve/([^/]+)/(.+)"
+)
+
+
+def _parse_hf_url(url: str) -> tuple[str, str, str] | None:
+    """Return (repo_id, revision, filename) if url is a HuggingFace resolve URL."""
+    m = _HF_URL_RE.match(url)
+    if m:
+        return m.group(1), m.group(2), m.group(3)
+    return None
+
+
+def _hf_hub_available() -> bool:
+    try:
+        import huggingface_hub  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 
 class EnsureAssetsResult(BaseModel):
     """Result from ensuring an asset group exists locally."""
@@ -62,16 +83,71 @@ def _aria2c_available() -> bool:
     return shutil.which("aria2c") is not None
 
 
+def _download_hf_hub(
+    url: str,
+    destination: Path,
+    *,
+    asset_name: str,
+    started_at: float,
+) -> None:
+    """Download a HuggingFace file using huggingface_hub.
+
+    huggingface_hub handles XetHub (cas-bridge.xethub.hf.co) natively — the
+    old requests/aria2c path times out because HuggingFace migrated large models
+    to XetHub's chunked protocol. Setting HF_XET_HIGH_PERFORMANCE=1 enables the
+    hf_xet Rust extension for parallel multi-part transfers.
+
+    Also supports resume: if local_dir/.cache has a partial download from a prior
+    interrupted attempt, hf_hub_download picks up from where it left off.
+    """
+    import os as _os
+    _os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+
+    from huggingface_hub import hf_hub_download
+
+    parsed = _parse_hf_url(url)
+    assert parsed is not None
+    repo_id, revision, filename = parsed
+    LOGGER.info(
+        "Downloading asset (hf_hub): %s repo=%s revision=%s file=%s",
+        asset_name, repo_id, revision, filename,
+    )
+
+    # hf_hub_download saves as local_dir/<filename>; rename to destination (.part path)
+    local_path = Path(
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            local_dir=destination.parent,
+        )
+    )
+    if local_path != destination:
+        os.replace(local_path, destination)
+
+    elapsed_sec = max(time.monotonic() - started_at, 0.001)
+    size = destination.stat().st_size
+    mb_per_sec = size / elapsed_sec / (1024 * 1024)
+    LOGGER.info(
+        "Download complete (hf_hub): %s %s in %.1fs (%.2f MB/s)",
+        asset_name, _format_bytes(size), elapsed_sec, mb_per_sec,
+    )
+
+
 def _download_to_path(url: str, destination: Path, *, asset_name: str) -> None:
     """Download a URL to a local destination.
 
-    Uses aria2c (16-connection parallel download) when available — typically
-    5-10x faster than a single requests stream on HuggingFace.  Falls back to
-    the streaming requests path if aria2c is not installed.
+    Priority:
+    1. huggingface_hub for HuggingFace URLs — handles XetHub natively and supports
+       resume. The old requests/aria2c paths time out on HF's XetHub CDN.
+    2. aria2c (16-connection parallel) when installed.
+    3. Single-connection requests stream as final fallback.
     """
     started_at = time.monotonic()
 
-    if _aria2c_available():
+    if _parse_hf_url(url) and _hf_hub_available():
+        _download_hf_hub(url, destination, asset_name=asset_name, started_at=started_at)
+    elif _aria2c_available():
         _download_aria2c(url, destination, asset_name=asset_name, started_at=started_at)
     else:
         _download_requests(url, destination, asset_name=asset_name, started_at=started_at)
