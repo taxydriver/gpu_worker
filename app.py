@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 import requests
 
 from gpu_worker.asset_canonical import canonical_asset_group, canonicalize_groups
-from gpu_worker.asset_manager import ensure_asset_group, is_asset_group_warm
+from gpu_worker.asset_manager import active_download_status, ensure_asset_group, is_asset_group_warm
 from gpu_worker.asset_registry import (
     ASSET_REGISTRY,
     asset_group_supported_by_capabilities,
@@ -675,6 +675,7 @@ def health() -> HealthResponse:
         capabilities=capabilities,
         active_jobs=active_jobs,
         max_concurrent_jobs=settings.resolved_max_concurrent_jobs(),
+        download_status=active_download_status(),
     )
 
 

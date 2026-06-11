@@ -1845,13 +1845,26 @@ async def remote_summary(ssh: str):
         from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
         ssh_cmd, _, _ = parse_ssh_command(ssh)
         ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
-        ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", *ssh_cmd[1:]]
+        ssh_cmd = [
+            ssh_cmd[0],
+            "-q",
+            "-o", "LogLevel=ERROR",
+            "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=1",
+            *ssh_cmd[1:],
+        ]
     except Exception as exc:
         raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
 
     script = r"""set -euo pipefail
-fetch_stats() {
+fetch_worker_state() {
   local unit="$1" port="$2"
+  local health_json
+  health_json=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/health" 2>/dev/null | tr '\n\t' '  ' || true)
+  if test -n "$health_json"; then
+    printf 'WORKER_HEALTH\t%s\t%s\n' "$unit" "$health_json"
+  fi
   local stats_json
   stats_json=$(curl -fsS --max-time 2 "http://127.0.0.1:${port}/stats" 2>/dev/null | tr '\n\t' '  ' || true)
   if test -n "$stats_json"; then
@@ -1873,11 +1886,11 @@ if command -v systemctl >/dev/null 2>&1; then
       printf 'WORKER_PORT\t%s\t%s\t%s\t%s\n' "$unit" "$active" "$port" "$name"
     fi
     if test -n "$port"; then
-      fetch_stats "$unit" "$port"
+      fetch_worker_state "$unit" "$port"
     fi
   done
   download=$(journalctl -u 'filmforge-worker-gpu*.service' --since '2 minutes ago' --no-pager 2>/dev/null \
-    | grep -E 'Downloading asset progress:|Downloading asset:' \
+    | grep -E 'Downloading asset( progress)?( \([^)]+\))?:|Download complete' \
     | tail -n 1 || true)
   if test -n "$download"; then
     printf 'DOWNLOAD\t%s\n' "$download"
@@ -1915,20 +1928,36 @@ PY
   elif ss -ltn 2>/dev/null | grep -q ":${port} "; then
     printf 'WORKER_PORT\tfilmforge-worker-gpu%s\tactive\t%s\t%s\n' "$idx" "$port" "$name"
   fi
-  fetch_stats "filmforge-worker-gpu${idx}" "$port"
+  fetch_worker_state "filmforge-worker-gpu${idx}" "$port"
 done
 """
     _ssh_cmd = ssh_cmd  # capture for lambda
-    proc = await asyncio.to_thread(
-        subprocess.run, [*_ssh_cmd, "bash", "-s"],
-        input=script, capture_output=True, text=True, timeout=20, check=False
-    )
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, [*_ssh_cmd, "bash", "-s"],
+            input=script, capture_output=True, text=True, timeout=20, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "worker_urls": [],
+            "download_line": "",
+            "download_status": None,
+            "remote_error": f"Remote summary timed out after {exc.timeout} seconds",
+        }
     if proc.returncode != 0:
-        raise HTTPException(502, (proc.stderr or proc.stdout or "Remote summary failed").strip())
+        error = (proc.stderr or proc.stdout or "Remote summary failed").strip()
+        return {
+            "worker_urls": [],
+            "download_line": "",
+            "download_status": None,
+            "remote_error": error,
+        }
 
     worker_urls: list[dict] = []
     stats_by_unit: dict[str, list[dict]] = {}
+    health_by_unit: dict[str, dict] = {}
     download_line = ""
+    download_status = None
     for line in proc.stdout.splitlines():
         if line.startswith("WORKER_URL\t"):
             _kind, unit, active, url, name = (line.split("\t", 4) + ["", "", "", "", ""])[:5]
@@ -1950,11 +1979,26 @@ done
                     groups = parsed.get("groups") or []
                     if isinstance(groups, list):
                         stats_by_unit[unit] = groups
+        elif line.startswith("WORKER_HEALTH\t"):
+            parts = line.split("\t", 2)
+            if len(parts) == 3:
+                _kind, unit, raw_json = parts
+                try:
+                    parsed = json.loads(raw_json)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    health_by_unit[unit] = parsed
+                    status = parsed.get("download_status")
+                    if isinstance(status, dict):
+                        download_status = status
     for entry in worker_urls:
         unit = entry.get("unit") or ""
         if unit in stats_by_unit:
             entry["stats"] = stats_by_unit[unit]
-    return {"worker_urls": worker_urls, "download_line": download_line}
+        if unit in health_by_unit:
+            entry["health"] = health_by_unit[unit]
+    return {"worker_urls": worker_urls, "download_line": download_line, "download_status": download_status}
 
 
 @app.get("/api/comfy-activity")
@@ -1971,7 +2015,15 @@ async def comfy_activity(ssh: str):
         from gpu_worker.deploy_gpu import add_default_host_key_policy, add_default_identity, parse_ssh_command
         ssh_cmd, _, _ = parse_ssh_command(ssh)
         ssh_cmd = add_default_host_key_policy(add_default_identity(ssh_cmd))
-        ssh_cmd = [ssh_cmd[0], "-q", "-o", "LogLevel=ERROR", *ssh_cmd[1:]]
+        ssh_cmd = [
+            ssh_cmd[0],
+            "-q",
+            "-o", "LogLevel=ERROR",
+            "-o", "ConnectTimeout=5",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=1",
+            *ssh_cmd[1:],
+        ]
     except Exception as exc:
         raise HTTPException(400, f"Invalid SSH command: {exc}") from exc
 
@@ -1996,10 +2048,13 @@ for p in $ports; do
 done
 printf 'COMFY\t%s\t%s\n' "$running" "$pending"
 """
-    proc = await asyncio.to_thread(
-        subprocess.run, [*ssh_cmd, "bash", "-s"],
-        input=script, capture_output=True, text=True, timeout=12, check=False
-    )
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, [*ssh_cmd, "bash", "-s"],
+            input=script, capture_output=True, text=True, timeout=12, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return {"reachable": False, "running": 0, "pending": 0}
     running = pending = 0
     reachable = False
     for line in proc.stdout.splitlines():
@@ -2719,7 +2774,9 @@ async function refreshSelectedInstanceSummary(force = false) {
       idata.workerUrl = urls[0];
     }
     idata.workerStats = statsByUrl;
-    if (summary.download_line) {
+    if (summary.download_status) {
+      updateDownloadStatusFromStructured(summary.download_status, idata);
+    } else if (summary.download_line) {
       updateDownloadStatusFromLine(summary.download_line, idata);
     } else if (idata.downloadStatus) {
       // No active download line in the recent journal → clear stale status.
@@ -3829,7 +3886,7 @@ function reconnectRemoteLog(src) {
 }
 
 function updateDownloadStatusFromLine(line, idata) {
-  let match = line.match(/Downloading asset progress:\s+([^\s]+)\s+(.+?)\s+\(([^)]+)\)\s+([0-9.]+\s+[KMGT]?B\/s)/);
+  let match = line.match(/Downloading asset progress(?: \([^)]+\))?:\s+([^\s]+)\s+(.+?)\s+\(([^)]+)\)\s+(?:avg=)?([0-9.]+\s+[KMGT]?B\/s)/);
   if (match) {
     idata.downloadStatus = {
       asset: match[1],
@@ -3838,7 +3895,16 @@ function updateDownloadStatusFromLine(line, idata) {
     };
     return true;
   }
-  if (/Download complete:/.test(line)) {
+  match = line.match(/Downloading asset progress(?: \([^)]+\))?:\s+([^\s]+)\s+(.+?)\s+downloaded\s+(?:avg=)?([0-9.]+\s+[KMGT]?B\/s)/);
+  if (match) {
+    idata.downloadStatus = {
+      asset: match[1],
+      detail: `${match[1]} · ${match[3]} · ${match[2]}`,
+      updatedAt: Date.now(),
+    };
+    return true;
+  }
+  if (/Download complete(?: \([^)]+\))?:/.test(line)) {
     // Download just finished — clear any lingering status so the UI hides it.
     if (idata.downloadStatus) {
       idata.downloadStatus = null;
@@ -3846,16 +3912,34 @@ function updateDownloadStatusFromLine(line, idata) {
     }
     return false;
   }
-  match = line.match(/Downloading asset:\s+([^\s]+)\s+total=([^ ]+\s+[KMGT]?B)/);
+  match = line.match(/Downloading asset:\s+([^\s]+)\s+total=([^ ]+\s+[KMGT]?B)/)
+    || line.match(/Downloading asset \([^)]+\):\s+([^\s]+)/);
   if (match) {
     idata.downloadStatus = {
       asset: match[1],
-      detail: `${match[1]} starting · ${match[2]}`,
+      detail: `${match[1]} starting${match[2] ? ' · ' + match[2] : ''}`,
       updatedAt: Date.now(),
     };
     return true;
   }
   return false;
+}
+
+function updateDownloadStatusFromStructured(status, idata) {
+  if (!status || !status.asset) return false;
+  const speed = Number(status.mb_per_sec);
+  const speedText = Number.isFinite(speed) ? `${speed.toFixed(2)} MB/s` : '';
+  const pct = Number(status.pct);
+  const pctText = Number.isFinite(pct) ? `${pct.toFixed(1)}%` : '';
+  const sizeText = status.total
+    ? `${status.downloaded || '?'} / ${status.total}`
+    : `${status.downloaded || '?'} downloaded`;
+  idata.downloadStatus = {
+    asset: status.asset,
+    detail: [status.asset, pctText, speedText, sizeText].filter(Boolean).join(' · '),
+    updatedAt: Date.now(),
+  };
+  return true;
 }
 
 const DOWNLOAD_STATUS_TTL_MS = 30000;

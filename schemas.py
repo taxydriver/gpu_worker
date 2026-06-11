@@ -24,6 +24,7 @@ class HealthResponse(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     active_jobs: int = 0
     max_concurrent_jobs: int = 1
+    download_status: dict[str, Any] | None = None
 
 
 class AssetGroupStats(BaseModel):

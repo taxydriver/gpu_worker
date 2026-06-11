@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import os
 import re
 import tempfile
 import time
 from pathlib import Path
+from threading import Event, Lock, Thread
 
 import portalocker
 import requests
@@ -19,6 +22,9 @@ from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
 
 
 LOGGER = logging.getLogger(__name__)
+_DOWNLOAD_STATUS_LOCK = Lock()
+_DOWNLOAD_STATUS: dict[str, object] | None = None
+_HF_INCOMPLETE_GLOB = "*.incomplete"
 
 # HuggingFace resolve URL pattern: .../resolve/<revision>/<path_in_repo>
 _HF_URL_RE = re.compile(
@@ -50,6 +56,13 @@ class EnsureAssetsResult(BaseModel):
     download_sec: float
 
 
+def active_download_status() -> dict[str, object] | None:
+    """Return a snapshot of the active model download, if any."""
+
+    with _DOWNLOAD_STATUS_LOCK:
+        return dict(_DOWNLOAD_STATUS) if _DOWNLOAD_STATUS else None
+
+
 def _format_bytes(num_bytes: int) -> str:
     """Return a compact human-readable byte count."""
 
@@ -62,6 +75,51 @@ def _format_bytes(num_bytes: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{num_bytes} B"
+
+
+def _set_download_status(
+    *,
+    asset_name: str,
+    downloaded_bytes: int,
+    total_bytes: int | None,
+    started_at: float,
+    source: str,
+) -> None:
+    elapsed_sec = max(time.monotonic() - started_at, 0.001)
+    mb_per_sec = downloaded_bytes / elapsed_sec / (1024 * 1024)
+    pct = (
+        min(max(downloaded_bytes / total_bytes * 100.0, 0.0), 100.0)
+        if total_bytes and total_bytes > 0
+        else None
+    )
+    with _DOWNLOAD_STATUS_LOCK:
+        global _DOWNLOAD_STATUS
+        _DOWNLOAD_STATUS = {
+            "asset": asset_name,
+            "source": source,
+            "downloaded_bytes": downloaded_bytes,
+            "downloaded": _format_bytes(downloaded_bytes),
+            "total_bytes": total_bytes,
+            "total": _format_bytes(total_bytes) if total_bytes else None,
+            "pct": pct,
+            "mb_per_sec": mb_per_sec,
+            "elapsed_sec": elapsed_sec,
+            "updated_at": time.time(),
+        }
+
+
+def _clear_download_status(asset_name: str) -> None:
+    with _DOWNLOAD_STATUS_LOCK:
+        global _DOWNLOAD_STATUS
+        if _DOWNLOAD_STATUS and _DOWNLOAD_STATUS.get("asset") == asset_name:
+            _DOWNLOAD_STATUS = None
+
+
+def _hf_incomplete_prefix(metadata_name: str) -> str:
+    """Return the Hugging Face local-dir incomplete-file prefix for a metadata file."""
+
+    digest = hashlib.sha1(metadata_name.encode()).digest()
+    return base64.urlsafe_b64encode(digest).decode()
 
 
 def _verify_sha256(path: Path, expected_sha256: str) -> None:
@@ -104,24 +162,151 @@ def _download_hf_hub(
     _os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
     from huggingface_hub import hf_hub_download
+    from huggingface_hub._local_folder import get_local_download_paths
 
     parsed = _parse_hf_url(url)
     assert parsed is not None
     repo_id, revision, filename = parsed
+    dry_run_info = hf_hub_download(
+        repo_id=repo_id,
+        filename=filename,
+        revision=revision,
+        local_dir=destination.parent,
+        dry_run=True,
+    )
+    total_bytes = int(getattr(dry_run_info, "file_size", 0) or 0) or None
+    local_paths = get_local_download_paths(local_dir=destination.parent, filename=filename)
+    incomplete_prefix = _hf_incomplete_prefix(local_paths.metadata_path.name)
+
+    def _hf_local_downloaded_bytes() -> int:
+        candidates = [local_paths.file_path, destination]
+        candidates.extend(
+            local_paths.metadata_path.parent.glob(f"{incomplete_prefix}.{_HF_INCOMPLETE_GLOB}")
+        )
+        sizes: list[int] = []
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    sizes.append(candidate.stat().st_size)
+            except OSError:
+                continue
+        return max(sizes, default=0)
+
     LOGGER.info(
         "Downloading asset (hf_hub): %s repo=%s revision=%s file=%s",
         asset_name, repo_id, revision, filename,
     )
 
-    # hf_hub_download saves as local_dir/<filename>; rename to destination (.part path)
-    local_path = Path(
-        hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=revision,
-            local_dir=destination.parent,
-        )
+    from huggingface_hub.utils import tqdm as hf_tqdm
+    stop_progress = Event()
+
+    def _log_local_progress() -> None:
+        last_logged_at = started_at
+        last_logged_size = -1
+        while not stop_progress.wait(2):
+            downloaded_bytes = _hf_local_downloaded_bytes()
+            if downloaded_bytes <= 0:
+                continue
+            _set_download_status(
+                asset_name=asset_name,
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=total_bytes,
+                started_at=started_at,
+                source="hf_hub",
+            )
+            now = time.monotonic()
+            if downloaded_bytes == last_logged_size or now - last_logged_at < 5:
+                continue
+            mb_per_sec = downloaded_bytes / max(now - started_at, 0.001) / (1024 * 1024)
+            if total_bytes:
+                pct = downloaded_bytes / total_bytes * 100.0
+                LOGGER.info(
+                    "Downloading asset progress: %s %s/%s (%.1f%%) %.2f MB/s",
+                    asset_name,
+                    _format_bytes(downloaded_bytes),
+                    _format_bytes(total_bytes),
+                    pct,
+                    mb_per_sec,
+                )
+            else:
+                LOGGER.info(
+                    "Downloading asset progress: %s %s downloaded %.2f MB/s",
+                    asset_name,
+                    _format_bytes(downloaded_bytes),
+                    mb_per_sec,
+                )
+            last_logged_size = downloaded_bytes
+            last_logged_at = now
+
+    progress_thread = Thread(
+        target=_log_local_progress,
+        name=f"asset-download-progress-{asset_name}",
+        daemon=True,
     )
+    progress_thread.start()
+
+    class DownloadProgressTqdm(hf_tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._last_log_at = started_at
+            _set_download_status(
+                asset_name=asset_name,
+                downloaded_bytes=max(int(self.n or 0), _hf_local_downloaded_bytes()),
+                total_bytes=int(self.total) if self.total else total_bytes,
+                started_at=started_at,
+                source="hf_hub",
+            )
+
+        def update(self, n=1):
+            result = super().update(n)
+            now = time.monotonic()
+            downloaded_bytes = max(int(self.n or 0), _hf_local_downloaded_bytes())
+            current_total_bytes = int(self.total) if self.total else total_bytes
+            _set_download_status(
+                asset_name=asset_name,
+                downloaded_bytes=downloaded_bytes,
+                total_bytes=current_total_bytes,
+                started_at=started_at,
+                source="hf_hub",
+            )
+            if now - self._last_log_at >= 5 and downloaded_bytes > 0:
+                mb_per_sec = downloaded_bytes / max(now - started_at, 0.001) / (1024 * 1024)
+                if current_total_bytes:
+                    pct = downloaded_bytes / current_total_bytes * 100.0
+                    LOGGER.info(
+                        "Downloading asset progress: %s %s/%s (%.1f%%) %.2f MB/s",
+                        asset_name,
+                        _format_bytes(downloaded_bytes),
+                        _format_bytes(current_total_bytes),
+                        pct,
+                        mb_per_sec,
+                    )
+                else:
+                    LOGGER.info(
+                        "Downloading asset progress: %s %s downloaded %.2f MB/s",
+                        asset_name,
+                        _format_bytes(downloaded_bytes),
+                        mb_per_sec,
+                    )
+                self._last_log_at = now
+            return result
+
+    # hf_hub_download saves as local_dir/<filename>; rename to destination (.part path)
+    try:
+        local_path = Path(
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                revision=revision,
+                local_dir=destination.parent,
+                tqdm_class=DownloadProgressTqdm,
+            )
+        )
+    finally:
+        stop_progress.set()
+        progress_thread.join(timeout=1)
+        _clear_download_status(asset_name)
+
     if local_path != destination:
         os.replace(local_path, destination)
 
@@ -145,12 +330,15 @@ def _download_to_path(url: str, destination: Path, *, asset_name: str) -> None:
     """
     started_at = time.monotonic()
 
-    if _parse_hf_url(url) and _hf_hub_available():
-        _download_hf_hub(url, destination, asset_name=asset_name, started_at=started_at)
-    elif _aria2c_available():
-        _download_aria2c(url, destination, asset_name=asset_name, started_at=started_at)
-    else:
-        _download_requests(url, destination, asset_name=asset_name, started_at=started_at)
+    try:
+        if _parse_hf_url(url) and _hf_hub_available():
+            _download_hf_hub(url, destination, asset_name=asset_name, started_at=started_at)
+        elif _aria2c_available():
+            _download_aria2c(url, destination, asset_name=asset_name, started_at=started_at)
+        else:
+            _download_requests(url, destination, asset_name=asset_name, started_at=started_at)
+    finally:
+        _clear_download_status(asset_name)
 
 
 def _download_aria2c(
@@ -228,9 +416,18 @@ def _download_aria2c(
                 elapsed_sec = max(now - started_at, 0.001)
                 if last_downloaded_mib is not None:
                     avg_mb_per_sec = last_downloaded_mib / elapsed_sec
+                    downloaded_bytes = int(last_downloaded_mib * 1024 * 1024)
                 else:
                     current_size = destination.stat().st_size if destination.exists() else 0
                     avg_mb_per_sec = current_size / elapsed_sec / (1024 * 1024)
+                    downloaded_bytes = current_size
+                _set_download_status(
+                    asset_name=asset_name,
+                    downloaded_bytes=downloaded_bytes,
+                    total_bytes=None,
+                    started_at=started_at,
+                    source="aria2c",
+                )
                 size_str = _format_bytes(int((last_downloaded_mib or 0) * 1024 * 1024)) if last_downloaded_mib else "?"
                 if last_dl_mib is not None:
                     LOGGER.info(
@@ -271,6 +468,7 @@ def _download_aria2c(
         elapsed_sec,
         mb_per_sec,
     )
+    _clear_download_status(asset_name)
 
 
 def _download_requests(
@@ -308,6 +506,13 @@ def _download_requests(
                 if now - last_log_at >= 5:
                     elapsed_sec = max(now - started_at, 0.001)
                     mb_per_sec = downloaded_bytes / elapsed_sec / (1024 * 1024)
+                    _set_download_status(
+                        asset_name=asset_name,
+                        downloaded_bytes=downloaded_bytes,
+                        total_bytes=total_bytes if total_bytes > 0 else None,
+                        started_at=started_at,
+                        source="requests",
+                    )
                     if total_bytes > 0:
                         pct = (downloaded_bytes / total_bytes) * 100
                         LOGGER.info(
@@ -339,6 +544,7 @@ def _download_requests(
         elapsed_sec,
         mb_per_sec,
     )
+    _clear_download_status(asset_name)
 
 
 def _ensure_single_asset(asset: dict[str, str]) -> str | None:
