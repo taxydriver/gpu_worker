@@ -3128,8 +3128,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verda-worker-count",
         type=int,
-        default=int(os.getenv("VERDA_WORKER_COUNT", "0")),
-        help="Number of GPU worker services to start. 0 means auto-detect all GPUs.",
+        default=int(os.getenv("VERDA_WORKER_COUNT", "3")),
+        help="Number of GPU worker services to start. 0 means auto-detect physical GPUs. Default 3 (safe for single 180GB+ GPU with STREAMING_CLIP_CONCURRENCY=2).",
     )
     parser.add_argument(
         "--verda-fresh-os-image",
