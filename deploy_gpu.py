@@ -561,7 +561,8 @@ if test -d /run/systemd/system && systemctl list-units >/dev/null 2>&1; then
 fi
 
 GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
-if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -lt "$GPU_COUNT"; then
+if test "$WORKER_COUNT_REQUESTED" -gt 0; then
+  # explicit count always wins — allows multiple instances on one physical GPU
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
 if test "$GPU_COUNT" -lt 1; then
@@ -1487,7 +1488,8 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
-if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -lt "$GPU_COUNT"; then
+if test "$WORKER_COUNT_REQUESTED" -gt 0; then
+  # explicit count always wins — allows multiple instances on one physical GPU
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
 if test "$GPU_COUNT" -lt 1; then
