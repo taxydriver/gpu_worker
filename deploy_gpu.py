@@ -1455,7 +1455,21 @@ def verda_rehydrate_script(
     comfy_port: int,
     worker_count: int,
     remote_root: str,
+    patch_content: str = "",
 ) -> str:
+    if patch_content:
+        _rehydrate_patch_block = (
+            "mkdir -p \"$COMFY_ROOT/custom_nodes/filmforge_cuda_patch\"\n"
+            "cat > \"$COMFY_ROOT/custom_nodes/filmforge_cuda_patch/__init__.py\" << 'FILMFORGE_PATCH_EOF'\n"
+            + patch_content.rstrip("\n")
+            + "\nFILMFORGE_PATCH_EOF\n"
+            "echo \"[verda] cuDNN patch custom node installed\" >&2"
+        )
+    else:
+        _rehydrate_patch_block = (
+            "echo \"[verda] WARNING: cuDNN patch not embedded — Blackwell SDP errors may occur\" >&2"
+        )
+
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
@@ -1788,6 +1802,23 @@ fi
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
 VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
 
+# Choose ComfyUI VRAM flag based on detected VRAM.
+# Total model footprint (Flux dev ~24 GB + WAN21 ~14 GB + encoders ~7 GB) is ~45 GB.
+# On cards with >= 64 GB we keep all models resident (--highvram) to eliminate the
+# per-job staging overhead (~15 s / job) that ComfyUI's default dynamic-VRAM mode
+# incurs. Below 64 GB let ComfyUI manage dynamically to avoid OOM on tighter cards.
+if [ "${{VRAM_GB}}" -ge 64 ] 2>/dev/null; then
+  COMFY_VRAM_FLAG="--highvram"
+else
+  COMFY_VRAM_FLAG=""
+fi
+echo "VRAM: ${{VRAM_GB}} GB → ComfyUI flag: ${{COMFY_VRAM_FLAG:-'(none, dynamic)'}}"
+
+# Install FilmForge cuDNN patch as a ComfyUI custom node (before services start).
+# Disables cuDNN SDP backend to prevent "No valid execution plans built" on
+# Blackwell (B300/SM 10.x) and future architectures where cuDNN has no plan.
+{_rehydrate_patch_block}
+
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   comfy_port=$((COMFY_PORT_BASE + idx))
   worker_port=$((WORKER_PORT_BASE + idx))
@@ -1804,7 +1835,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$COMFY_ROOT
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory ${{comfy_user_dir}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
+ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --use-pytorch-cross-attention ${{COMFY_VRAM_FLAG}} --user-directory ${{comfy_user_dir}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
 Restart=always
 RestartSec=5
 
@@ -1924,8 +1955,22 @@ def verda_fresh_install_script(
     comfy_repo_url: str,
     pytorch_index_url: str,
     remote_root: str,
+    patch_content: str = "",
 ) -> str:
     """Install ComfyUI and gpu_worker onto a fresh Verda base image."""
+
+    if patch_content:
+        _cuda_patch_block = (
+            "mkdir -p \"$COMFY_ROOT/custom_nodes/filmforge_cuda_patch\"\n"
+            "cat > \"$COMFY_ROOT/custom_nodes/filmforge_cuda_patch/__init__.py\" << 'FILMFORGE_PATCH_EOF'\n"
+            + patch_content.rstrip("\n")
+            + "\nFILMFORGE_PATCH_EOF\n"
+            "echo \"FilmForge cuDNN patch custom node installed\""
+        )
+    else:
+        _cuda_patch_block = (
+            "echo \"[verda] WARNING: cuDNN patch not embedded — Blackwell SDP errors may occur\" >&2"
+        )
 
     return f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -2036,6 +2081,10 @@ fi
 if ! test -d "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus"; then
   GIT_TERMINAL_PROMPT=0 git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus.git "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus" || true
 fi
+
+# Install FilmForge cuDNN patch custom node (disables cuDNN SDP to prevent
+# "No valid execution plans built" on Blackwell and other unsupported GPUs).
+{_cuda_patch_block}
 
 for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
   if test -f "$req"; then
@@ -2211,12 +2260,14 @@ def verda_deploy(args: argparse.Namespace) -> int:
 
     env_vars = _verda_env_vars(args)
 
+    _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     script = verda_rehydrate_script(
         public_ip=ip,
         worker_port=args.worker_port,
         comfy_port=args.verda_comfy_port,
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
+        patch_content=_patch_path.read_text() if _patch_path.exists() else "",
     )
     env_exports = build_env_exports(env_vars)
     if env_exports:
@@ -2313,11 +2364,13 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
     ssh_cmd, _, _ = parse_ssh_command(ssh_command)
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
 
+    _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     install_script = verda_fresh_install_script(
         worker_repo_url=args.verda_worker_repo_url,
         comfy_repo_url=args.verda_comfy_repo_url,
         pytorch_index_url=args.verda_pytorch_index_url,
         remote_root=args.remote_root,
+        patch_content=_patch_path.read_text() if _patch_path.exists() else "",
     )
     log("Installing worker stack on fresh Verda OS volume...")
     try:
@@ -2334,12 +2387,14 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         print(install_result.stderr, file=sys.stderr, end="")
 
     env_vars = _verda_env_vars(args)
+    _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     script = verda_rehydrate_script(
         public_ip=ip,
         worker_port=args.worker_port,
         comfy_port=args.verda_comfy_port,
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
+        patch_content=_patch_path.read_text() if _patch_path.exists() else "",
     )
     env_exports = build_env_exports(env_vars)
     if env_exports:

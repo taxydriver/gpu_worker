@@ -33,7 +33,12 @@ from gpu_worker.comfy_client import (
     resolve_served_file,
     submit_prompt,
 )
-from gpu_worker.comfy_process import is_comfy_healthy, restart_comfy
+from gpu_worker.comfy_process import (
+    is_comfy_healthy,
+    restart_comfy,
+    run_gpu_diagnostics,
+    run_gpu_smoke_test,
+)
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import (
     EnsureAssetGroupResult,
@@ -69,6 +74,14 @@ if get_settings().log_prompts_only:
     logging.getLogger("gpu_worker.prompts").propagate = False
 
 app = FastAPI(title="FilmForge GPU Worker", version="0.1.0")
+
+# Run GPU diagnostics and smoke test in a background thread so they don't
+# block uvicorn startup. Results appear in the worker log (journalctl / /tmp/gpu_worker.log).
+threading.Thread(
+    target=lambda: (run_gpu_diagnostics(), run_gpu_smoke_test()),
+    name="gpu-startup-check",
+    daemon=True,
+).start()
 
 _STILL_ASSET_GROUPS = {"flux_stills_v1"}
 _VIDEO_ASSET_GROUPS = {"wan_i2v_v1"}

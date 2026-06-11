@@ -1362,11 +1362,13 @@ fi
                 )
                 if comfy_check.returncode != 0:
                     _put(job, "[deploy] ComfyUI not installed — running Verda fresh-install (clones ComfyUI, mounts /dev/vdb, installs deps). This takes ~5–10 min.")
+                    _patch_path = SCRIPT_DIR / "comfy_torch_patch.py"
                     install_script = verda_fresh_install_script(
                         worker_repo_url=DEFAULT_WORKER_REPO_URL,
                         comfy_repo_url=DEFAULT_COMFY_REPO_URL,
                         pytorch_index_url=DEFAULT_PYTORCH_INDEX_URL,
                         remote_root=req.remote_root,
+                        patch_content=_patch_path.read_text() if _patch_path.exists() else "",
                     )
                     if env_exports:
                         install_script = env_exports + "\n\n" + install_script
@@ -1409,12 +1411,14 @@ fi
                 # systemd (survives reboots) and the data volume binds re-mount
                 # cleanly. This is the same path the CLI's --verda-fresh uses.
                 _put(job, f"[deploy] Verda bootstrap: {max(effective_worker_count, 1)} worker(s) under systemd.")
+                _patch_path = SCRIPT_DIR / "comfy_torch_patch.py"
                 script = verda_rehydrate_script(
                     public_ip=direct_host or "",
                     worker_port=req.worker_port,
                     comfy_port=req.comfy_port,
                     worker_count=max(effective_worker_count, 1),
                     remote_root=req.remote_root,
+                    patch_content=_patch_path.read_text() if _patch_path.exists() else "",
                 )
             elif effective_worker_count > 1:
                 _put(job, f"[deploy] Detected {remote_gpu_count} GPUs; starting {effective_worker_count} workers.")
