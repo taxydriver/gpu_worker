@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 import time
 import uuid
@@ -89,6 +90,30 @@ _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0
 _BASE_VIDEO_SEC = 30.0
 _ETA_WINDOW = 12
+
+# ── VRAM pre-flight guard ─────────────────────────────────────────────────────
+# Minimum free VRAM (MiB) required before this worker accepts a job.
+# Based on observed inference activation peaks on a single shared GPU device.
+# When multiple ComfyUI instances share one physical GPU, a job that would OOM
+# mid-inference is rejected here instantly so the broker routes it elsewhere.
+_VRAM_FLOOR_MIB: dict[str, int] = {
+    "wan_i2v_v1": 55_000,    # WAN 14B: ~55GB activation headroom observed
+    "flux_stills_v1": 12_000, # FLUX: ~12GB activation headroom
+}
+
+
+def _free_vram_mib() -> int | None:
+    """Return free VRAM in MiB via nvidia-smi. Returns None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        return int(out.decode().strip().splitlines()[0])
+    except Exception:
+        return None
+
 
 # ── Active-job tracking (used by watchdog to avoid restarting mid-run) ────────
 _ACTIVE_JOBS_LOCK = threading.Lock()
@@ -234,8 +259,8 @@ def _broker_worker_payload() -> dict[str, object]:
     with _ACTIVE_JOBS_LOCK:
         active_jobs = _ACTIVE_JOBS
 
-    free_vram_mb = None
-    if settings.worker_vram_gb is not None:
+    free_vram_mb = _free_vram_mib()
+    if free_vram_mb is None and settings.worker_vram_gb is not None:
         free_vram_mb = int(settings.worker_vram_gb * 1024)
 
     raw_capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
@@ -716,6 +741,28 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             history_found=history_found,
             error=_asset_group_mismatch_error(request.asset_group),
         )
+
+    # Pre-flight VRAM check — fast-reject before acquiring execution slot so
+    # the broker can immediately route to a worker that has headroom.
+    canonical_group = canonical_asset_group(request.asset_group)
+    vram_floor = _VRAM_FLOOR_MIB.get(canonical_group)
+    if vram_floor is not None:
+        free_mib = _free_vram_mib()
+        if free_mib is not None and free_mib < vram_floor:
+            timings.total_sec = time.monotonic() - total_started
+            LOGGER.warning(
+                "vram_pressure job_id=%s asset_group=%s free=%dMiB required=%dMiB — rejecting",
+                request.job_id, request.asset_group, free_mib, vram_floor,
+            )
+            return _error_response(
+                request=request,
+                timings=timings,
+                downloaded_assets=[],
+                restart_performed=False,
+                comfy_prompt_id=None,
+                history_found=False,
+                error=RuntimeError(f"vram_pressure: {free_mib}MiB free < {vram_floor}MiB required for {canonical_group}"),
+            )
 
     if progress is not None:
         _set_progress_stage(progress, "starting", message="Waiting for worker capacity", eta_sec=progress.eta_sec)
