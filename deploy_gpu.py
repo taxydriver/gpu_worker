@@ -1594,9 +1594,9 @@ require_root_space_kb() {{
 cleanup_hidden_comfy_dir() {{
   src="$1"
   dst="$2"
-  test -d "$src" || return
-  test -d "$dst" || return
-  mountpoint -q "$dst" || return
+  test -d "$src" || return 0
+  test -d "$dst" || return 0
+  mountpoint -q "$dst" || return 0
 
   root_view="/mnt/data/.filmforge_root_view"
   mkdir -p "$root_view"
@@ -1605,9 +1605,9 @@ cleanup_hidden_comfy_dir() {{
   fi
 
   hidden="$root_view$dst"
-  test -d "$hidden" || return
+  test -d "$hidden" || return 0
   if ! test -n "$(find "$hidden" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-    return
+    return 0
   fi
 
   missing=0
@@ -1630,10 +1630,10 @@ cleanup_hidden_comfy_dir() {{
 move_visible_comfy_dir_to_data() {{
   src="$1"
   dst="$2"
-  test -d "$dst" || return
-  mountpoint -q "$dst" && return
+  test -d "$dst" || return 0
+  mountpoint -q "$dst" && return 0
   if ! test -n "$(find "$dst" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)"; then
-    return
+    return 0
   fi
   echo "Moving existing $dst contents to $src before bind mount" >&2
   mkdir -p "$src"
@@ -2116,7 +2116,7 @@ def _verda_env_vars(args: argparse.Namespace) -> list[str]:
     existing_keys = {item.split("=", 1)[0] for item in env_vars if "=" in item}
     for key in ("WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_TOKEN", "WORKER_API_TOKEN"):
         if key not in existing_keys:
-            value = _read_env_value(args.backend_env, key)
+            value = _read_env_value(args.backend_env, key) or os.getenv(key)
             if value:
                 env_vars.append(f"{key}={value}")
                 existing_keys.add(key)
@@ -2125,7 +2125,7 @@ def _verda_env_vars(args: argparse.Namespace) -> list[str]:
         {"WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_TOKEN"} & existing_keys
     )
     if has_registration_token and "FILMFORGE_BACKEND_URL" not in existing_keys:
-        value = _read_env_value(args.backend_env, "FILMFORGE_BACKEND_URL")
+        value = _read_env_value(args.backend_env, "FILMFORGE_BACKEND_URL") or os.getenv("FILMFORGE_BACKEND_URL")
         if value:
             env_vars.append(f"FILMFORGE_BACKEND_URL={value}")
             log("Auto-injected FILMFORGE_BACKEND_URL from backend .env")
