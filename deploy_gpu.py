@@ -3128,8 +3128,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verda-worker-count",
         type=int,
-        default=int(os.getenv("VERDA_WORKER_COUNT", "3")),
-        help="Number of GPU worker services to start. 0 means auto-detect physical GPUs. Default 3 (safe for single 180GB+ GPU with STREAMING_CLIP_CONCURRENCY=2).",
+        default=int(os.getenv("VERDA_WORKER_COUNT", "2")),
+        help="Number of GPU worker services to start. 0 means auto-detect physical GPUs. Default 2: safe for a single 180GB GPU — 2 concurrent WAN inference peaks (~75GB each) fit within device limit without OOM.",
     )
     parser.add_argument(
         "--verda-fresh-os-image",
