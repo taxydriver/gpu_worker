@@ -445,7 +445,7 @@ test -n "${{WORKER_NAME:-}}" && ENV_VARS+=(WORKER_NAME="${{WORKER_NAME}}")
 test -n "${{WORKER_PUBLIC_URL:-}}" && ENV_VARS+=(WORKER_PUBLIC_URL="${{WORKER_PUBLIC_URL}}")
 test -n "${{WORKER_GPU_NAME:-}}" && ENV_VARS+=(WORKER_GPU_NAME="${{WORKER_GPU_NAME}}")
 test -n "${{WORKER_VRAM_GB:-}}" && ENV_VARS+=(WORKER_VRAM_GB="${{WORKER_VRAM_GB}}")
-ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1}}")
+ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}")
 test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && ENV_VARS+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
 test -n "${{WORKER_API_TOKEN:-}}" && ENV_VARS+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
 
@@ -560,9 +560,12 @@ if test -d /run/systemd/system && systemctl list-units >/dev/null 2>&1; then
   HAS_SYSTEMD=1
 fi
 
-GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
-if test "$WORKER_COUNT_REQUESTED" -gt 0; then
-  # explicit count always wins — allows multiple instances on one physical GPU
+PHYSICAL_GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+GPU_COUNT="$PHYSICAL_GPU_COUNT"
+# An explicit request may LOWER the worker count but must NEVER exceed the
+# physical GPUs: each worker is pinned to CUDA_VISIBLE_DEVICES=<idx>, so a gpuN
+# beyond the real GPU count crash-loops forever on "No CUDA GPUs are available".
+if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -le "$PHYSICAL_GPU_COUNT"; then
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
 if test "$GPU_COUNT" -lt 1; then
@@ -658,7 +661,7 @@ start_worker_no_systemd() {{
   worker_env+=(WORKER_PROVIDER="vast")
   worker_env+=(WORKER_GPU_NAME="$GPU_NAME")
   worker_env+=(WORKER_VRAM_GB="$VRAM_GB")
-  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1}}")
+  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}")
   worker_env+=(WORKER_ID_FILE="/workspace/.filmforge_worker_gpu${{idx}}.id")
   worker_env+=(MODEL_DOWNLOAD_TIMEOUT_SEC="7200")
   worker_env+=(COMFY_HEALTH_TIMEOUT_SEC="180")
@@ -727,7 +730,7 @@ Environment=WORKER_NAME=filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=vast
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}"
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
 Environment=COMFY_HEALTH_TIMEOUT_SEC=180
@@ -1487,9 +1490,12 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 1
 fi
 
-GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
-if test "$WORKER_COUNT_REQUESTED" -gt 0; then
-  # explicit count always wins — allows multiple instances on one physical GPU
+PHYSICAL_GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
+GPU_COUNT="$PHYSICAL_GPU_COUNT"
+# An explicit request may LOWER the worker count but must NEVER exceed the
+# physical GPUs: each worker is pinned to CUDA_VISIBLE_DEVICES=<idx>, so a gpuN
+# beyond the real GPU count crash-loops forever on "No CUDA GPUs are available".
+if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -le "$PHYSICAL_GPU_COUNT"; then
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
 if test "$GPU_COUNT" -lt 1; then
@@ -1865,7 +1871,7 @@ Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=verda
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio,ltx_i2v}}"
 Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
