@@ -42,6 +42,7 @@ from gpu_worker.comfy_process import (
 )
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import (
+    ActiveJobSummary,
     EnsureAssetGroupResult,
     EnsureAssetsRequest,
     EnsureAssetsResponse,
@@ -689,6 +690,33 @@ def ensure_assets(
     )
 
 
+def _active_jobs_detail() -> list[ActiveJobSummary]:
+    """Compact summaries of jobs currently executing, for the infra dashboard.
+
+    Built from the async-job registry (the production path); the legacy sync
+    /run path doesn't register here, so detail is best-effort and the dashboard
+    falls back to the bare active_jobs count when this is empty.
+    """
+    with _JOB_LOCK:
+        running = [
+            r for r in _JOBS.values()
+            if r.status == "running" and r.progress is not None
+        ]
+    out: list[ActiveJobSummary] = []
+    for r in running:
+        p = r.progress
+        out.append(ActiveJobSummary(
+            job_id=r.request.job_id,
+            asset_group=r.request.asset_group,
+            stage=p.stage,
+            message=p.message,
+            elapsed_sec=round(p.elapsed_sec, 1),
+            eta_sec=(round(p.eta_sec, 1) if p.eta_sec is not None else None),
+            resolution_bucket=p.resolution_bucket,
+        ))
+    return out
+
+
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     """Return worker and ComfyUI health state."""
@@ -714,6 +742,7 @@ def health() -> HealthResponse:
         active_jobs=active_jobs,
         max_concurrent_jobs=settings.resolved_max_concurrent_jobs(),
         download_status=active_download_status(),
+        active_jobs_detail=_active_jobs_detail(),
     )
 
 

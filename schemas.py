@@ -8,6 +8,20 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
+class ActiveJobSummary(BaseModel):
+    """Compact view of one in-flight job, surfaced on /health so the infra
+    dashboard can show *what* a box is generating (and how far along), not just
+    a count. Fields mirror the live JobProgressResponse for running jobs."""
+
+    job_id: str
+    asset_group: str
+    stage: str
+    message: str = ""
+    elapsed_sec: float = 0.0
+    eta_sec: float | None = None
+    resolution_bucket: str | None = None
+
+
 class HealthResponse(BaseModel):
     """Health response payload."""
 
@@ -25,6 +39,7 @@ class HealthResponse(BaseModel):
     active_jobs: int = 0
     max_concurrent_jobs: int = 1
     download_status: dict[str, Any] | None = None
+    active_jobs_detail: list[ActiveJobSummary] = Field(default_factory=list)
 
 
 class AssetGroupStats(BaseModel):
