@@ -122,6 +122,11 @@ _ACTIVE_JOBS: int = 0  # count of jobs currently executing
 _MAX_EXECUTION_SLOTS = max(1, get_settings().resolved_max_concurrent_jobs())
 _EXECUTION_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_EXECUTION_SLOTS)
 
+# Last model family run, so we only release VRAM when it actually changes (see
+# _free_vram_on_group_switch). Single execution slot (WORKER_MAX_CONCURRENT_JOBS
+# defaults to 1), so a plain global is race-free.
+_LAST_ASSET_GROUP: str | None = None
+
 # ── Warmed asset groups tracking ─────────────────────────────────────────────────
 _WARMED_GROUPS_LOCK = threading.Lock()
 _WARMED_GROUPS: set[str] = set()  # asset groups that have been successfully downloaded
@@ -746,6 +751,24 @@ def health() -> HealthResponse:
     )
 
 
+def _free_vram_on_group_switch(asset_group: str) -> None:
+    """Release the resident ComfyUI model only when the model *family* changes.
+
+    ComfyUI runs with --highvram on big cards, which pins models on the GPU.
+    We used to flush VRAM after every job, which evicted a model we were about
+    to reuse — so consecutive same-family shots (all stills, then all clips)
+    needlessly reloaded the 30 GB+ model each time. Now we keep it warm within a
+    family and only unload when switching (e.g. Flux2 stills → LTX clips), which
+    also makes room so the incoming model doesn't OOM on top of the old one.
+    """
+    global _LAST_ASSET_GROUP
+    last = _LAST_ASSET_GROUP
+    _LAST_ASSET_GROUP = asset_group
+    if last is not None and canonical_asset_group(last) != canonical_asset_group(asset_group):
+        LOGGER.info("asset_group switch %s -> %s: releasing resident model", last, asset_group)
+        free_comfy_memory(unload_models=True)
+
+
 def _execute_run(request: RunRequest, progress: JobProgressResponse | None = None) -> RunResponse:
     """Ensure assets, run a ComfyUI prompt, and report structured results."""
 
@@ -808,6 +831,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
 
     try:
         LOGGER.info("Starting job_id=%s asset_group=%s", request.job_id, request.asset_group)
+        _free_vram_on_group_switch(request.asset_group)
         if progress is not None:
             _set_progress_stage(progress, "starting", message="Preparing job", eta_sec=progress.eta_sec)
             _update_progress_elapsed(
@@ -948,8 +972,10 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         output_files = build_output_files(outputs)
         timings.total_sec = time.monotonic() - total_started
 
-        # Release VRAM after every job so it doesn't accumulate across shots
-        free_comfy_memory(unload_models=False)  # keep models loaded, just flush cache
+        # NB: we deliberately do NOT flush VRAM here. With --highvram the model
+        # stays pinned, so a per-job flush only forces the next same-family shot
+        # to reload it. VRAM is instead released on model-family switch, at job
+        # start (see _free_vram_on_group_switch).
 
         _store_eta_sample(request.asset_group, resolution_bucket, timings.comfy_run_sec)
 
