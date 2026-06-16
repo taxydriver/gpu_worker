@@ -329,6 +329,25 @@ def _register_with_broker() -> None:
         LOGGER.warning("[broker] worker registration failed: %s", exc)
 
 
+def _send_heartbeat_now() -> None:
+    """Fire a single heartbeat immediately. Best-effort — never raises."""
+    settings = get_settings()
+    backend_url = settings.resolved_backend_url()
+    if not backend_url:
+        return
+    worker_id = settings.resolved_worker_id()
+    if not worker_id:
+        return
+    url = f"{backend_url.rstrip('/')}/api/render-broker/workers/{worker_id}/heartbeat"
+    payload = _broker_worker_payload()
+    payload.pop("worker_id", None)
+    try:
+        response = requests.post(url, json=payload, headers=_broker_headers(), timeout=5)
+        response.raise_for_status()
+    except Exception as exc:
+        LOGGER.debug("[broker] immediate heartbeat failed: %s", exc)
+
+
 def _broker_heartbeat_loop() -> None:
     settings = get_settings()
     backend_url = settings.resolved_backend_url()
@@ -828,6 +847,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     with _ACTIVE_JOBS_LOCK:
         global _ACTIVE_JOBS
         _ACTIVE_JOBS += 1
+    threading.Thread(target=_send_heartbeat_now, daemon=True).start()
 
     try:
         LOGGER.info("Starting job_id=%s asset_group=%s", request.job_id, request.asset_group)
@@ -1010,6 +1030,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         with _ACTIVE_JOBS_LOCK:
             _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
         _EXECUTION_SEMAPHORE.release()
+        threading.Thread(target=_send_heartbeat_now, daemon=True).start()
 
 
 def _run_job_async(worker_job_id: str) -> None:
