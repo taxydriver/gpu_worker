@@ -77,6 +77,17 @@ if get_settings().log_prompts_only:
 
 app = FastAPI(title="FilmForge GPU Worker", version="0.1.0")
 
+# Self-heal model wiring BEFORE any asset check: guarantee that the hardcoded
+# /workspace/ComfyUI/models paths resolve to the populated data volume, so we
+# reuse already-downloaded models instead of re-downloading the warm set. Runs
+# synchronously so it wins the race against the preload thread below.
+try:
+    from gpu_worker.model_store import ensure_model_store
+
+    ensure_model_store()
+except Exception:  # never block worker startup on self-heal
+    logging.getLogger(__name__).exception("model-store self-heal failed; continuing")
+
 # Run GPU diagnostics and smoke test in a background thread so they don't
 # block uvicorn startup. Results appear in the worker log (journalctl / /tmp/gpu_worker.log).
 threading.Thread(
