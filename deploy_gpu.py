@@ -860,7 +860,7 @@ echo "GPU_COUNT=${{GPU_COUNT}}"
 """
 
 
-def update_env_file(env_path: Path, worker_url: str) -> None:
+def update_env_file(env_path: Path, worker_url: str, semantic_url: str | None = None) -> None:
     content = env_path.read_text()
     line = f"GPU_WORKER_BASE_URL={worker_url}"
     if "GPU_WORKER_BASE_URL=" in content:
@@ -868,6 +868,13 @@ def update_env_file(env_path: Path, worker_url: str) -> None:
     else:
         suffix = "" if content.endswith("\n") else "\n"
         content = f"{content}{suffix}{line}\n"
+    if semantic_url:
+        sem_line = f"SEMANTIC_SEARCH_URL={semantic_url}"
+        if "SEMANTIC_SEARCH_URL=" in content:
+            content = re.sub(r"^SEMANTIC_SEARCH_URL=.*$", sem_line, content, flags=re.MULTILINE)
+        else:
+            suffix = "" if content.endswith("\n") else "\n"
+            content = f"{content}{suffix}{sem_line}\n"
     env_path.write_text(content)
 
 
@@ -1011,6 +1018,23 @@ def _positive_float(value: object) -> float | None:
 
 
 def _select_vast_offer(args: argparse.Namespace) -> dict:
+    # An explicit offer id (from the rent UI's "pick this box") wins over the
+    # search heuristics — rent the exact box the operator clicked.
+    pinned_id = getattr(args, "vast_offer_id", None)
+    if pinned_id:
+        # The rent UI already picked a specific offer. Vast's `search offers` is
+        # non-deterministic (identical queries return different offer sets), so
+        # there's no way to re-fetch this id — but `create instance <id>` accepts
+        # the id directly. Synthesize a minimal offer dict from what the caller
+        # passed; gpu count is corrected post-SSH by _vast_remote_gpu_count.
+        selected = {
+            "id": int(pinned_id),
+            "gpu_name": getattr(args, "vast_gpu", "") or "",
+            "num_gpus": getattr(args, "vast_worker_count", 0) or 0,
+            "dph_total": float(getattr(args, "vast_max_price", 0.0) or 0.0),
+        }
+        log(f"Using pinned Vast offer id={pinned_id} gpu={selected['gpu_name'] or 'unknown'}")
+        return selected
     query = " ".join(
         [
             f"gpu_ram>={int(args.vast_min_vram_gb)}",
@@ -1460,6 +1484,7 @@ def verda_rehydrate_script(
     worker_count: int,
     remote_root: str,
     patch_content: str = "",
+    semantic_port: int = 8082,
 ) -> str:
     if patch_content:
         _rehydrate_patch_block = (
@@ -1684,6 +1709,36 @@ bind_comfy_dir() {{
 for dir in models input output temp; do
   bind_comfy_dir "/mnt/data/ComfyUI/$dir" "$COMFY_ROOT/$dir"
 done
+
+# Belt-and-suspenders: ComfyUI must see the models that live on the data volume.
+# The bind above can be silently lost (e.g. ComfyUI recreates models/ on the OS
+# disk after boot), which leaves an empty /workspace/ComfyUI/models and triggers a
+# full re-download even though /mnt/data is 69% full. So (1) fail loud if the
+# models bind did not take, and (2) ALWAYS write extra_model_paths.yaml pointing
+# directly at /mnt/data so ComfyUI finds the models regardless of the bind state.
+if ! mountpoint -q "$COMFY_ROOT/models"; then
+  echo "WARNING: $COMFY_ROOT/models is not bind-mounted from /mnt/data/ComfyUI/models" >&2
+  echo "         Relying on extra_model_paths.yaml below to point ComfyUI at /mnt/data." >&2
+  mount | grep -iE "comfy|mnt/data" >&2 || true
+else
+  echo "$COMFY_ROOT/models bind-mounted from /mnt/data/ComfyUI/models (used: $(df -h /mnt/data | awk 'NR==2{{print $3}}'))" >&2
+fi
+
+cat > "$COMFY_ROOT/extra_model_paths.yaml" <<'YAML'
+filmforge_worker:
+    base_path: /mnt/data/ComfyUI/models
+    checkpoints: checkpoints
+    clip: clip
+    vae: vae
+    diffusion_models: diffusion_models
+    text_encoders: text_encoders
+    loras: loras
+    unet: unet
+    controlnet: controlnet
+    upscale_models: upscale_models
+YAML
+echo "Wrote extra_model_paths.yaml → ComfyUI scans /mnt/data/ComfyUI/models directly" >&2
+
 require_root_space_kb 65536
 
 if test -n "$VDB_UUID" && ! grep -q "$VDB_UUID" /etc/fstab; then
@@ -1954,6 +2009,175 @@ done
 
 echo "GPU_COUNT=${{GPU_COUNT}}"
 df -h /mnt/data
+
+# ── Semantic search service ───────────────────────────────────────────────────
+# Run the whole block in a guarded subshell: the outer script is `set -e`, so any
+# failure here (pip, embedding, systemd) would otherwise abort the entire worker
+# deploy. Semantic search is non-essential to the GPU worker — degrade to a
+# warning instead of killing the deploy.
+(
+set +e
+SEMANTIC_DIR="/mnt/data/semantic_search"
+SEMANTIC_ART="$SEMANTIC_DIR/artifacts/semantics"
+SEMANTIC_PORT={semantic_port}
+SEMANTIC_MODEL="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+mkdir -p "$SEMANTIC_ART"
+
+# Install dependencies if not already present
+if ! python3 -c "import faiss, flask, sentence_transformers" 2>/dev/null; then
+  # --ignore-installed blinker: flask depends on blinker, but the Debian-shipped
+  # blinker 1.7.0 has no RECORD file, so pip's uninstall step fails and aborts the
+  # whole deploy. Skip uninstalling it and install our own copy alongside.
+  pip3 install --quiet --break-system-packages --ignore-installed blinker flask sentence-transformers faiss-gpu numpy tqdm
+fi
+
+# Write the serve app (idempotent)
+cat > "$SEMANTIC_DIR/app.py" << 'SEMANTIC_APP_EOF'
+import os, json, faiss, numpy as np
+from flask import Flask, request, jsonify
+from sentence_transformers import SentenceTransformer
+
+MODEL_DIR = os.getenv("MODEL_DIR", "/mnt/data/semantic_search/artifacts/semantics")
+ST_MODEL  = os.getenv("ST_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+TMDB_BASE = "https://image.tmdb.org/t/p/w500"
+
+def _title_from(m):  return m.get("title") or m.get("name") or m.get("original_title")
+def _year_from(m):   return m.get("year") or m.get("release_year")
+def _poster_from(m):
+    p = m.get("poster") or m.get("posterUrl") or m.get("poster_path")
+    if p and isinstance(p, str) and not p.startswith("http"):
+        return TMDB_BASE + p
+    return p
+
+index = faiss.read_index(os.path.join(MODEL_DIR, "movies.faiss"))
+ids   = np.load(os.path.join(MODEL_DIR, "ids.npy"))
+with open(os.path.join(MODEL_DIR, "meta.json"), "r", encoding="utf-8") as f:
+    meta = json.load(f)
+model = SentenceTransformer(ST_MODEL)
+print(f"[semantic] Loaded {{index.ntotal}} vectors, {{len(meta)}} meta entries", flush=True)
+
+app = Flask(__name__)
+
+@app.get("/ping")
+def ping(): return "ok", 200
+
+@app.post("/invocations")
+def invocations():
+    payload = request.get_json(force=True)
+    q = (payload.get("q") or "").strip()
+    k = int(payload.get("k", 20))
+    if not q: return jsonify({{"error": "Missing q"}}), 400
+    qv = model.encode([q], normalize_embeddings=True).astype("float32")
+    scores, idxs = index.search(qv, k)
+    items = []
+    for i, s in zip(idxs[0], scores[0]):
+        if i < 0: continue
+        mid = str(ids[int(i)])
+        m = meta.get(mid, {{}})
+        poster = _poster_from(m)
+        if poster and not poster.startswith("http"):
+            poster = TMDB_BASE + poster
+        items.append({{"item_id": mid, "title": _title_from(m), "year": _year_from(m), "posterUrl": poster, "score": float(s)}})
+    return jsonify({{"items": items}})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8082")), debug=False)
+SEMANTIC_APP_EOF
+
+# Build artifacts if they don't exist yet (first boot after fresh deploy)
+if [ ! -f "$SEMANTIC_ART/movies.faiss" ]; then
+  echo "[semantic] No FAISS index found — running embedding job..." >&2
+  DATA_FILE="/mnt/data/semantic_search/movies_colab_last.ndjson"
+  if [ ! -f "$DATA_FILE" ]; then
+    echo "[semantic] ERROR: movie data not found at $DATA_FILE" >&2
+    echo "[semantic] Upload it with: scp movies_colab_last.ndjson root@$PUBLIC_IP:$DATA_FILE" >&2
+  else
+    cat > /tmp/embed_and_index.py << 'EMBED_EOF'
+import sys, os, json, numpy as np
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+import torch, faiss
+
+MODEL_NAME = os.environ.get("ST_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+in_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+out_dir.mkdir(parents=True, exist_ok=True)
+
+ids, texts, meta = [], [], {{}}
+with open(in_path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        m = json.loads(line)
+        ov = (m.get("overview") or "").strip()
+        if not ov: continue
+        mid = int(m["id"])
+        title = m.get("title", "")
+        lang = m.get("original_language", "")
+        genres = " ".join(m.get("genres", []))
+        ids.append(mid)
+        texts.append(f"{{title}}\nLANG:{{lang}}\nGENRES:{{genres}}\n{{ov}}".strip())
+        meta[str(mid)] = {{"title": title, "year": m.get("year"), "poster": m.get("poster_path") or m.get("poster"), "genres": m.get("genres", []), "overview": ov}}
+
+print(f"Encoding {{len(ids)}} movies...", flush=True)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = SentenceTransformer(MODEL_NAME, device=device)
+vecs = model.encode(texts, batch_size=256, show_progress_bar=True, normalize_embeddings=True).astype("float32")
+
+np.save(out_dir / "item_ids.npy", np.array(ids, dtype=np.int64))
+np.save(out_dir / "item_vecs_norm.npy", vecs)
+import shutil; shutil.copy(out_dir / "item_ids.npy", out_dir / "ids.npy")
+with open(out_dir / "meta.json", "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False)
+
+index = faiss.IndexFlatIP(vecs.shape[1])
+index.add(vecs)
+faiss.write_index(index, str(out_dir / "movies.faiss"))
+print(f"Done: {{index.ntotal}} vectors indexed", flush=True)
+EMBED_EOF
+    ST_MODEL="$SEMANTIC_MODEL" python3 /tmp/embed_and_index.py "$DATA_FILE" "$SEMANTIC_ART" \
+      >> /var/log/semantic_embed.log 2>&1 \
+      && echo "[semantic] Embedding complete" >&2 \
+      || echo "[semantic] Embedding failed — check /var/log/semantic_embed.log" >&2
+  fi
+fi
+
+# Write systemd unit for semantic search service
+cat > /etc/systemd/system/semantic-search.service << SEMANTIC_UNIT_EOF
+[Unit]
+Description=FilmForge Semantic Search
+After=network.target
+
+[Service]
+Type=simple
+Environment=MODEL_DIR=$SEMANTIC_ART
+Environment=ST_MODEL=$SEMANTIC_MODEL
+Environment=PORT=$SEMANTIC_PORT
+ExecStart=python3 $SEMANTIC_DIR/app.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+SEMANTIC_UNIT_EOF
+
+systemctl daemon-reload
+systemctl enable --now semantic-search.service
+
+# Wait for it to be ready
+for _ in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:$SEMANTIC_PORT/ping" >/dev/null 2>&1; then
+    echo "[semantic] Server ready on port $SEMANTIC_PORT" >&2
+    break
+  fi
+  sleep 3
+done
+
+echo "SEMANTIC_URL=http://${{PUBLIC_IP}}:${{SEMANTIC_PORT}}"
+) || echo "[semantic] WARNING: semantic-search setup failed — worker deploy continuing without it" >&2
 """
 
 
@@ -2281,6 +2505,18 @@ def verda_deploy(args: argparse.Namespace) -> int:
     if env_exports:
         script = f"{env_exports}\n\n{script}"
 
+    # Upload movie data for semantic search if not already on the volume
+    _movie_data = Path(__file__).parent.parent / "duku 1.0" / "duku-recs" / "data" / "tmdb_raw" / "movies_colab_last.ndjson"
+    if _movie_data.exists():
+        log(f"Uploading movie dataset ({_movie_data.stat().st_size // 1_000_000}MB) for semantic search...")
+        run([*ssh_cmd, "mkdir -p /mnt/data/semantic_search"], check=False)
+        scp_cmd = ["scp", f"-i{identity}", "-o", "StrictHostKeyChecking=no",
+                   "-o", "UserKnownHostsFile=/dev/null", "-o", "GlobalKnownHostsFile=/dev/null",
+                   str(_movie_data), f"root@{ip}:/mnt/data/semantic_search/movies_colab_last.ndjson"]
+        run(scp_cmd, check=False)
+    else:
+        log(f"Movie dataset not found at {_movie_data} — semantic embedding will be skipped on GPU")
+
     log("Running Verda post-boot worker fixup...")
     try:
         remote_result = run([*ssh_cmd, "bash", "-s"], input_text=script, capture_output=True)
@@ -2304,7 +2540,23 @@ def verda_deploy(args: argparse.Namespace) -> int:
     else:
         log("No Verda worker URLs found in post-boot output.")
 
+    # Extract SEMANTIC_URL from script output and update .env
+    semantic_url: str | None = None
+    for line in (remote_result.stdout or "").splitlines():
+        if line.startswith("SEMANTIC_URL="):
+            semantic_url = line.split("=", 1)[1].strip()
+            break
+    if semantic_url:
+        log(f"Semantic search URL: {semantic_url}")
+        print(f"SEMANTIC_URL={semantic_url}")
+
     (SCRIPT_DIR / ".last_ssh_dest").write_text(f"-i {identity} root@{ip}\n")
+
+    if worker_urls and args.backend_env and args.backend_env.exists():
+        update_env_file(args.backend_env, worker_urls[0], semantic_url)
+        log(f"Updated {args.backend_env} with worker + semantic URLs")
+        if backend_is_running(args.backend_root):
+            restart_backend(args.backend_root)
 
     if worker_urls and args.warm_asset_groups and not args.skip_warmup:
         for url in worker_urls:
@@ -2922,13 +3174,16 @@ fi
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument(
+    # Python 3.13 does not allow positional args inside mutually_exclusive_group.
+    # ssh_command is optional/positional; the flags below are the other modes.
+    # Manual conflict check is done after parse_args() below.
+    parser.add_argument(
         "ssh_command",
         nargs="?",
         default=None,
         help="Full SSH command, e.g.: ssh -i ~/.ssh/id_ed25519 -p 22981 root@61.206.39.5",
     )
+    mode = parser.add_mutually_exclusive_group(required=False)
     mode.add_argument(
         "--runpod",
         action="store_true",
@@ -3010,6 +3265,11 @@ def parse_args() -> argparse.Namespace:
         "--vast-gpu",
         default=DEFAULT_VAST_GPU,
         help=f"Preferred Vast GPU name substring. Default: {DEFAULT_VAST_GPU}",
+    )
+    parser.add_argument(
+        "--vast-offer-id",
+        default=None,
+        help="Rent this exact Vast offer id (bypasses search heuristics).",
     )
     parser.add_argument(
         "--vast-max-price",
@@ -3268,6 +3528,14 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+
+    # Manual mutual-exclusion check (Python 3.13 disallows positional in exclusive group)
+    flags = [args.runpod, args.vast, args.verda, args.verda_fresh]
+    if args.ssh_command and any(flags):
+        parser.error("ssh_command cannot be used together with --runpod/--vast/--verda/--verda-fresh")
+    if not args.ssh_command and not any(flags):
+        parser.error("one of ssh_command, --runpod, --vast, --verda, or --verda-fresh is required")
+
     return args
 
 

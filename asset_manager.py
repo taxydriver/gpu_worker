@@ -24,6 +24,12 @@ from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
 LOGGER = logging.getLogger(__name__)
 _DOWNLOAD_STATUS_LOCK = Lock()
 _DOWNLOAD_STATUS: dict[str, object] | None = None
+# Suppress the download banner for the first few seconds of an entry: a warm
+# model that hf_hub_download resumes/verifies briefly reports a non-zero
+# downloaded_bytes against its total before it settles to "already present",
+# flashing a phantom "downloading 22%" that self-corrects. Only surface a
+# status once it has been live past this window.
+_DOWNLOAD_STATUS_MIN_ELAPSED_SEC = 3.0
 _HF_INCOMPLETE_GLOB = "*.incomplete"
 
 # HuggingFace resolve URL pattern: .../resolve/<revision>/<path_in_repo>
@@ -60,7 +66,14 @@ def active_download_status() -> dict[str, object] | None:
     """Return a snapshot of the active model download, if any."""
 
     with _DOWNLOAD_STATUS_LOCK:
-        return dict(_DOWNLOAD_STATUS) if _DOWNLOAD_STATUS else None
+        if not _DOWNLOAD_STATUS:
+            return None
+        elapsed = _DOWNLOAD_STATUS.get("elapsed_sec")
+        if isinstance(elapsed, (int, float)) and elapsed < _DOWNLOAD_STATUS_MIN_ELAPSED_SEC:
+            # Too young to trust: a warm model being resumed/verified flashes a
+            # phantom percentage here. Hide it until it has been live a moment.
+            return None
+        return dict(_DOWNLOAD_STATUS)
 
 
 def _format_bytes(num_bytes: int) -> str:
