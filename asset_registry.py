@@ -84,6 +84,27 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it.safetensors",
         },
     ],
+    # Per-character identity LoRAs (FilmForge-trained, WAN 2.2 I2V). OPT-IN — gated by
+    # the `character_loras` capability (see CAPABILITY_ASSET_GROUPS), which base WAN
+    # deploys do NOT declare. To "also deploy the LoRAs", add it to the worker caps:
+    #   WORKER_CAPABILITIES=flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras
+    # then the worker preloads + serves this group (and /assets/ensure allows warming
+    # it). Workflows reference loras/<character>/... and chain them after the lightx2v
+    # loaders at strength ~0.7. Hosted on a public HF repo (tokenless download, like
+    # every other asset URL). Adding a character = upload its pair + 2 entries here.
+    # See discovery identity-lora-pipeline-2026-06-21 + memory project_identity_lora_pipeline.
+    "character_loras_v1": [
+        {
+            "name": "aigiri_young_i2v_high_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/aigiri/aigiri_young_i2v_v1_high_noise.safetensors",
+            "url": "https://huggingface.co/taxydriver/filmforge-loras/resolve/main/aigiri/aigiri_young_i2v_v1_high_noise.safetensors",
+        },
+        {
+            "name": "aigiri_young_i2v_low_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/aigiri/aigiri_young_i2v_v1_low_noise.safetensors",
+            "url": "https://huggingface.co/taxydriver/filmforge-loras/resolve/main/aigiri/aigiri_young_i2v_v1_low_noise.safetensors",
+        },
+    ],
 }
 
 
@@ -100,6 +121,11 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "ltx_t2v": ["ltx_i2v_v1"],
     "ltx2_3": ["ltx_i2v_v1"],
     "ltx_i2v_v1": ["ltx_i2v_v1"],
+    # Opt-in: a worker only provisions/serves character LoRAs when it DECLARES this
+    # capability (WORKER_CAPABILITIES=...,character_loras). Not implied by wan_i2v,
+    # so base WAN deploys stay lean; deploy with it to "also deploy the LoRAs".
+    "character_loras": ["character_loras_v1"],
+    "character_loras_v1": ["character_loras_v1"],
 }
 
 
