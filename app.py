@@ -114,30 +114,46 @@ _VRAM_FLOOR_MIB: dict[str, int] = {
 }
 
 
-def _free_vram_mib() -> int | None:
-    """Return free VRAM in MiB via nvidia-smi. Returns None if unavailable."""
+def _own_gpu_index() -> int:
+    """Physical GPU index this worker owns. nvidia-smi ignores CUDA_VISIBLE_DEVICES
+    and lists ALL GPUs, so on a multi-GPU box we must index by it ourselves — else
+    every worker reads physical GPU 0's VRAM and they all reject/accept in lockstep.
+    """
+    cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not cvd:
+        return 0
+    first = cvd.split(",")[0].strip()
+    try:
+        return int(first)
+    except ValueError:
+        return 0
+
+
+def _query_vram_mib(field: str) -> int | None:
+    """Return memory.<field> in MiB for THIS worker's GPU via nvidia-smi."""
     try:
         out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            ["nvidia-smi", f"--query-gpu=memory.{field}", "--format=csv,noheader,nounits"],
             timeout=3,
             stderr=subprocess.DEVNULL,
         )
-        return int(out.decode().strip().splitlines()[0])
+        lines = out.decode().strip().splitlines()
+        idx = _own_gpu_index()
+        if 0 <= idx < len(lines):
+            return int(lines[idx])
+        return int(lines[0])
     except Exception:
         return None
+
+
+def _free_vram_mib() -> int | None:
+    """Return free VRAM in MiB for this worker's GPU. None if unavailable."""
+    return _query_vram_mib("free")
 
 
 def _total_vram_mib() -> int | None:
-    """Return total VRAM in MiB via nvidia-smi. Returns None if unavailable."""
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            timeout=3,
-            stderr=subprocess.DEVNULL,
-        )
-        return int(out.decode().strip().splitlines()[0])
-    except Exception:
-        return None
+    """Return total VRAM in MiB for this worker's GPU. None if unavailable."""
+    return _query_vram_mib("total")
 
 
 def _effective_vram_floor(canonical_group: str) -> int | None:
