@@ -136,6 +136,18 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_fun_vace_low_noise_14B_fp8_scaled.safetensors",
         },
     ],
+    # ESRGAN upscaler for the identity-quality FINISHING pass (4x then downscale to
+    # net 2x → film clarity, identity-safe — no diffusion). OPT-IN via `finishing` cap.
+    # The finish workflow (render.py finish_clip) loads it by filename through native
+    # UpscaleModelLoader, so it just needs to be on disk. ~64MB. See discovery
+    # project_wan_identity_quality.
+    "finishing_v1": [
+        {
+            "name": "upscale_4x_ultrasharp",
+            "path": "/workspace/ComfyUI/models/upscale_models/4x-UltraSharp.pth",
+            "url": "https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth",
+        },
+    ],
 }
 
 
@@ -161,6 +173,9 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     # Declare WORKER_CAPABILITIES=...,wan_vace to provision/serve it. Not implied by wan_i2v.
     "wan_vace": ["wan_vace_v1"],
     "wan_vace_v1": ["wan_vace_v1"],
+    # Opt-in: ESRGAN upscaler for the quality finishing pass.
+    "finishing": ["finishing_v1"],
+    "finishing_v1": ["finishing_v1"],
 }
 
 
