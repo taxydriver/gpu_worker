@@ -104,6 +104,37 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "path": "/workspace/ComfyUI/models/loras/aigiri/aigiri_young_i2v_v1_low_noise.safetensors",
             "url": "https://huggingface.co/taxydriver/filmforge-loras/resolve/main/aigiri/aigiri_young_i2v_v1_low_noise.safetensors",
         },
+        {
+            "name": "swami_i2v_high_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/swami/swami_i2v_v1_high_noise.safetensors",
+            "url": "https://huggingface.co/taxydriver/filmforge-loras/resolve/main/swami/swami_i2v_v1_high_noise.safetensors",
+        },
+        {
+            "name": "swami_i2v_low_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/swami/swami_i2v_v1_low_noise.safetensors",
+            "url": "https://huggingface.co/taxydriver/filmforge-loras/resolve/main/swami/swami_i2v_v1_low_noise.safetensors",
+        },
+    ],
+    # Fun-VACE module for WAN 2.2 — reference-image identity conditioning for the boys /
+    # extras / one-offs (training-free, ControlNet-style). Mirrors the WAN 2.2 dual-expert
+    # structure (high/low), fp8_scaled ~17.3 GB each. OPT-IN — gated by the `wan_vace`
+    # capability (see CAPABILITY_ASSET_GROUPS), NOT implied by wan_i2v, so base WAN deploys
+    # stay lean. The VACE workflow swaps WanImageToVideo -> WanVaceToVideo and points the
+    # UNETLoaders at these modules; leads' LoRAs still chain after the lightx2v loaders, so
+    # a lead (LoRA) + a boy (VACE ref) compose in the same shot. Hosted on Comfy-Org HF
+    # (tokenless). See discovery vace-boys-identity-design-2026-06-21 + memory
+    # project_identity_lora_pipeline.
+    "wan_vace_v1": [
+        {
+            "name": "wan22_fun_vace_high_noise",
+            "path": "/workspace/ComfyUI/models/diffusion_models/wan2.2_fun_vace_high_noise_14B_fp8_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_fun_vace_high_noise_14B_fp8_scaled.safetensors",
+        },
+        {
+            "name": "wan22_fun_vace_low_noise",
+            "path": "/workspace/ComfyUI/models/diffusion_models/wan2.2_fun_vace_low_noise_14B_fp8_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_fun_vace_low_noise_14B_fp8_scaled.safetensors",
+        },
     ],
 }
 
@@ -126,6 +157,10 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     # so base WAN deploys stay lean; deploy with it to "also deploy the LoRAs".
     "character_loras": ["character_loras_v1"],
     "character_loras_v1": ["character_loras_v1"],
+    # Opt-in: Fun-VACE module for reference-image identity conditioning (the boys).
+    # Declare WORKER_CAPABILITIES=...,wan_vace to provision/serve it. Not implied by wan_i2v.
+    "wan_vace": ["wan_vace_v1"],
+    "wan_vace_v1": ["wan_vace_v1"],
 }
 
 
