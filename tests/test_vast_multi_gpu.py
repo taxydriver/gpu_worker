@@ -77,6 +77,37 @@ def test_select_vast_offer_falls_back_when_requested_multi_gpu_is_unavailable(mo
     assert selected["id"] == "single"
 
 
+def test_multi_gpu_script_is_gpu_agnostic_and_starts_comfy_per_gpu() -> None:
+    """The multi-GPU script must auto-detect physical GPUs and provision a
+    comfyui + worker systemd unit per GPU — the bug was the SSH path using the
+    legacy single-worker remote_script (no ComfyUI, one worker on 9000)."""
+    script = deploy_gpu.vast_multi_gpu_script(
+        remote_root="/workspace/filmforge_gpu_worker",
+        worker_port=9000,
+        comfy_port=18188,
+        worker_count=0,  # 0 = auto-detect from PHYSICAL_GPU_COUNT
+    )
+    # GPU-agnostic: count comes from the box, not a hardcoded number.
+    assert "PHYSICAL_GPU_COUNT=" in script
+    assert 'nvidia-smi -L' in script
+    # One comfyui + one worker unit per GPU, pinned via CUDA_VISIBLE_DEVICES.
+    assert "comfyui-gpu${idx}.service" in script
+    assert "filmforge-worker-gpu${idx}.service" in script
+    assert "CUDA_VISIBLE_DEVICES=${idx}" in script
+    # Distinct per-GPU worker id (not a single shared RENDER_BROKER_WORKER_ID).
+    assert "WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${idx}.id" in script
+    # Honors WORKER_PUBLIC_URLS so every gpuN gets a routable public URL.
+    assert "WORKER_PUBLIC_URLS" in script
+
+
+def test_legacy_single_worker_script_does_not_start_comfy() -> None:
+    """Regression guard: the legacy remote_script never starts ComfyUI (it only
+    waits for one) and pins a single worker — must NOT be used for multi-GPU."""
+    script = deploy_gpu.remote_script("/workspace/filmforge_gpu_worker", 9000)
+    assert "filmforge-worker-gpu" not in script  # no per-GPU systemd units
+    assert "PHYSICAL_GPU_COUNT" not in script  # not GPU-aware
+
+
 def test_extract_worker_urls_deduplicates_aggregate_and_per_worker_lines() -> None:
     output = "\n".join(
         [

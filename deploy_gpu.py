@@ -626,10 +626,19 @@ fi
 # new features (e.g. sqlalchemy/alembic for its local DB). Without this, fresh
 # VMs that rehydrate an existing volume can crash-loop with ModuleNotFoundError.
 echo "Installing/updating ComfyUI requirements..." >&2
-"$COMFY_PYTHON" -m pip install -q -r "$COMFY_ROOT/requirements.txt" 2>&1 | tail -5 || true
+# Write to a log instead of piping to `tail`: under `set -o pipefail` a SIGPIPE
+# from the closed `tail` read-end (141) propagated out and aborted the whole
+# `ssh ... bash -s` deploy at this step. Tail the file afterwards (no pipe on
+# the long-running command).
+"$COMFY_PYTHON" -m pip install -q -r "$COMFY_ROOT/requirements.txt" > /tmp/comfy_reqs_install.log 2>&1 || true
+tail -5 /tmp/comfy_reqs_install.log >&2 || true
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
-VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+# Query GPU 0 only (-i 0) instead of piping all GPUs to `head -1`: on a multi-GPU
+# box, `nvidia-smi | head -1` races — head closes after one line and SIGPIPEs
+# nvidia-smi, which under `set -o pipefail` returns 141 and aborts the deploy.
+# This is why the deploy worked on 1-2 GPU boxes but failed on 8.
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 | awk '{{printf "%.0f", $1 / 1024}}')"
 PUBLIC_URLS="${{WORKER_PUBLIC_URLS:-}}"
 mkdir -p /etc/systemd/system
 
@@ -1865,8 +1874,12 @@ if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
   exit 1
 fi
 
-GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | xargs)"
-VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1 | awk '{{printf "%.0f", $1 / 1024}}')"
+# Query GPU 0 only (-i 0) instead of piping all GPUs to `head -1`: on a multi-GPU
+# box, `nvidia-smi | head -1` races — head closes after one line and SIGPIPEs
+# nvidia-smi, which under `set -o pipefail` returns 141 and aborts the deploy.
+# This is why the deploy worked on 1-2 GPU boxes but failed on 8.
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | xargs)"
+VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 | awk '{{printf "%.0f", $1 / 1024}}')"
 
 # Choose ComfyUI VRAM flag based on detected VRAM.
 # Total model footprint (Flux dev ~24 GB + WAN21 ~14 GB + encoders ~7 GB) is ~45 GB.
@@ -3078,8 +3091,17 @@ fi
             getattr(args, "_vast_effective_worker_count", 0) or requested_vast_workers or 1
         )
         is_vast_multi = effective_vast_workers > 1
+        # Plain-SSH deploys (no --vast/--verda) previously always fell back to the
+        # legacy single-worker remote_script, which never starts ComfyUI and pins
+        # one worker to port 9000 — wrong for any multi-GPU box. --worker-count
+        # routes the SSH path through the GPU-agnostic systemd script instead.
+        # -1 (default) auto-detects the box's physical GPUs remotely (worker_count=0
+        # tells the script to use PHYSICAL_GPU_COUNT); 1 keeps the legacy flow.
+        worker_count_requested = int(getattr(args, "worker_count", -1))
+        is_ssh_multi = worker_count_requested != 1
+        is_multi = is_vast_multi or is_ssh_multi
         auto_env_keys = ["FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "WORKER_CAPABILITIES"]
-        if not is_vast_multi:
+        if not is_multi:
             auto_env_keys.append("RENDER_BROKER_WORKER_ID")
         for key in auto_env_keys:
             if key not in existing_keys:
@@ -3094,6 +3116,42 @@ fi
                 worker_port=args.worker_port,
                 comfy_port=args.vast_comfy_port,
                 worker_count=effective_vast_workers,
+            )
+        elif is_ssh_multi:
+            # worker_count_requested == -1 means auto-detect: pass 0 to the script
+            # so it uses the box's PHYSICAL_GPU_COUNT.
+            script_worker_count = max(worker_count_requested, 0)
+            # The multi-GPU script only stamps WORKER_PUBLIC_URL on gpu0 unless we
+            # supply WORKER_PUBLIC_URLS. On an SSH box with a public IP, every
+            # gpuN needs its own http://<ip>:<port> so the backend can route to it.
+            gpu_count = script_worker_count
+            if gpu_count == 0:
+                try:
+                    probe = run(
+                        [*ssh_cmd, "nvidia-smi", "-L"],
+                        capture_output=True,
+                    )
+                    gpu_count = len([
+                        line for line in probe.stdout.splitlines() if line.startswith("GPU ")
+                    ])
+                except subprocess.CalledProcessError:
+                    gpu_count = 0
+            host = destination.split("@")[-1] if destination else ""
+            if host and gpu_count > 0 and "WORKER_PUBLIC_URLS" not in existing_keys:
+                urls = ",".join(
+                    f"http://{host}:{args.worker_port + i}" for i in range(gpu_count)
+                )
+                env_vars.append(f"WORKER_PUBLIC_URLS={urls}")
+                log(f"SSH multi-GPU: set WORKER_PUBLIC_URLS for {gpu_count} GPU(s)")
+            log(
+                "SSH multi-GPU deploy: using systemd multi-GPU script "
+                f"(worker_count={'auto' if script_worker_count == 0 else script_worker_count})"
+            )
+            script = vast_multi_gpu_script(
+                remote_root=args.remote_root,
+                worker_port=args.worker_port,
+                comfy_port=args.vast_comfy_port,
+                worker_count=script_worker_count,
             )
         else:
             script = remote_script(args.remote_root, args.worker_port)
@@ -3474,6 +3532,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=9000,
         help="Remote local port for the GPU worker. Default: 9000",
+    )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=int(os.getenv("WORKER_COUNT", "-1")),
+        help=(
+            "Number of GPU workers to provision over an SSH deploy. "
+            "-1 (default) auto-detects the box's physical GPUs and uses the "
+            "multi-GPU systemd script when more than one GPU is present; "
+            "1 forces the legacy single-worker flow."
+        ),
     )
     parser.add_argument(
         "--backend-env",
