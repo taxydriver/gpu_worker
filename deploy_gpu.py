@@ -1835,7 +1835,10 @@ fi
 for _wr in /opt/filmforge_gpu_worker /workspace/filmforge_gpu_worker; do
   if test -d "$_wr/.git"; then
     echo "[verda] git pull in $_wr..." >&2
-    GIT_TERMINAL_PROMPT=0 git -C "$_wr" pull --ff-only 2>&1 || true
+    # </dev/null + GIT_PAGER=cat: this whole script is piped into `ssh ... bash -s`,
+    # so git MUST NOT inherit stdin — its ssh child / pager would consume the rest of
+    # the script, truncating worker-service creation and SIGPIPE-killing the deploy (141).
+    GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat git -C "$_wr" pull --ff-only </dev/null 2>&1 || true
     break
   fi
 done
@@ -2278,10 +2281,10 @@ if test -b /dev/vdb; then
 fi
 
 if test -d "$WORKER_ROOT/.git"; then
-  git -C "$WORKER_ROOT" pull --ff-only || true
+  GIT_PAGER=cat git -C "$WORKER_ROOT" pull --ff-only </dev/null || true
 else
   rm -rf "$WORKER_ROOT"
-  GIT_TERMINAL_PROMPT=0 git clone "$WORKER_REPO_URL" "$WORKER_ROOT"
+  GIT_TERMINAL_PROMPT=0 git clone "$WORKER_REPO_URL" "$WORKER_ROOT" </dev/null
 fi
 ln -sfn "$WORKER_ROOT" /opt/gpu_worker
 
@@ -2292,7 +2295,7 @@ fi
 "$WORKER_ROOT/.venv/bin/python" -m pip install -r "$WORKER_ROOT/requirements.txt"
 
 if test -d "$COMFY_ROOT/.git"; then
-  git -C "$COMFY_ROOT" pull --ff-only || true
+  GIT_PAGER=cat git -C "$COMFY_ROOT" pull --ff-only </dev/null || true
 else
   rm -rf "$COMFY_ROOT"
   GIT_TERMINAL_PROMPT=0 git clone "$COMFY_REPO_URL" "$COMFY_ROOT"
