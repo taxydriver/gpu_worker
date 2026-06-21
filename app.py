@@ -873,19 +873,18 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
 
     # Pre-flight VRAM check — fast-reject before acquiring execution slot so
     # the broker can immediately route to a worker that has headroom.
-    # SKIP it when the SAME model family is already resident: that job reuses the
-    # warm model (see _free_vram_on_group_switch) and needs only activation room,
-    # not a fresh load. The floor sizes a COLD load; applying it to a reuse wedges
-    # back-to-back same-group jobs (e.g. WAN→WAN) — the resident model itself leaves
-    # < floor free, so every job after the first is falsely rejected. Only gate a
-    # genuine cold/cross-family load.
+    # SKIP it whenever a model is ALREADY resident — the worker manages its own
+    # VRAM inside the execution slot: same family → reuse the warm model (needs
+    # only activation room); different family → _free_vram_on_group_switch unloads
+    # the old model FIRST, freeing the card before the new load. The floor sizes a
+    # COLD load and runs BEFORE that unload, so on a family switch the still-resident
+    # old model (~37GB) leaves < floor free and falsely rejects a switch that would
+    # actually have room. Only gate a GENUINE cold start (no resident model) where
+    # free < floor means something else is eating VRAM.
     canonical_group = canonical_asset_group(request.asset_group)
     vram_floor = _effective_vram_floor(canonical_group)
-    resident_same_family = (
-        _LAST_ASSET_GROUP is not None
-        and canonical_asset_group(_LAST_ASSET_GROUP) == canonical_group
-    )
-    if vram_floor is not None and not resident_same_family:
+    model_resident = _LAST_ASSET_GROUP is not None
+    if vram_floor is not None and not model_resident:
         free_mib = _free_vram_mib()
         if free_mib is not None and free_mib < vram_floor:
             timings.total_sec = time.monotonic() - total_started
