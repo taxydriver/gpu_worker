@@ -129,6 +129,22 @@ class ComfyInputFile(BaseModel):
     subfolder: str = ""
 
 
+class ClipKeyframe(BaseModel):
+    """One sampled frame from a video output, carried inline so the backend
+    never has to download + ffmpeg-decode the clip itself."""
+
+    timestamp_sec: float
+    image_b64: str
+    mime: str = "image/png"
+
+
+class ClipKeyframes(BaseModel):
+    """Keyframes the worker extracted for one video output."""
+
+    output_filename: str
+    frames: list[ClipKeyframe] = Field(default_factory=list)
+
+
 class RunResponse(BaseModel):
     """Structured response for a worker run."""
 
@@ -140,6 +156,9 @@ class RunResponse(BaseModel):
     comfy_prompt_id: str | None
     outputs: list[str]
     output_files: list[OutputFile] = Field(default_factory=list)
+    # Worker-extracted keyframes for any video outputs (inline base64). The
+    # backend uses these for observation instead of re-downloading + ffmpeg.
+    keyframes: list[ClipKeyframes] = Field(default_factory=list)
     timings: RunTimings
     debug: RunDebug
     error: str | None = None

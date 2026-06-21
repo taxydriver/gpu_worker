@@ -42,8 +42,11 @@ from gpu_worker.comfy_process import (
     run_gpu_smoke_test,
 )
 from gpu_worker.config import get_settings
+from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.schemas import (
     ActiveJobSummary,
+    ClipKeyframe,
+    ClipKeyframes,
     EnsureAssetGroupResult,
     EnsureAssetsRequest,
     EnsureAssetsResponse,
@@ -1057,6 +1060,24 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
 
         outputs = collect_output_paths(history)
         output_files = build_output_files(outputs)
+
+        # Extract observation keyframes here (the worker has the video on disk +
+        # ffmpeg) so the backend never re-downloads + ffmpeg-decodes the clip.
+        keyframes: list[ClipKeyframes] = []
+        for of in output_files:
+            if not is_video_output(of.path):
+                continue
+            try:
+                frames = extract_keyframes_b64(of.path)
+            except Exception as exc:  # never fail a render over keyframes
+                LOGGER.warning("keyframe extraction failed for %s: %s", of.filename, exc)
+                frames = []
+            if frames:
+                keyframes.append(ClipKeyframes(
+                    output_filename=of.filename,
+                    frames=[ClipKeyframe(**f) for f in frames],
+                ))
+
         timings.total_sec = time.monotonic() - total_started
 
         # NB: we deliberately do NOT flush VRAM here. With --highvram the model
@@ -1075,6 +1096,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             comfy_prompt_id=prompt_id,
             outputs=outputs,
             output_files=output_files,
+            keyframes=keyframes,
             timings=timings,
             debug=RunDebug(
                 history_found=history_found,
