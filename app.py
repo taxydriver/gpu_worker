@@ -127,6 +127,36 @@ def _free_vram_mib() -> int | None:
         return None
 
 
+def _total_vram_mib() -> int | None:
+    """Return total VRAM in MiB via nvidia-smi. Returns None if unavailable."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            timeout=3,
+            stderr=subprocess.DEVNULL,
+        )
+        return int(out.decode().strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def _effective_vram_floor(canonical_group: str) -> int | None:
+    """VRAM floor for a cold load, capped to the card's capacity.
+
+    The configured floors size a COLD load on a big (96GB) card. On smaller cards
+    (e.g. 40GB A100) WAN/FLUX still run via CPU offload, but a floor above the
+    card's total VRAM is unsatisfiable and would reject every cold job. Cap the
+    floor at 90% of total VRAM so it scales to the GPU instead of hard-failing.
+    """
+    floor = _VRAM_FLOOR_MIB.get(canonical_group)
+    if floor is None:
+        return None
+    total = _total_vram_mib()
+    if total is not None:
+        floor = min(floor, int(total * 0.9))
+    return floor
+
+
 # ── Active-job tracking (used by watchdog to avoid restarting mid-run) ────────
 _ACTIVE_JOBS_LOCK = threading.Lock()
 _ACTIVE_JOBS: int = 0  # count of jobs currently executing
@@ -833,7 +863,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     # < floor free, so every job after the first is falsely rejected. Only gate a
     # genuine cold/cross-family load.
     canonical_group = canonical_asset_group(request.asset_group)
-    vram_floor = _VRAM_FLOOR_MIB.get(canonical_group)
+    vram_floor = _effective_vram_floor(canonical_group)
     resident_same_family = (
         _LAST_ASSET_GROUP is not None
         and canonical_asset_group(_LAST_ASSET_GROUP) == canonical_group
