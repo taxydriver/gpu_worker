@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -43,6 +45,7 @@ from gpu_worker.comfy_process import (
 )
 from gpu_worker.config import get_settings
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
+from gpu_worker.stitch import stitch_clips, upload_via_signed_put
 from gpu_worker.schemas import (
     ActiveJobSummary,
     ClipKeyframe,
@@ -60,6 +63,8 @@ from gpu_worker.schemas import (
     RunResponse,
     RunTimings,
     StatsResponse,
+    StitchRequest,
+    StitchResponse,
 )
 
 
@@ -1163,6 +1168,32 @@ def run_job(request: RunRequest, _: None = Depends(_require_worker_api_token)) -
     """Run a job synchronously and return the final worker response."""
 
     return _execute_run(request)
+
+
+@app.post("/stitch", response_model=StitchResponse)
+def stitch_job(request: StitchRequest, _: None = Depends(_require_worker_api_token)) -> StitchResponse:
+    """Stitch a rough cut on the box and upload it straight to storage.
+
+    Keeps the API backend out of the video path entirely — no clip downloads,
+    no ffmpeg, no bytes through it. Always cleans up its temp dir.
+    """
+    work_dir = tempfile.mkdtemp(prefix="ff_stitch_")
+    try:
+        out_path, meta = stitch_clips(
+            clips=[c.model_dump() for c in request.clips],
+            audio_url=request.audio_url,
+            width=request.width,
+            height=request.height,
+            fps=request.fps,
+            work_dir=work_dir,
+        )
+        upload_via_signed_put(request.signed_put_url, out_path, request.content_type)
+        return StitchResponse(ok=True, job_id=request.job_id, public_url=request.public_url, metadata=meta)
+    except Exception as exc:  # noqa: BLE001 — return ok=False so the backend can fall back
+        LOGGER.exception("[stitch] failed job=%s", request.job_id)
+        return StitchResponse(ok=False, job_id=request.job_id, error=f"{type(exc).__name__}: {exc}")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @app.post("/jobs", response_model=JobSubmitResponse)

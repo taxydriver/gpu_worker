@@ -205,3 +205,43 @@ class JobStatusResponse(BaseModel):
     result: RunResponse | None = None
     error: str | None = None
     progress: JobProgressResponse | None = None
+
+
+class StitchClip(BaseModel):
+    """One clip in the ordered stitch sequence (fetched by URL on the worker)."""
+
+    url: str
+    edit_in_sec: float | None = None
+    edit_out_sec: float | None = None
+    target_duration_sec: float | None = None
+    source_duration_sec: float | None = None
+
+
+class StitchRequest(BaseModel):
+    """Stitch a rough cut on the worker and upload it straight to storage.
+
+    The backend fetches nothing and stores no bytes: it mints ``signed_put_url``
+    (a Supabase signed upload URL for a deterministic path) and the worker PUTs
+    the finished video there. v1 = video concat + score-only audio mux; foley is
+    deferred (backend will pass a pre-resolved filter spec later).
+    """
+
+    job_id: str
+    clips: list[StitchClip]
+    audio_url: str | None = None
+    width: int = 768
+    height: int = 432
+    fps: int = 24
+    signed_put_url: str
+    public_url: str | None = None
+    content_type: str = "video/mp4"
+
+
+class StitchResponse(BaseModel):
+    """Result of a worker stitch. ``ok=False`` lets the backend fall back."""
+
+    ok: bool
+    job_id: str
+    public_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
