@@ -80,6 +80,21 @@ class EnsureAssetsResponse(BaseModel):
     restart_performed: bool = False
 
 
+class OutputUploadTarget(BaseModel):
+    """Where the worker should PUT its produced output (ADR-0002 media-offload).
+
+    The backend mints a Supabase signed upload URL for a deterministic path and
+    passes it in; the worker PUTs the file there with **no storage credentials of
+    its own** and echoes ``public_url`` back on the OutputFile so the backend
+    records the URL without downloading + re-uploading. Same creds-off-the-box
+    pattern as ``/stitch``. Absent → the worker behaves exactly as before (the
+    backend downloads via ``/files``)."""
+
+    signed_put_url: str
+    public_url: str
+    content_type: str = "application/octet-stream"
+
+
 class RunRequest(BaseModel):
     """Request payload for a worker run."""
 
@@ -89,6 +104,8 @@ class RunRequest(BaseModel):
     comfy_input_files: list["ComfyInputFile"] = Field(default_factory=list)
     timeout_sec: int = 3600
     poll_interval_sec: float = 2.0
+    # When set, the worker uploads its primary output straight to storage.
+    output_upload: "OutputUploadTarget | None" = None
 
 
 class RunTimings(BaseModel):
@@ -114,6 +131,9 @@ class OutputFile(BaseModel):
     path: str
     filename: str
     download_url: str
+    # Set when the worker uploaded this output straight to storage (option A):
+    # the public URL the backend records instead of downloading via download_url.
+    storage_url: str | None = None
 
 
 class ComfyInputFile(BaseModel):

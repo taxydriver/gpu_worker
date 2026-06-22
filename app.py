@@ -58,6 +58,8 @@ from gpu_worker.schemas import (
     JobProgressResponse,
     JobStatusResponse,
     JobSubmitResponse,
+    OutputFile,
+    OutputUploadTarget,
     RunDebug,
     RunRequest,
     RunResponse,
@@ -854,6 +856,36 @@ def _free_vram_on_group_switch(asset_group: str) -> None:
         free_comfy_memory(unload_models=True)
 
 
+def _maybe_upload_primary_output(
+    output_files: list[OutputFile],
+    output_upload: OutputUploadTarget | None,
+    *,
+    job_id: str,
+) -> list[OutputFile]:
+    """ADR-0002 media offload: PUT the primary output straight to storage.
+
+    When ``output_upload`` is set, PUT ``output_files[0]`` to the backend-minted
+    signed URL and stamp its ``storage_url`` so the backend records the URL
+    instead of downloading + re-uploading. On any failure (or no target / no
+    outputs) the list is returned unchanged — ``storage_url`` stays None and the
+    backend falls back to its ``/files`` download. Never raises."""
+    if output_upload is None or not output_files:
+        return output_files
+    primary = output_files[0]
+    try:
+        upload_via_signed_put(output_upload.signed_put_url, primary.path, output_upload.content_type)
+    except Exception as exc:  # noqa: BLE001 — degrade to backend download
+        LOGGER.warning(
+            "[output_upload] job=%s failed for %s: %s — backend will download via /files",
+            job_id, primary.filename, exc,
+        )
+        return output_files
+    LOGGER.info("[output_upload] job=%s uploaded %s -> %s", job_id, primary.filename, output_upload.public_url)
+    updated = list(output_files)
+    updated[0] = primary.model_copy(update={"storage_url": output_upload.public_url})
+    return updated
+
+
 def _execute_run(request: RunRequest, progress: JobProgressResponse | None = None) -> RunResponse:
     """Ensure assets, run a ComfyUI prompt, and report structured results."""
 
@@ -1082,6 +1114,14 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
                     output_filename=of.filename,
                     frames=[ClipKeyframe(**f) for f in frames],
                 ))
+
+        # Media offload (ADR-0002): when the backend minted a signed upload URL,
+        # PUT the primary output straight to storage so the 2 GB API box never
+        # downloads + re-uploads it. On any failure the output keeps storage_url
+        # unset and the backend falls back to its /files download + re-upload.
+        output_files = _maybe_upload_primary_output(
+            output_files, request.output_upload, job_id=request.job_id
+        )
 
         timings.total_sec = time.monotonic() - total_started
 
