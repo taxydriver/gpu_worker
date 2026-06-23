@@ -4070,8 +4070,9 @@ const CONFIG_FIELDS = [
     {value: '120', label: '120s'},
     {value: '300', label: '300s'},
   ]},
-  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio,ltx_i2v', options: [
-    {value: 'flux2_stills,wan_i2v,stable_audio,ltx_i2v', label: 'Flux + WAN + Audio + LTX (all)'},
+  {key: 'WORKER_CAPABILITIES', label: 'Capabilities', type: 'select', selectId: 'cfg-capabilities', defaultValue: 'flux2_stills,wan_i2v,stable_audio,ltx_i2v,character_loras', options: [
+    {value: 'flux2_stills,wan_i2v,stable_audio,ltx_i2v,character_loras', label: 'Flux + WAN + Audio + LTX + LoRAs (all)'},
+    {value: 'flux2_stills,wan_i2v,stable_audio,ltx_i2v', label: 'Flux + WAN + Audio + LTX'},
     {value: 'flux2_stills,wan_i2v,stable_audio', label: 'Flux + WAN + Audio'},
     {value: 'wan_i2v,ltx_i2v', label: 'WAN + LTX (video)'},
     {value: 'flux2_stills,wan_i2v', label: 'Flux + WAN'},

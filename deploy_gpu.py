@@ -445,7 +445,7 @@ test -n "${{WORKER_NAME:-}}" && ENV_VARS+=(WORKER_NAME="${{WORKER_NAME}}")
 test -n "${{WORKER_PUBLIC_URL:-}}" && ENV_VARS+=(WORKER_PUBLIC_URL="${{WORKER_PUBLIC_URL}}")
 test -n "${{WORKER_GPU_NAME:-}}" && ENV_VARS+=(WORKER_GPU_NAME="${{WORKER_GPU_NAME}}")
 test -n "${{WORKER_VRAM_GB:-}}" && ENV_VARS+=(WORKER_VRAM_GB="${{WORKER_VRAM_GB}}")
-ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}")
+ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}")
 test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && ENV_VARS+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
 test -n "${{WORKER_API_TOKEN:-}}" && ENV_VARS+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
 
@@ -670,7 +670,7 @@ start_worker_no_systemd() {{
   worker_env+=(WORKER_PROVIDER="vast")
   worker_env+=(WORKER_GPU_NAME="$GPU_NAME")
   worker_env+=(WORKER_VRAM_GB="$VRAM_GB")
-  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}")
+  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}")
   worker_env+=(WORKER_ID_FILE="/workspace/.filmforge_worker_gpu${{idx}}.id")
   worker_env+=(MODEL_DOWNLOAD_TIMEOUT_SEC="7200")
   worker_env+=(COMFY_HEALTH_TIMEOUT_SEC="180")
@@ -739,7 +739,7 @@ Environment=WORKER_NAME=filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=vast
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}"
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
 Environment=COMFY_HEALTH_TIMEOUT_SEC=180
@@ -1942,7 +1942,7 @@ Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=verda
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio,ltx_i2v}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio,ltx_i2v,character_loras}}"
 Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
