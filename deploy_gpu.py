@@ -55,7 +55,7 @@ DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 _TORCH_PIN = "torch==2.11.0"
 _TORCHVISION_PIN = "torchvision==0.26.0"
 _TORCHAUDIO_PIN = "torchaudio==2.11.0"
-DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1", "ltx_i2v_v1"]
+DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1", "ltx_i2v_v1", "character_loras_v1"]
 
 # Ordered list of candidate identity files to try when none is specified
 _CANDIDATE_IDENTITIES = [
