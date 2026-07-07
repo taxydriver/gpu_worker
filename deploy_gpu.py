@@ -526,10 +526,67 @@ if test -n "$WORKER_URL" && test -z "$PRESET_PUBLIC_URL"; then
   echo "Worker restarted with public URL" >&2
 fi
 
+# ── Optional Qwen3-VL vision sidecar (opt-in via ENABLE_QWEN_SIDECAR) ─────────
+# Runs vLLM (OpenAI-compatible) alongside ComfyUI on the SAME GPU. VRAM is capped
+# via --gpu-memory-utilization so the vision server never starves the render
+# models. Exposed on its own cloudflared tunnel; the URL (with /v1) is printed as
+# QWEN_URL for the deployer to write into the backend's QWEN_BASE_URL.
+QWEN_URL=""
+if test "${{ENABLE_QWEN_SIDECAR:-}}" = "true"; then
+  if command -v docker >/dev/null 2>&1; then
+    QWEN_MODEL="${{QWEN_MODEL:-Qwen/Qwen3-VL-8B-Instruct}}"
+    QWEN_GPU_FRACTION="${{QWEN_GPU_FRACTION:-0.25}}"
+    mkdir -p /workspace/hf_cache
+    echo "Starting Qwen3-VL vision sidecar ($QWEN_MODEL, gpu-frac=$QWEN_GPU_FRACTION)..." >&2
+    docker rm -f qwen-vision >/dev/null 2>&1 || true
+    docker run -d --name qwen-vision --gpus all -p 8000:8000 \\
+      -v /workspace/hf_cache:/root/.cache/huggingface \\
+      --shm-size 8g --restart unless-stopped \\
+      vllm/vllm-openai:latest \\
+      "$QWEN_MODEL" \\
+      --served-model-name "$QWEN_MODEL" \\
+      --trust-remote-code \\
+      --max-model-len 16384 \\
+      --gpu-memory-utilization "$QWEN_GPU_FRACTION" \\
+      --limit-mm-per-prompt '{{"image": 4}}' >/dev/null 2>&1 || true
+    echo "Waiting for Qwen vision server (up to ~5 min for first model download)..." >&2
+    for _ in $(seq 1 60); do
+      if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+        echo "Qwen vision server healthy" >&2
+        break
+      fi
+      sleep 5
+    done
+    if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1 && test -x /opt/instance-tools/bin/cloudflared; then
+      pkill -f "cloudflared tunnel --url http://127.0.0.1:8000" || true
+      sleep 2
+      >/tmp/filmforge_qwen_tunnel.log
+      nohup /opt/instance-tools/bin/cloudflared tunnel --url "http://127.0.0.1:8000" --no-autoupdate \\
+        >/tmp/filmforge_qwen_tunnel.log 2>&1 </dev/null &
+      for _ in $(seq 1 30); do
+        if grep -aEo 'https://[-a-z0-9]+\\.trycloudflare\\.com' /tmp/filmforge_qwen_tunnel.log | tail -n 1 >/tmp/filmforge_qwen_tunnel_url.txt 2>/dev/null; then
+          QWEN_URL="$(tr -d '\\000' </tmp/filmforge_qwen_tunnel_url.txt)"
+          break
+        fi
+        sleep 1
+      done
+    fi
+    if test -n "$QWEN_URL"; then
+      QWEN_URL="${{QWEN_URL}}/v1"
+      echo "Qwen vision sidecar public URL: $QWEN_URL" >&2
+    else
+      echo "Qwen vision sidecar did not produce a public URL (check: docker logs qwen-vision)." >&2
+    fi
+  else
+    echo "ENABLE_QWEN_SIDECAR=true but docker unavailable on this box; skipping sidecar." >&2
+  fi
+fi
+
 printf 'REMOTE_ROOT=%s\\n' "$REMOTE_ROOT"
 printf 'COMFY_BASE_URL=%s\\n' "$COMFY_BASE_URL"
 printf 'WORKER_PORT=%s\\n' "$WORKER_PORT"
 printf 'WORKER_URL=%s\\n' "$WORKER_URL"
+printf 'QWEN_URL=%s\\n' "$QWEN_URL"
 printf 'WORKER_HEALTH=%s\\n' "$(cat /tmp/gpu_worker_health.json)"
 """
 
@@ -869,21 +926,26 @@ echo "GPU_COUNT=${{GPU_COUNT}}"
 """
 
 
-def update_env_file(env_path: Path, worker_url: str, semantic_url: str | None = None) -> None:
+def _upsert_env_line(content: str, key: str, value: str) -> str:
+    line = f"{key}={value}"
+    if f"{key}=" in content:
+        return re.sub(rf"^{re.escape(key)}=.*$", line, content, flags=re.MULTILINE)
+    suffix = "" if content.endswith("\n") else "\n"
+    return f"{content}{suffix}{line}\n"
+
+
+def update_env_file(
+    env_path: Path,
+    worker_url: str,
+    semantic_url: str | None = None,
+    qwen_url: str | None = None,
+) -> None:
     content = env_path.read_text()
-    line = f"GPU_WORKER_BASE_URL={worker_url}"
-    if "GPU_WORKER_BASE_URL=" in content:
-        content = re.sub(r"^GPU_WORKER_BASE_URL=.*$", line, content, flags=re.MULTILINE)
-    else:
-        suffix = "" if content.endswith("\n") else "\n"
-        content = f"{content}{suffix}{line}\n"
+    content = _upsert_env_line(content, "GPU_WORKER_BASE_URL", worker_url)
     if semantic_url:
-        sem_line = f"SEMANTIC_SEARCH_URL={semantic_url}"
-        if "SEMANTIC_SEARCH_URL=" in content:
-            content = re.sub(r"^SEMANTIC_SEARCH_URL=.*$", sem_line, content, flags=re.MULTILINE)
-        else:
-            suffix = "" if content.endswith("\n") else "\n"
-            content = f"{content}{suffix}{sem_line}\n"
+        content = _upsert_env_line(content, "SEMANTIC_SEARCH_URL", semantic_url)
+    if qwen_url:
+        content = _upsert_env_line(content, "QWEN_BASE_URL", qwen_url)
     env_path.write_text(content)
 
 
@@ -934,6 +996,13 @@ def extract_worker_url(remote_output: str) -> str:
             return line.split("=", 1)[1].strip()
     match = WORKER_URL_PATTERN.search(remote_output)
     return match.group(0) if match else ""
+
+
+def extract_qwen_url(remote_output: str) -> str:
+    for line in remote_output.splitlines():
+        if line.startswith("QWEN_URL="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 def extract_worker_name(remote_output: str) -> str:
@@ -3155,6 +3224,11 @@ fi
             )
         else:
             script = remote_script(args.remote_root, args.worker_port)
+        if getattr(args, "qwen_sidecar", False):
+            env_vars.append("ENABLE_QWEN_SIDECAR=true")
+            env_vars.append(f"QWEN_MODEL={args.qwen_model}")
+            env_vars.append(f"QWEN_GPU_FRACTION={args.qwen_gpu_fraction}")
+            log("Qwen3-VL vision sidecar enabled for this deploy")
         env_exports = build_env_exports(env_vars)
         if env_exports:
             script = f"{env_exports}\n\n{script}"
@@ -3200,9 +3274,15 @@ fi
             log(f"Inferred RunPod proxy URL from existing .env: {worker_url}")
             print(f"WORKER_URL={worker_url}")
 
+    qwen_url = extract_qwen_url(remote_result.stdout)
+    if qwen_url:
+        log(f"Qwen vision sidecar URL: {qwen_url}")
+
     if worker_url and not args.skip_backend_env and args.backend_env.exists():
-        update_env_file(args.backend_env, worker_url)
+        update_env_file(args.backend_env, worker_url, qwen_url=qwen_url or None)
         log(f"Updated {args.backend_env} with GPU_WORKER_BASE_URL={worker_url}")
+        if qwen_url:
+            log(f"Updated {args.backend_env} with QWEN_BASE_URL={qwen_url}")
     elif worker_url and not args.skip_backend_env:
         log(f"Backend env not found at {args.backend_env}; skipped env update.")
     elif not worker_url:
@@ -3526,6 +3606,24 @@ def parse_args() -> argparse.Namespace:
         "--remote-root",
         default=DEFAULT_REMOTE_ROOT,
         help=f"Remote install root. Default: {DEFAULT_REMOTE_ROOT}",
+    )
+    parser.add_argument(
+        "--qwen-sidecar",
+        action="store_true",
+        help="Also run a Qwen3-VL vision server (vLLM) alongside ComfyUI on the worker "
+             "GPU, exposed via its own cloudflared tunnel and written to the backend's "
+             "QWEN_BASE_URL. Requires docker on the worker box.",
+    )
+    parser.add_argument(
+        "--qwen-model",
+        default="Qwen/Qwen3-VL-8B-Instruct",
+        help="Served model for the Qwen vision sidecar. Default: Qwen/Qwen3-VL-8B-Instruct",
+    )
+    parser.add_argument(
+        "--qwen-gpu-fraction",
+        default="0.25",
+        help="Fraction of GPU VRAM the vision sidecar may use, so it does not starve "
+             "the render models. Default: 0.25 (~20GB on an 80GB A100).",
     )
     parser.add_argument(
         "--worker-port",
