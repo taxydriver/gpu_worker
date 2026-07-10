@@ -29,7 +29,7 @@ from pydantic import BaseModel
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR.parent))
 
-DEFAULT_BACKEND_ENV = SCRIPT_DIR.parent / "filmforge_backend" / "app" / ".env"
+DEFAULT_BACKEND_ENV = SCRIPT_DIR.parent / "backend" / "app" / ".env"
 PREFERRED_COMFY_IMAGE = "vastai/comfy"
 PREFERRED_COMFY_TAG = "v0.15.1-cuda-12.9-py312"
 
@@ -69,6 +69,7 @@ class CreateInstanceRequest(BaseModel):
 class AutoProvisionRequest(BaseModel):
     gpu_type: str = "RTX 4090"
     max_price: float = 0.75
+    country: str = ""  # comma-separated ISO codes; blank = deploy_gpu.py's reliable default
     min_vram_gb: int = 24
     disk_gb: int = 200
     image: str = "vastai/comfy:v0.15.1-cuda-12.9-py312"
@@ -1515,6 +1516,8 @@ async def start_vast_provision(req: AutoProvisionRequest):
                 "--vast-comfy-port", str(req.comfy_port),
                 "--remote-root", req.remote_root,
             ]
+            if req.country.strip():
+                command.extend(["--vast-country", req.country.strip()])
             if req.template_hash:
                 command.extend(["--vast-template-hash", req.template_hash])
             if req.max_upload_cost is not None:
@@ -2483,6 +2486,17 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
           <label>Max $/hr</label>
           <input id="c-price" type="number" value="0.75" step="0.05">
         </div>
+      </div>
+      <div class="fg">
+        <label>Allowed Regions</label>
+        <select id="c-country">
+          <option value="US,CA,GB,IE,FR,DE,NL,BE,LU,CH,AT,SE,NO,FI,DK,IS,EE,LT,LV,PL,CZ,SK,HU,RO,BG,SI,HR,IT,ES,PT,GR,UA,AU,NZ,IN" selected>Reliable — US / Europe / AU / India (default)</option>
+          <option value="US,CA">North America (US / CA)</option>
+          <option value="GB,IE,FR,DE,NL,BE,LU,CH,AT,SE,NO,FI,DK,IS,EE,LT,LV,PL,CZ,SK,HU,RO,BG,SI,HR,IT,ES,PT,GR,UA">Europe</option>
+          <option value="AU,NZ">Australia / NZ</option>
+          <option value="IN">India</option>
+        </select>
+        <span class="muted text-xs">Excludes CN and other regions where boxes often hang on load.</span>
       </div>
       <button class="btn btn-success btn-full" id="provision-btn" onclick="quickDeploy()" style="margin-bottom:8px">
         ⚡ Create &amp; Deploy
@@ -3651,6 +3665,7 @@ async function quickDeploy() {
       body: JSON.stringify({
         gpu_type: document.getElementById('c-gpu').value,
         max_price: +document.getElementById('c-price').value,
+        country: document.getElementById('c-country').value,
         min_vram_gb: +(document.getElementById('c-vram').value) || 24,
         disk_gb: +(document.getElementById('c-disk').value) || 200,
         template_hash: document.getElementById('c-tmpl').value.trim() || null,

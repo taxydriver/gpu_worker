@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     worker_api_token: str | None = Field(default=None, alias="WORKER_API_TOKEN")
     worker_heartbeat_seconds: int = Field(default=60, alias="WORKER_HEARTBEAT_SECONDS")
 
+    # Proactive ComfyUI recycle to clear accumulated / fragmented VRAM (both
+    # opt-in; 0 disables). The watchdog restarts ComfyUI while the worker is idle
+    # when either trigger fires. See app._maybe_recycle_comfy.
+    worker_recycle_after_jobs: int = Field(default=0, alias="WORKER_RECYCLE_AFTER_JOBS")
+    worker_recycle_min_free_mib: int = Field(default=0, alias="WORKER_RECYCLE_MIN_FREE_MIB")
+
     def served_file_roots(self) -> dict[str, Path]:
         """Return the named roots the worker is allowed to serve files from."""
 

@@ -28,7 +28,7 @@ HEARTBEAT_INTERVAL_SEC=300                   # send heartbeat every N seconds
 
 ### 1. Start backend
 ```bash
-cd filmforge_backend
+cd Filmforge/backend
 python -m uvicorn app.main:app --reload
 ```
 

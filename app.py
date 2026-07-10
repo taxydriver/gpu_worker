@@ -195,6 +195,12 @@ _EXECUTION_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_EXECUTION_SLOTS)
 # defaults to 1), so a plain global is race-free.
 _LAST_ASSET_GROUP: str | None = None
 
+# Monotonic count of jobs that have finished executing (success or failure).
+# The watchdog reads it to drive the proactive VRAM recycle (see
+# _maybe_recycle_comfy); it tracks its own baseline, so this is never reset.
+_JOBS_COMPLETED_LOCK = threading.Lock()
+_JOBS_COMPLETED: int = 0
+
 # ── Warmed asset groups tracking ─────────────────────────────────────────────────
 _WARMED_GROUPS_LOCK = threading.Lock()
 _WARMED_GROUPS: set[str] = set()  # asset groups that have been successfully downloaded
@@ -242,31 +248,148 @@ def _asset_group_mismatch_error(asset_group: str) -> ValueError:
     )
 
 
+def _note_job_completed() -> None:
+    """Bump the monotonic completed-jobs counter (once per finished job)."""
+    global _JOBS_COMPLETED
+    with _JOBS_COMPLETED_LOCK:
+        _JOBS_COMPLETED += 1
+
+
+def _jobs_completed() -> int:
+    with _JOBS_COMPLETED_LOCK:
+        return _JOBS_COMPLETED
+
+
+def _acquire_all_slots(timeout_sec: float) -> bool:
+    """Grab every execution slot so no job can run during a restart.
+
+    Returns True with all slots held — the caller MUST call _release_all_slots.
+    Returns False (having released anything it took) if a job is holding a slot
+    within the timeout. Closes the race between an idle snapshot and the restart.
+    """
+    acquired = 0
+    deadline = time.monotonic() + timeout_sec
+    for _ in range(_MAX_EXECUTION_SLOTS):
+        remaining = max(0.0, deadline - time.monotonic())
+        if _EXECUTION_SEMAPHORE.acquire(timeout=remaining):
+            acquired += 1
+        else:
+            break
+    if acquired == _MAX_EXECUTION_SLOTS:
+        return True
+    for _ in range(acquired):
+        _EXECUTION_SEMAPHORE.release()
+    return False
+
+
+def _release_all_slots() -> None:
+    for _ in range(_MAX_EXECUTION_SLOTS):
+        _EXECUTION_SEMAPHORE.release()
+
+
+def _periodic_recycle_due(completed: int, baseline: int, after_jobs: int) -> bool:
+    """True when at least ``after_jobs`` jobs finished since the last recycle."""
+    return after_jobs > 0 and (completed - baseline) >= after_jobs
+
+
+def _maybe_recycle_comfy(settings, recycle_baseline: int) -> bool:
+    """Proactively restart ComfyUI to clear accumulated VRAM — only while idle.
+
+    Restarting ComfyUI is what actually reclaims the GPU's VRAM: the /free
+    endpoint only unloads models and flushes the CUDA cache, which does NOT
+    recover leaked or fragmented allocations that build up across many jobs.
+
+    Fires on either trigger (both opt-in via env; each disabled when 0):
+      • WORKER_RECYCLE_AFTER_JOBS   — jobs completed since the last recycle.
+      • WORKER_RECYCLE_MIN_FREE_MIB — free-VRAM floor. Low free VRAM alone is
+        normal under --highvram (the warm model is pinned), so we first call
+        /free and re-read; we only recycle if the memory does NOT come back —
+        i.e. it is genuinely leaked/fragmented, not just a resident model.
+
+    Returns True iff ComfyUI was restarted (the caller then re-baselines).
+    """
+    after_jobs = getattr(settings, "worker_recycle_after_jobs", 0)
+    floor_mib = getattr(settings, "worker_recycle_min_free_mib", 0)
+    if after_jobs <= 0 and floor_mib <= 0:
+        return False  # feature disabled
+
+    # Cheap idle snapshot — never touch a busy worker.
+    with _ACTIVE_JOBS_LOCK:
+        if _ACTIVE_JOBS > 0:
+            return False
+
+    periodic_due = _periodic_recycle_due(_jobs_completed(), recycle_baseline, after_jobs)
+
+    raw_low = False
+    if floor_mib > 0:
+        free_mib = _free_vram_mib()
+        raw_low = free_mib is not None and free_mib < floor_mib
+
+    if not periodic_due and not raw_low:
+        return False
+
+    # A trigger is plausible — quiesce so a job can't start mid-restart.
+    if not _acquire_all_slots(timeout_sec=5.0):
+        LOGGER.info("[recycle] recycle wanted but a job started — deferring")
+        return False
+    try:
+        if periodic_due:
+            reason = f"periodic: {_jobs_completed() - recycle_baseline} jobs since last recycle"
+        else:
+            # Confirm the pressure is real: release the resident model and re-read.
+            # If /free brings VRAM back above the floor it was just the warm model
+            # — no restart needed (and we've done a useful flush anyway).
+            free_comfy_memory(unload_models=True)
+            after_free = _free_vram_mib()
+            if after_free is None or after_free >= floor_mib:
+                LOGGER.info(
+                    "[recycle] /free recovered VRAM (free=%sMiB >= %dMiB floor) — no restart",
+                    after_free, floor_mib,
+                )
+                return False
+            reason = f"free VRAM {after_free}MiB < {floor_mib}MiB even after /free (leaked)"
+        LOGGER.warning("[recycle] restarting ComfyUI proactively — %s", reason)
+        restart_comfy()
+        LOGGER.info("[recycle] ComfyUI restarted")
+        return True
+    finally:
+        _release_all_slots()
+
+
 def _watchdog_loop() -> None:
-    """Background thread: restart ComfyUI when it goes unhealthy and no job is running."""
+    """Background thread: keep ComfyUI healthy AND clear its VRAM creep.
+
+    Two idle-gated actions, never taken while a job is running:
+      1. Restart ComfyUI when it goes unhealthy.
+      2. Proactively recycle ComfyUI to clear accumulated / fragmented VRAM,
+         driven by WORKER_RECYCLE_AFTER_JOBS / WORKER_RECYCLE_MIN_FREE_MIB.
+    """
 
     settings = get_settings()
     if not settings.comfy_start_cmd:
         LOGGER.info("[watchdog] COMFY_START_CMD not set — watchdog disabled")
         return
 
+    recycle_baseline = _jobs_completed()
     LOGGER.info("[watchdog] started, checking every 30s")
     while True:
         time.sleep(30)
         try:
-            if is_comfy_healthy():
+            if not is_comfy_healthy():
+                with _ACTIVE_JOBS_LOCK:
+                    active = _ACTIVE_JOBS
+                if active > 0:
+                    LOGGER.warning("[watchdog] ComfyUI unhealthy but %d job(s) active — waiting", active)
+                    continue
+                LOGGER.warning("[watchdog] ComfyUI unhealthy and idle — restarting")
+                restart_comfy()
+                recycle_baseline = _jobs_completed()
+                LOGGER.info("[watchdog] ComfyUI restarted successfully")
                 continue
 
-            with _ACTIVE_JOBS_LOCK:
-                active = _ACTIVE_JOBS
-
-            if active > 0:
-                LOGGER.warning("[watchdog] ComfyUI unhealthy but %d job(s) active — waiting", active)
-                continue
-
-            LOGGER.warning("[watchdog] ComfyUI unhealthy and idle — restarting")
-            restart_comfy()
-            LOGGER.info("[watchdog] ComfyUI restarted successfully")
+            # ComfyUI is healthy — proactively recycle to clear VRAM creep.
+            if _maybe_recycle_comfy(settings, recycle_baseline):
+                recycle_baseline = _jobs_completed()
         except Exception as exc:
             LOGGER.error("[watchdog] error: %s", exc)
 
@@ -1163,6 +1286,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     finally:
         with _ACTIVE_JOBS_LOCK:
             _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
+        _note_job_completed()
         _EXECUTION_SEMAPHORE.release()
         threading.Thread(target=_send_heartbeat_now, daemon=True).start()
 

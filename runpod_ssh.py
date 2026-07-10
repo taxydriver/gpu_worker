@@ -9,7 +9,7 @@ POD_NAME = "filmforge_comfy"
 
 
 def main() -> int:
-    env_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent.parent / "filmforge_backend" / "app" / ".env"
+    env_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).parent.parent / "backend" / "app" / ".env"
 
     api_key = None
     if env_path.exists():

@@ -20,8 +20,8 @@ from urllib.request import Request, urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REMOTE_ROOT = "/workspace/filmforge_gpu_worker"
-DEFAULT_BACKEND_ENV = SCRIPT_DIR.parent / "filmforge_backend" / "app" / ".env"
-DEFAULT_BACKEND_ROOT = SCRIPT_DIR.parent / "filmforge_backend"
+DEFAULT_BACKEND_ENV = SCRIPT_DIR.parent / "backend" / "app" / ".env"
+DEFAULT_BACKEND_ROOT = SCRIPT_DIR.parent / "backend"
 WORKER_URL_PATTERN = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 DEFAULT_SSH_IDENTITY = Path.home() / ".ssh" / "vast_deploy"
 DEFAULT_SSH_IDENTITY_RUNPOD = Path.home() / ".ssh" / "runpod_deploy"
@@ -31,6 +31,17 @@ DEFAULT_VAST_MAX_PRICE = 0.75
 DEFAULT_VAST_MIN_VRAM_GB = 24
 DEFAULT_VAST_LIMIT = 25
 DEFAULT_VAST_BOOT_TIMEOUT = 900
+# Reliable-region allow-list for Vast offers. Chinese (CN) and other unlisted
+# hosts are excluded because some hang forever on "loading" and never accept SSH
+# (observed 2026-07-10: a CN box stuck loading past the boot timeout). Regions:
+# North America, Europe, Australia/NZ, India. Override with --vast-country.
+DEFAULT_VAST_COUNTRIES = [
+    "US", "CA",  # North America
+    "GB", "IE", "FR", "DE", "NL", "BE", "LU", "CH", "AT", "SE", "NO", "FI", "DK",
+    "IS", "EE", "LT", "LV", "PL", "CZ", "SK", "HU", "RO", "BG", "SI", "HR", "IT",
+    "ES", "PT", "GR", "UA",  # Europe
+    "AU", "NZ", "IN",  # Australia + India
+]
 DEFAULT_VERDA_CLI = Path.home() / ".verda" / "bin" / "verda"
 DEFAULT_VERDA_LOCATION = "FIN-01"
 DEFAULT_VERDA_INSTANCE_TYPE = "2A100.44V"
@@ -43,7 +54,7 @@ DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
 # Models on the data volume: default warm set (flux 71 + wan 38 + stable_audio 6 + ltx 70)
 # ≈ 186 GB; +juggernaut 10 ≈ 196 GB. 300 GB leaves ~100 GB for ComfyUI outputs/temp/.part
 # download slack (LTX checkpoint alone is 46 GB) and the next model. See
-# filmforge_backend/docs/ltx-2-3-gpu-worker-install-2026-05-30.md.
+# Filmforge/backend/docs/discoveries/ltx-2-3-gpu-worker-install-2026-05-30.md.
 DEFAULT_VERDA_FRESH_STORAGE_SIZE = 300
 DEFAULT_VERDA_CONTRACT = "pay_as_go"
 DEFAULT_WORKER_REPO_URL = "https://github.com/taxydriver/gpu_worker.git"
@@ -1126,6 +1137,10 @@ def _select_vast_offer(args: argparse.Namespace) -> dict:
         query = f"{query} inet_up_cost<={float(args.vast_max_upload_cost)}"
     if args.vast_max_download_cost is not None:
         query = f"{query} inet_down_cost<={float(args.vast_max_download_cost)}"
+    countries = [c.strip().upper() for c in getattr(args, "vast_country", None) or [] if c.strip()]
+    if countries:
+        query = f"{query} geolocation in [{','.join(countries)}]"
+        log(f"Restricting Vast offers to regions: {', '.join(countries)}")
     data = _vastai(
         "search",
         "offers",
@@ -3029,6 +3044,30 @@ def vast_deploy(args: argparse.Namespace) -> int:
             port_publish_flags,
         ]
     )
+    # Inject our public key into authorized_keys at boot. Vast's `--ssh` relies on
+    # syncing the *account* keys into the container, which can lag or silently fail
+    # (observed 2026-07-10: a running box left the key unsynced for >13 min and
+    # rejected every login). This onstart append makes SSH auth deterministic and
+    # runs alongside the image's own startup (it does not replace the container
+    # CMD/supervisord that boots ComfyUI). Guarded so a restart can't duplicate it.
+    pubkey_path = identity.with_name(identity.name + ".pub")
+    if pubkey_path.exists():
+        pubkey = pubkey_path.read_text().strip()
+        # sshd StrictModes refuses authorized_keys if /root or ~/.ssh is group/
+        # world-writable — the vastai/comfy image ships /root writable, so sshd
+        # rejected BOTH Vast's account key and ours ("bad ownership or modes",
+        # observed 2026-07-10). Fix ownership + strip group/other write on the
+        # whole chain, not just the file.
+        onstart_cmd = (
+            "mkdir -p /root/.ssh && "
+            "chmod go-w /root && chmod 700 /root/.ssh && "
+            f"(grep -qF '{pubkey}' /root/.ssh/authorized_keys 2>/dev/null || "
+            f"echo '{pubkey}' >> /root/.ssh/authorized_keys) && "
+            "chown -R root:root /root/.ssh && chmod 600 /root/.ssh/authorized_keys"
+        )
+        create_args.extend(["--onstart-cmd", onstart_cmd])
+    else:
+        log(f"WARNING: public key {pubkey_path} not found; relying on Vast account-key sync for SSH.")
     create = _vastai(*create_args, timeout=120)
     if isinstance(create, dict) and "error" in create:
         raise RuntimeError(f"Failed to create Vast instance: {create['error']}")
@@ -3454,6 +3493,16 @@ def parse_args() -> argparse.Namespace:
         help=f"How many Vast offers to inspect. Default: {DEFAULT_VAST_LIMIT}",
     )
     parser.add_argument(
+        "--vast-country",
+        type=lambda s: [x.strip().upper() for x in s.split(",") if x.strip()],
+        default=DEFAULT_VAST_COUNTRIES,
+        help=(
+            "Comma-separated ISO country codes to restrict Vast offers to "
+            "(reliable regions). Pass an empty string to disable the filter. "
+            f"Default: {','.join(DEFAULT_VAST_COUNTRIES)}"
+        ),
+    )
+    parser.add_argument(
         "--vast-image",
         default=DEFAULT_VAST_IMAGE,
         help=f"Vast image to rent. Default: {DEFAULT_VAST_IMAGE}",
@@ -3535,8 +3584,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verda-worker-count",
         type=int,
-        default=int(os.getenv("VERDA_WORKER_COUNT", "2")),
-        help="Number of GPU worker services to start. 0 means auto-detect physical GPUs. Default 2: safe for a single 180GB GPU — 2 concurrent WAN inference peaks (~75GB each) fit within device limit without OOM.",
+        default=int(os.getenv("VERDA_WORKER_COUNT", "0")),
+        help="Number of GPU worker services to start, one per GPU (each pinned to its own CUDA device). 0 (default) auto-detects and uses every physical GPU on the box, so a multi-GPU box uses all its GPUs. Set a lower value to leave some GPUs unused. Per-GPU inference concurrency is a separate setting, not this.",
     )
     parser.add_argument(
         "--verda-fresh-os-image",

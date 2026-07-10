@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-BACKEND_ENV="$SCRIPT_DIR/../filmforge_backend/app/.env"
+BACKEND_ENV="$SCRIPT_DIR/../backend/app/.env"
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 if [[ $# -ge 1 && ( "$1" == "--help" || "$1" == "-h" ) ]]; then
@@ -64,7 +64,7 @@ MODES
 
   --gpus
       List all available RunPod GPU types with their IDs and display names.
-      Uses RUNPOD_API_KEY from filmforge_backend/app/.env.
+      Uses RUNPOD_API_KEY from Filmforge/backend/app/.env.
 
   --logs
       Stream gpu_worker logs in real time.
@@ -169,8 +169,8 @@ if [[ $# -ge 1 && "$1" == "--logs" ]]; then
     exec ssh -o StrictHostKeyChecking=accept-new $VAST_SSH_DEST "tail -f /tmp/gpu_worker.log"
   else
     echo "ERROR: No SSH destination found." >&2
-    echo "  • For RunPod: set RUNPOD_API_KEY in filmforge_backend/app/.env" >&2
-    echo "  • For Vast: add VAST_SSH_DEST=root@<host> -p <port> -i ~/.ssh/vast_deploy to filmforge_backend/app/.env" >&2
+    echo "  • For RunPod: set RUNPOD_API_KEY in Filmforge/backend/app/.env" >&2
+    echo "  • For Vast: add VAST_SSH_DEST=root@<host> -p <port> -i ~/.ssh/vast_deploy to Filmforge/backend/app/.env" >&2
     exit 1
   fi
 fi

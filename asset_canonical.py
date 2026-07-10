@@ -4,7 +4,7 @@ One canonical identifier per logical asset group. Aliases (legacy capability
 names like 'wan_i2v', 'flux2_stills') resolve to the canonical form (the keys
 of ASSET_REGISTRY, e.g. 'wan_i2v_v1', 'flux_stills_v1').
 
-Keep the alias table in sync with filmforge_backend/app/render_broker/asset_canonical.py.
+Keep the alias table in sync with Filmforge/backend/app/render_broker/asset_canonical.py.
 """
 
 from __future__ import annotations

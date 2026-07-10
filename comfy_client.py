@@ -156,6 +156,23 @@ class ComfyRestartDetectedError(RuntimeError):
         super().__init__(message)
 
 
+def _assert_history_identity(prompt_id: str, entry: dict[str, Any]) -> None:
+    """Belt-and-braces on top of the keyed lookup: ComfyUI history entries
+    carry the executed prompt as ``entry["prompt"] = [number, prompt_id,
+    graph, ...]``. If that inner id disagrees with the id we polled for, the
+    entry belongs to another job — refuse it."""
+
+    prompt_record = entry.get("prompt")
+    if not (isinstance(prompt_record, (list, tuple)) and len(prompt_record) >= 2):
+        return  # no inner id to check — keyed lookup already matched
+    inner_id = prompt_record[1]
+    if isinstance(inner_id, str) and inner_id and inner_id != prompt_id:
+        raise ComfyExecutionError(
+            f"History identity violation: polled prompt_id={prompt_id} but the "
+            f"entry's executed prompt is {inner_id} — refusing another job's output"
+        )
+
+
 def _history_entry_complete(entry: dict[str, Any]) -> bool:
     """Return True when a history entry looks complete (success or error)."""
 
@@ -301,11 +318,17 @@ def poll_for_completion(
             LOGGER.error("ComfyUI restart detected for prompt_id=%s", prompt_id)
             raise
 
+        # IDENTITY RULE (misjoin fix, backend runs 22f7bb86/0b63398f): only
+        # ever accept the history entry keyed by OUR prompt_id. The old
+        # fallback ("payload has exactly one entry — take it") adopted a
+        # concurrent job's history after a mid-run ComfyUI restart, shipping
+        # that job's video under this job's name. Wrong-output is strictly
+        # worse than no-output; a missing entry stays missing until the
+        # restart detector or the timeout deals with it.
         history = payload.get(prompt_id)
-        if history is None and len(payload) == 1:
-            history = next(iter(payload.values()))
 
         if isinstance(history, dict) and _history_entry_complete(history):
+            _assert_history_identity(prompt_id, history)
             _check_history_for_errors(history)  # raises ComfyExecutionError on OOM / error
             return history
 

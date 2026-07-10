@@ -71,7 +71,7 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
     # shipping LTXAVTextEncoderLoader / the LTX-2.3 AV nodes). The distilled checkpoint
     # is all-in-one (video transformer + video VAE + audio VAE). The Gemma text encoder
     # is the ungated Comfy-Org repack, downloaded under the name the AV nodes expect.
-    # Validated 2026-05-30: see filmforge_backend/docs/ltx-2-3-gpu-worker-install-2026-05-30.md.
+    # Validated 2026-05-30: see Filmforge/backend/docs/discoveries/ltx-2-3-gpu-worker-install-2026-05-30.md.
     "ltx_i2v_v1": [
         {
             "name": "ltx2_3_distilled_checkpoint",
