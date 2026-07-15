@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -1009,6 +1011,86 @@ def _maybe_upload_primary_output(
     return updated
 
 
+def _run_sa3_audio(request: RunRequest, total_started: float) -> RunResponse:
+    """Stable Audio 3 generation — provisioner-backed, NOT ComfyUI.
+
+    SA3 is a standalone pip lib in its own venv (see provision_sa3.sh), so instead of
+    a ComfyUI graph the payload carries {prompt, seconds} and we invoke sa3_infer.py
+    in the sa3_spike venv as a subprocess. Returns an mp3 written under the served
+    output root (so the backend fetches it via the normal /files download path).
+
+    Self-contained: owns the execution slot + active-job accounting + heartbeat, so
+    the ComfyUI path in _execute_run is untouched.
+    """
+    timings = RunTimings()
+    _EXECUTION_SEMAPHORE.acquire()
+    with _ACTIVE_JOBS_LOCK:
+        global _ACTIVE_JOBS
+        _ACTIVE_JOBS += 1
+    threading.Thread(target=_send_heartbeat_now, daemon=True).start()
+    try:
+        # Free any resident ComfyUI model so SA3 (~10GB) has the card to itself.
+        try:
+            free_comfy_memory()
+        except Exception as exc:  # best-effort — SA3 loads its own weights regardless
+            LOGGER.warning("sa3: free_comfy_memory failed (%s) — continuing", exc)
+
+        payload = request.comfy_payload or {}
+        prompt = str(payload.get("prompt") or payload.get("audio_prompt") or "").strip()
+        seconds = float(payload.get("seconds") or payload.get("duration") or 30.0)
+        seconds = max(5.0, min(120.0, seconds))  # SA3 tops out at 120s
+        if not prompt:
+            raise ValueError("stable_audio3: empty prompt")
+
+        out_dir = get_settings().served_file_roots()["output"] / "audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_job = re.sub(r"[^A-Za-z0-9_.-]", "_", request.job_id)[:80] or "sa3"
+        out_path = out_dir / f"sa3_{safe_job}.mp3"
+
+        sa3_python = Path(os.environ.get("SA3_VENV", "/workspace/sa3_spike")) / "bin" / "python"
+        infer_script = Path(__file__).resolve().parent / "sa3_infer.py"
+        if not sa3_python.exists():
+            raise RuntimeError(f"stable_audio3 venv not provisioned at {sa3_python} (run provision_sa3.sh)")
+
+        LOGGER.info("sa3: generating %.1fs job_id=%s", seconds, request.job_id)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [str(sa3_python), str(infer_script),
+             "--prompt", prompt, "--seconds", str(seconds), "--out", str(out_path)],
+            capture_output=True, text=True, timeout=request.timeout_sec,
+        )
+        timings.comfy_run_sec = time.monotonic() - started
+        if proc.returncode != 0 or not out_path.exists():
+            raise RuntimeError(
+                f"stable_audio3 inference failed (rc={proc.returncode}): "
+                f"{(proc.stderr or '')[-800:]}"
+            )
+
+        output_files = build_output_files([str(out_path)])
+        timings.total_sec = time.monotonic() - total_started
+        return RunResponse(
+            ok=True, job_id=request.job_id, asset_group=request.asset_group,
+            downloaded_assets=[], restart_performed=False, comfy_prompt_id=None,
+            outputs=[str(out_path)], output_files=output_files, keyframes=[],
+            timings=timings,
+            debug=RunDebug(history_found=True, comfy_base_url=get_settings().comfy_base_url),
+            error=None,
+        )
+    except Exception as exc:
+        LOGGER.exception("stable_audio3 job failed job_id=%s", request.job_id)
+        timings.total_sec = time.monotonic() - total_started
+        return _error_response(
+            request=request, timings=timings, downloaded_assets=[],
+            restart_performed=False, comfy_prompt_id=None, history_found=False, error=exc,
+        )
+    finally:
+        with _ACTIVE_JOBS_LOCK:
+            _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
+        _note_job_completed()
+        _EXECUTION_SEMAPHORE.release()
+        threading.Thread(target=_send_heartbeat_now, daemon=True).start()
+
+
 def _execute_run(request: RunRequest, progress: JobProgressResponse | None = None) -> RunResponse:
     """Ensure assets, run a ComfyUI prompt, and report structured results."""
 
@@ -1033,6 +1115,11 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             history_found=history_found,
             error=_asset_group_mismatch_error(request.asset_group),
         )
+
+    # Provisioner-backed standalone audio (Stable Audio 3) runs its own venv, not
+    # ComfyUI — delegate before any comfy-specific VRAM/asset/prompt handling.
+    if canonical_asset_group(request.asset_group) == "stable_audio3_v1":
+        return _run_sa3_audio(request, total_started)
 
     # Pre-flight VRAM check — fast-reject before acquiring execution slot so
     # the broker can immediately route to a worker that has headroom.
