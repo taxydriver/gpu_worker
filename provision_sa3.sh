@@ -21,6 +21,12 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 export HF_XET_HIGH_PERFORMANCE=1
+# Keep the ~10GB model snapshot OFF the small root fs — Verda boxes bind-mount a big
+# data volume at /mnt/data. Point the HF cache there when it exists (else default).
+if [ -z "${HF_HOME:-}" ] && [ -d /mnt/data ]; then
+  export HF_HOME=/mnt/data/hf_cache
+  mkdir -p "$HF_HOME"
+fi
 log() { echo "[provision_sa3] $*" >&2; }
 
 if [ -z "${HF_TOKEN:-}" ]; then

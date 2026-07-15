@@ -23,6 +23,11 @@ set -euo pipefail
 WORKSPACE="${WORKSPACE:-/workspace}"
 WHICH="${1:-all}"
 export HF_XET_HIGH_PERFORMANCE=1
+# Keep model snapshots OFF the small root fs — use the big /mnt/data volume when present.
+if [ -z "${HF_HOME:-}" ] && [ -d /mnt/data ]; then
+  export HF_HOME=/mnt/data/hf_cache
+  mkdir -p "$HF_HOME"
+fi
 
 log() { echo "[provision_tts] $*" >&2; }
 
