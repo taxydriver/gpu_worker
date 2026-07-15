@@ -4095,6 +4095,11 @@ const CONFIG_FIELDS = [
     {value: 'ltx_i2v', label: 'LTX 2.3 Fast (video+audio only)'},
     {value: 'flux2_stills', label: 'Flux (stills only)'},
     {value: 'wan_i2v', label: 'WAN (video)'},
+    // --- Audio aux tier (provisioner-backed; run on a cheap 24GB box, NOT the render card) ---
+    {value: 'tts_dialogue,stable_audio3', label: '🔊 Audio worker: Dialogue + Music (aux tier)'},
+    {value: 'tts_dialogue', label: '🔊 Dialogue TTS only (Chatterbox + Indic Parler)'},
+    {value: 'stable_audio3', label: '🔊 Music only (Stable Audio 3)'},
+    {value: 'flux2_stills,wan_i2v,ltx_i2v,character_loras,tts_dialogue,stable_audio3', label: 'Full stack incl. Dialogue + SA3 Music'},
   ]},
   {key: 'WORKER_NAME', label: 'Worker Name', type: 'text', inputId: 'cfg-worker-name', placeholder: 'auto (hostname)'},
   {key: 'WORKER_GPU_NAME', label: 'GPU Type', type: 'select', selectId: 'cfg-gpu-name', inputId: 'cfg-gpu-custom', defaultValue: 'RTX 4090', options: [

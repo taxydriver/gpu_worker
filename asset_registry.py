@@ -148,6 +148,31 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth",
         },
     ],
+    # --- Provisioner-backed audio groups (NOT single-file ComfyUI models) ---------------
+    # These run as standalone pip packages in isolated venvs (their transformers pins
+    # conflict with each other and with ComfyUI), loading whole HF-repo snapshots via
+    # from_pretrained — so they are NOT downloaded by asset_manager (empty file list).
+    # They are installed by PROVISIONERS (see below) at deploy time, but registered here
+    # as canonical groups so the worker ADVERTISES them via /health + backend registration
+    # (canonicalize_groups only surfaces groups that exist in ASSET_REGISTRY) and so the
+    # infra UI can offer them. OPT-IN via capability; base render deploys stay lean.
+    # Validated 2026-07-15: backend/docs/discoveries/oss-dialogue-tts-validation-2026-07-15.md
+    # + research/oss_audio_video_models_survey_2026-07-15.md.
+    #
+    # tts_dialogue_v1  -> Chatterbox Multilingual (EN/Hindi clone) + Indic Parler (Telugu/Tamil)
+    #                     installed by gpu_worker/provision_tts.sh (Parler gated -> HF_TOKEN).
+    "tts_dialogue_v1": [],
+    # stable_audio3_v1 -> Stable Audio 3 Medium (music/score, replaces Stable Audio Open 1.0)
+    #                     installed by gpu_worker/provision_sa3.sh (gated -> HF_TOKEN).
+    "stable_audio3_v1": [],
+}
+
+
+# Provisioner-backed groups: capability declared -> deploy runs this script instead of
+# (or in addition to) asset_manager file downloads. Keys are canonical ASSET_REGISTRY groups.
+PROVISIONERS: dict[str, str] = {
+    "tts_dialogue_v1": "gpu_worker/provision_tts.sh",
+    "stable_audio3_v1": "gpu_worker/provision_sa3.sh",
 }
 
 
@@ -176,6 +201,16 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     # Opt-in: ESRGAN upscaler for the quality finishing pass.
     "finishing": ["finishing_v1"],
     "finishing_v1": ["finishing_v1"],
+    # Opt-in: open-source dialogue TTS (Chatterbox + Indic Parler), provisioner-backed.
+    "tts": ["tts_dialogue_v1"],
+    "tts_dialogue": ["tts_dialogue_v1"],
+    "chatterbox": ["tts_dialogue_v1"],
+    "indic_parler": ["tts_dialogue_v1"],
+    "tts_dialogue_v1": ["tts_dialogue_v1"],
+    # Opt-in: Stable Audio 3 music/score (replaces Stable Audio Open 1.0), provisioner-backed.
+    "stable_audio3": ["stable_audio3_v1"],
+    "stable_audio_3": ["stable_audio3_v1"],
+    "stable_audio3_v1": ["stable_audio3_v1"],
 }
 
 
