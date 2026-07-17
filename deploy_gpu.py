@@ -2110,6 +2110,31 @@ done
 echo "GPU_COUNT=${{GPU_COUNT}}"
 df -h /mnt/data
 
+# ── Audio department (opt-in via WORKER_CAPABILITIES) ─────────────────────────
+# tts_dialogue / stable_audio3 in the capability list makes this box the sound
+# stage too: provision the model stacks (idempotent — instant when the /mnt/data
+# volume already carries them) and install the resident Parler voice server via
+# setup_audio_services.sh. Guarded subshell: audio failures degrade to warnings,
+# never kill a render deploy.
+(
+set +e
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,tts_dialogue,*|*,stable_audio3,*)
+    echo "[audio] audio capabilities requested — setting up the sound stage"
+    cd "$WORKER_ROOT"
+    export WORKSPACE=/mnt/data
+    export HF_HUB_ENABLE_HF_TRANSFER=0
+    if [ -n "${{HF_TOKEN:-}}" ]; then
+      bash provision_tts.sh || echo "[audio] WARN: provision_tts.sh failed" >&2
+      bash provision_sa3.sh || echo "[audio] WARN: provision_sa3.sh failed" >&2
+    else
+      echo "[audio] HF_TOKEN not set — skipping model downloads (volume assumed provisioned)"
+    fi
+    bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
+    ;;
+esac
+)
+
 # ── Semantic search service ───────────────────────────────────────────────────
 # Run the whole block in a guarded subshell: the outer script is `set -e`, so any
 # failure here (pip, embedding, systemd) would otherwise abort the entire worker
@@ -2510,6 +2535,22 @@ def _verda_env_vars(args: argparse.Namespace) -> list[str]:
         if value:
             env_vars.append(f"FILMFORGE_BACKEND_URL={value}")
             log("Auto-injected FILMFORGE_BACKEND_URL from backend .env")
+    # Audio deploys (tts_dialogue / stable_audio3 capability) need HF_TOKEN on the
+    # box for the gated repos (SA3 license, Indic Parler terms). Fallback chain:
+    # backend .env → local env → the hf CLI's token file.
+    caps = next(
+        (item.split("=", 1)[1] for item in env_vars if item.startswith("WORKER_CAPABILITIES=")),
+        os.getenv("WORKER_CAPABILITIES", ""),
+    )
+    if ("tts_dialogue" in caps or "stable_audio3" in caps) and "HF_TOKEN" not in existing_keys:
+        value = _read_env_value(args.backend_env, "HF_TOKEN") or os.getenv("HF_TOKEN")
+        if not value:
+            token_file = Path.home() / ".cache" / "huggingface" / "token"
+            if token_file.exists():
+                value = token_file.read_text().strip()
+        if value:
+            env_vars.append(f"HF_TOKEN={value}")
+            log("Auto-injected HF_TOKEN for audio provisioning")
     return env_vars
 
 
