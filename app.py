@@ -1011,6 +1011,73 @@ def _maybe_upload_primary_output(
     return updated
 
 
+def _run_tts_dialogue(request: RunRequest, total_started: float) -> RunResponse:
+    """Dialogue TTS via the resident parler_server (filmforge-parler.service).
+
+    Unlike SA3 there is no per-job model load and no VRAM eviction — the Parler
+    model (~4GB) stays resident in its own process on :9101. Payload:
+    {text, description?}. Returns a wav under the served output root.
+    Self-contained slot/heartbeat accounting, mirroring _run_sa3_audio.
+    """
+    timings = RunTimings()
+    _EXECUTION_SEMAPHORE.acquire()
+    with _ACTIVE_JOBS_LOCK:
+        global _ACTIVE_JOBS
+        _ACTIVE_JOBS += 1
+    threading.Thread(target=_send_heartbeat_now, daemon=True).start()
+    try:
+        payload = request.comfy_payload or {}
+        text = str(payload.get("text") or payload.get("prompt") or "").strip()
+        if not text:
+            raise ValueError("tts_dialogue: empty text")
+
+        out_dir = get_settings().served_file_roots()["output"] / "audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_job = re.sub(r"[^A-Za-z0-9_.-]", "_", request.job_id)[:80] or "tts"
+        out_path = out_dir / f"tts_{safe_job}.wav"
+
+        started = time.monotonic()
+        resp = requests.post(
+            f"http://127.0.0.1:{os.environ.get('PARLER_PORT', '9101')}/tts",
+            json={"text": text, "description": payload.get("description")},
+            timeout=min(request.timeout_sec, 600),
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"parler_server returned {resp.status_code}: {resp.text[:300]}")
+        out_path.write_bytes(resp.content)
+        timings.comfy_run_sec = time.monotonic() - started
+
+        output_files = build_output_files([str(out_path)])
+        timings.total_sec = time.monotonic() - total_started
+        return RunResponse(
+            ok=True, job_id=request.job_id, asset_group=request.asset_group,
+            downloaded_assets=[], restart_performed=False, comfy_prompt_id=None,
+            outputs=[str(out_path)], output_files=output_files, keyframes=[],
+            timings=timings,
+            debug=RunDebug(history_found=True, comfy_base_url=get_settings().comfy_base_url),
+            error=None,
+        )
+    except Exception as exc:
+        LOGGER.exception("tts_dialogue job failed job_id=%s", request.job_id)
+        timings.total_sec = time.monotonic() - total_started
+        return _error_response(
+            request=request, timings=timings, downloaded_assets=[],
+            restart_performed=False, comfy_prompt_id=None, history_found=False, error=exc,
+        )
+
+
+def _gpu_free_mib() -> int:
+    """Free VRAM on GPU 0 in MiB; 0 on any failure (treated as 'tight')."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return int(out.stdout.strip().splitlines()[0])
+    except Exception:
+        return 0
+
+
 def _run_sa3_audio(request: RunRequest, total_started: float) -> RunResponse:
     """Stable Audio 3 generation — provisioner-backed, NOT ComfyUI.
 
@@ -1029,11 +1096,17 @@ def _run_sa3_audio(request: RunRequest, total_started: float) -> RunResponse:
         _ACTIVE_JOBS += 1
     threading.Thread(target=_send_heartbeat_now, daemon=True).start()
     try:
-        # Free any resident ComfyUI model so SA3 (~10GB) has the card to itself.
-        try:
-            free_comfy_memory()
-        except Exception as exc:  # best-effort — SA3 loads its own weights regardless
-            LOGGER.warning("sa3: free_comfy_memory failed (%s) — continuing", exc)
+        # SA3 needs ~12GB. Only evict resident ComfyUI models when the card is
+        # actually tight — an unconditional eviction forces the next render to
+        # reload ~60GB of models (observed 2026-07-17: audio job stalled the
+        # director's render session).
+        free_mib = _gpu_free_mib()
+        if free_mib < 14000:
+            try:
+                LOGGER.info("sa3: only %dMiB free — evicting comfy models", free_mib)
+                free_comfy_memory()
+            except Exception as exc:  # best-effort — SA3 loads its own weights regardless
+                LOGGER.warning("sa3: free_comfy_memory failed (%s) — continuing", exc)
 
         payload = request.comfy_payload or {}
         prompt = str(payload.get("prompt") or payload.get("audio_prompt") or "").strip()
@@ -1120,6 +1193,8 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     # ComfyUI — delegate before any comfy-specific VRAM/asset/prompt handling.
     if canonical_asset_group(request.asset_group) == "stable_audio3_v1":
         return _run_sa3_audio(request, total_started)
+    if canonical_asset_group(request.asset_group) == "tts_dialogue_v1":
+        return _run_tts_dialogue(request, total_started)
 
     # Pre-flight VRAM check — fast-reject before acquiring execution slot so
     # the broker can immediately route to a worker that has headroom.

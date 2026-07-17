@@ -1,0 +1,101 @@
+# FilmForge AUDIO worker as a SkyPilot task — RunPod cloud.
+#
+# The sound stage: Stable Audio 3 (music) + Chatterbox (cloned-voice EN dialogue)
+# + Indic Parler (Telugu/Tamil described-voice dialogue) on one 24GB box.
+# No ComfyUI: COMFY_START_CMD stays unset so the worker's comfy watchdog disables
+# itself; audio jobs run in their own provisioned venvs (sa3_spike / tts_spike /
+# parler_spike — see provision_sa3.sh / provision_tts.sh).
+#
+# BAREBOX image strategy (learned 2026-07-17, first launch): the prebuilt
+# runpod/comfyui image lacks rsync → SkyPilot runtime setup dies (rc=127). Like
+# ff_worker_render_runpod_barebox.yaml, we use NO image_id — SkyPilot's clean
+# runpod/base ubuntu — and let each provisioner venv pip-install its own torch
+# (their packages declare it; --system-site-packages finds nothing on barebox).
+# Weights land in /workspace (HF_HOME override) per the root-fs-full lesson in
+# backend/docs/discoveries/oss-dialogue-tts-validation-2026-07-15.md §6d.
+#
+# PREREQS (once):
+#   - gpu_worker main pushed to GitHub (deploy = git clone/pull, NOT local rsync)
+#   - HF token whose account accepted the gated repos: stabilityai stable-audio-3
+#     license + ai4bharat/indic-parler-tts terms
+#
+# Launch:
+#   sky launch -c ff-audio ff_worker_audio_runpod.yaml -y -d \
+#     --env FILMFORGE_BACKEND_URL=… \
+#     --secret WORKER_REGISTRATION_TOKEN=… \
+#     --secret HF_TOKEN=…
+# Idle shutdown:  sky autostop ff-audio -i 30 --down
+# Teardown:       sky down -y ff-audio
+
+resources:
+  infra: runpod
+  # 24GB is enough: SA3 ~15GB loads per job; the two dialogue models (~8GB) can
+  # stay resident. L40S/A100 as availability fallbacks.
+  accelerators: {RTX4090:1, L40S:1, A100-80GB:1}
+  use_spot: false   # audio jobs are short; flip to spot later if cost demands
+  ports: 9000
+  disk_size: 150    # ~30GB audio weights + HF cache + per-venv torch + headroom
+  # NO image_id — barebox (see header)
+
+envs:
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # The job-acceptance gate: this worker takes audio work only.
+  WORKER_CAPABILITIES: "tts_dialogue,stable_audio3"
+  HF_HOME: /workspace/hf_cache
+  # Injected at launch: FILMFORGE_BACKEND_URL, WORKER_REGISTRATION_TOKEN, HF_TOKEN
+
+setup: |
+  set -euo pipefail
+  export HF_HOME=/workspace/hf_cache
+  # Base image sets HF_HUB_ENABLE_HF_TRANSFER=1 but our provisioner venvs don't
+  # install hf_transfer → downloads hard-fail. Plain downloads are fine here.
+  export HF_HUB_ENABLE_HF_TRANSFER=0
+  mkdir -p "$HF_HOME"
+
+  # cloudflared so the broker can probe /health over a public URL.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+
+  # Worker code from GitHub (same repo/idiom as the render variant).
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+
+  # Provision the three audio stacks (idempotent; each makes its own venv).
+  # HF_TOKEN is needed for the gated repos (SA3 license, Indic Parler terms).
+  WORKSPACE=/workspace bash provision_tts.sh
+  WORKSPACE=/workspace bash provision_sa3.sh
+
+run: |
+  set -euo pipefail
+  WORKER_PORT=9000
+  export HF_HOME=/workspace/hf_cache
+
+  # cloudflared tunnel so the broker reaches /health.
+  pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
+  : >/tmp/ff_tunnel.log
+  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  WORKER_URL=""
+  for _ in $(seq 1 30); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  [ -z "$WORKER_URL" ] && { echo "ERROR: no tunnel URL"; exit 1; }
+  echo "Tunnel: $WORKER_URL"
+
+  # No COMFY_START_CMD / COMFY_BASE_URL: audio-only box, comfy watchdog disabled.
+  export SA3_VENV=/workspace/sa3_spike
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-audio-$(hostname)"
+
+  # Start the worker (self-registers with the backend, advertises audio caps).
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT"
