@@ -1096,18 +1096,6 @@ def _run_sa3_audio(request: RunRequest, total_started: float) -> RunResponse:
         _ACTIVE_JOBS += 1
     threading.Thread(target=_send_heartbeat_now, daemon=True).start()
     try:
-        # SA3 needs ~12GB. Only evict resident ComfyUI models when the card is
-        # actually tight — an unconditional eviction forces the next render to
-        # reload ~60GB of models (observed 2026-07-17: audio job stalled the
-        # director's render session).
-        free_mib = _gpu_free_mib()
-        if free_mib < 14000:
-            try:
-                LOGGER.info("sa3: only %dMiB free — evicting comfy models", free_mib)
-                free_comfy_memory()
-            except Exception as exc:  # best-effort — SA3 loads its own weights regardless
-                LOGGER.warning("sa3: free_comfy_memory failed (%s) — continuing", exc)
-
         payload = request.comfy_payload or {}
         prompt = str(payload.get("prompt") or payload.get("audio_prompt") or "").strip()
         seconds = float(payload.get("seconds") or payload.get("duration") or 30.0)
@@ -1119,6 +1107,45 @@ def _run_sa3_audio(request: RunRequest, total_started: float) -> RunResponse:
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_job = re.sub(r"[^A-Za-z0-9_.-]", "_", request.job_id)[:80] or "sa3"
         out_path = out_dir / f"sa3_{safe_job}.mp3"
+
+        # Warm path first: the resident sa3_server (filmforge-sa3.service) skips
+        # the ~50s per-job model load. On any failure (not running, OOM, card
+        # full) fall through to the proven subprocess path below.
+        try:
+            started = time.monotonic()
+            resp = requests.post(
+                f"http://127.0.0.1:{os.environ.get('SA3_PORT', '9102')}/music",
+                json={"prompt": prompt, "seconds": seconds},
+                timeout=min(request.timeout_sec, 900),
+            )
+            if resp.status_code == 200 and resp.content:
+                out_path.write_bytes(resp.content)
+                timings.comfy_run_sec = time.monotonic() - started
+                output_files = build_output_files([str(out_path)])
+                timings.total_sec = time.monotonic() - total_started
+                return RunResponse(
+                    ok=True, job_id=request.job_id, asset_group=request.asset_group,
+                    downloaded_assets=[], restart_performed=False, comfy_prompt_id=None,
+                    outputs=[str(out_path)], output_files=output_files, keyframes=[],
+                    timings=timings,
+                    debug=RunDebug(history_found=True, comfy_base_url=get_settings().comfy_base_url),
+                    error=None,
+                )
+            LOGGER.warning("sa3: warm server returned %s — falling back to subprocess", resp.status_code)
+        except requests.RequestException as exc:
+            LOGGER.info("sa3: warm server unavailable (%s) — subprocess path", type(exc).__name__)
+
+        # Subprocess fallback loads SA3 fresh (~12GB). Only evict resident comfy
+        # models when the card is actually tight — an unconditional eviction
+        # forces the next render to reload ~60GB (observed 2026-07-17: audio job
+        # stalled the director's render session).
+        free_mib = _gpu_free_mib()
+        if free_mib < 14000:
+            try:
+                LOGGER.info("sa3: only %dMiB free — evicting comfy models", free_mib)
+                free_comfy_memory()
+            except Exception as exc:  # best-effort — SA3 loads its own weights regardless
+                LOGGER.warning("sa3: free_comfy_memory failed (%s) — continuing", exc)
 
         sa3_python = Path(os.environ.get("SA3_VENV", "/workspace/sa3_spike")) / "bin" / "python"
         infer_script = Path(__file__).resolve().parent / "sa3_infer.py"

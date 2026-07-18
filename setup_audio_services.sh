@@ -51,6 +51,33 @@ systemctl enable -q filmforge-parler
 systemctl restart filmforge-parler
 log "filmforge-parler started (model load ~60s; check curl localhost:9101/health)"
 
+# 3b) Resident SA3 music server (warm cues; lazy-load + idle-unload).
+SA3_VENV="$WORKSPACE/sa3_spike"
+if [ -x "$SA3_VENV/bin/python" ]; then
+  cat > /etc/systemd/system/filmforge-sa3.service <<EOF
+[Unit]
+Description=FilmForge resident Stable Audio 3 server (warm music cues)
+After=network.target
+
+[Service]
+Environment=HF_HOME=$WORKSPACE/hf_cache
+Environment=SA3_PORT=9102
+WorkingDirectory=$REPO_DIR
+ExecStart=$SA3_VENV/bin/python $REPO_DIR/sa3_server.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable -q filmforge-sa3
+  systemctl restart filmforge-sa3
+  log "filmforge-sa3 started (model loads lazily on first cue)"
+else
+  log "sa3 venv missing — skipping music server (run provision_sa3.sh)"
+fi
+
 # 4) Advertise audio capabilities on the worker (quoted Environment line!).
 if [ -f "$UNIT_WORKER" ] && ! grep -q "stable_audio3" "$UNIT_WORKER"; then
   python3 - <<PY
