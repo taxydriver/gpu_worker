@@ -1,0 +1,98 @@
+# FilmForge AUDIO worker as a SkyPilot task — VAST cloud.
+#
+# The sound stage on a cheap 24GB Vast box: Stable Audio 3 (music) + Indic
+# Parler (Telugu/Tamil/Hindi described-voice dialogue + Maya's interactive
+# voice) + Chatterbox (EN dialogue, clones a reference clip). Vast twin of
+# ff_worker_audio_runpod.yaml; one department per box (never render models).
+#
+# Proven mechanics baked in (2026-07-23/24 smoke + E2E, see discovery
+# sa3-barebox-install-stall-uv-vs-pip-2026-07-23.md):
+#   - provisioners are torch-first (bare-box pip resolver stall fix, in repo)
+#   - cloudflared invoked by FULL PATH (/usr/local/bin not always on PATH here)
+#   - parler_server (:9101) started in the run block — the worker's /tts and
+#     tts_dialogue handler PROXY to it; without it voice 502s
+#   - SkyPilot's runtime python is 3.10 (host shell may be 3.8 — chatterbox
+#     needs >=3.10, so provisioning must run in setup, not an ssh shell)
+#   - E2E verified on a Vast RTX3090 (Romania, $0.25/hr, ~107MB/s pipe)
+#
+# Launch:
+#   ~/.venvs/skypilot/bin/sky launch -c ff-audio ff_worker_audio_vast.yaml -y -d \
+#     --env FILMFORGE_BACKEND_URL=… \
+#     --secret WORKER_REGISTRATION_TOKEN=… \
+#     --secret HF_TOKEN=…
+# Idle shutdown:  sky autostop ff-audio -i 30 --down
+# Teardown:       sky down -y ff-audio
+
+resources:
+  infra: vast
+  accelerators: {RTX3090:1, RTX4090:1, L40S:1, A100-80GB:1}   # 24GB is plenty
+  use_spot: false   # audio serves interactive voice too — don't get preempted
+  ports: 9000
+  disk_size: 100    # ~25GB audio weights + 3 venv torches + HF cache + headroom
+
+envs:
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # The job-acceptance gate: this worker takes audio work only.
+  WORKER_CAPABILITIES: "tts_dialogue,stable_audio3"
+  HF_HOME: /workspace/hf_cache
+  # Injected at launch: FILMFORGE_BACKEND_URL, WORKER_REGISTRATION_TOKEN, HF_TOKEN
+
+setup: |
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl git python3 python3-dev python3-pip python3-venv build-essential ffmpeg
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+  mkdir -p /workspace/hf_cache
+  export HF_HOME=/workspace/hf_cache HF_HUB_ENABLE_HF_TRANSFER=0
+
+  # Worker code from GitHub (torch-first provisioners landed 3d265c6).
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -q -r requirements.txt
+
+  # Provision the audio stacks (idempotent; each in its own venv).
+  WORKSPACE=/workspace bash provision_tts.sh      # chatterbox + parler
+  WORKSPACE=/workspace bash provision_sa3.sh      # SA3 music
+
+run: |
+  set -uo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export PARLER_PORT=9101
+
+  # Resident Parler voice server — the worker's /tts + tts_dialogue proxy here.
+  pkill -f parler_server 2>/dev/null || true
+  nohup /workspace/parler_spike/bin/python /workspace/gpu_worker/parler_server.py \
+    >/tmp/parler.log 2>&1 &
+
+  # cloudflared tunnel so the backend/rail reach the worker publicly.
+  pkill -f "cloudflared tunnel" || true
+  : >/tmp/ff_tunnel.log
+  nohup /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:9000 --no-autoupdate \
+    >/tmp/ff_tunnel.log 2>&1 &
+  WORKER_URL=""
+  for _ in $(seq 1 40); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  [ -z "$WORKER_URL" ] && { echo "ERROR: no tunnel URL"; exit 1; }
+  echo "Tunnel: $WORKER_URL" | tee /tmp/worker_url.txt
+
+  # No COMFY_START_CMD / COMFY_BASE_URL: audio-only box, comfy watchdog disabled.
+  export SA3_VENV=/workspace/sa3_spike
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-audio-vast-$(hostname)"
+
+  # Worker app (self-registers with the backend, advertises audio caps).
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port 9000

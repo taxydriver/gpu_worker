@@ -78,11 +78,21 @@ run: |
   set -euo pipefail
   WORKER_PORT=9000
   export HF_HOME=/workspace/hf_cache
+  export PARLER_PORT=9101
 
-  # cloudflared tunnel so the broker reaches /health.
+  # Resident Parler voice server — the worker's /tts + tts_dialogue handler
+  # PROXY to :9101; without it, voice requests 502 (gap found during the
+  # 2026-07-24 Vast E2E; on Verda systemd owns this, on SkyPilot the run
+  # block must).
+  pkill -f parler_server 2>/dev/null || true
+  nohup /workspace/parler_spike/bin/python /workspace/gpu_worker/parler_server.py \
+    >/tmp/parler.log 2>&1 &
+
+  # cloudflared tunnel so the broker reaches /health. Full path: /usr/local/bin
+  # is not always on PATH in the run env.
   pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
   : >/tmp/ff_tunnel.log
-  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  nohup /usr/local/bin/cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
   WORKER_URL=""
   for _ in $(seq 1 30); do
     WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
