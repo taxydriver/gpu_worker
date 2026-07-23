@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     worker_registration_token: str | None = Field(default=None, alias="WORKER_REGISTRATION_TOKEN")
     worker_api_token: str | None = Field(default=None, alias="WORKER_API_TOKEN")
     worker_heartbeat_seconds: int = Field(default=60, alias="WORKER_HEARTBEAT_SECONDS")
+    # Vision boxes only: public URL of the co-resident vLLM server (OpenAI-compatible,
+    # e.g. https://<tunnel>.trycloudflare.com/v1). Advertised via registration metadata
+    # so the backend's vision-worker discovery can hand it to the LLM gateway.
+    worker_vision_base_url: str | None = Field(default=None, alias="WORKER_VISION_BASE_URL")
 
     # Proactive ComfyUI recycle to clear accumulated / fragmented VRAM (both
     # opt-in; 0 disables). The watchdog restarts ComfyUI while the worker is idle

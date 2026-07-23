@@ -471,6 +471,24 @@ def _broker_worker_payload() -> dict[str, object]:
 
     max_concurrent_jobs = settings.resolved_max_concurrent_jobs()
     comfy_queue = comfy_queue_depth()
+    metadata: dict = {
+        "comfy_base_url": settings.comfy_base_url,
+        "comfy_reachable": is_comfy_healthy(),
+        "comfy_queue_running": comfy_queue["running"] if comfy_queue else None,
+        "comfy_queue_pending": comfy_queue["pending"] if comfy_queue else None,
+        # Cloud provider + instance id let the deploy UI cross-check this
+        "provider": settings.worker_provider,
+        "instance_id": settings.worker_instance_id,
+        "performance": _performance_snapshot(),
+        "performance_window": _STATS_WINDOW,
+        "active_jobs": active_jobs,
+        "max_concurrent_jobs": max_concurrent_jobs,
+        "warmed_asset_groups": warmed,
+    }
+    if settings.worker_vision_base_url:
+        # Vision boxes: the vLLM tunnel URL the backend's LLM gateway should call
+        # (distinct from base_url, which is this worker app's own :9000 tunnel).
+        metadata["vision_base_url"] = settings.worker_vision_base_url.rstrip("/")
     return {
         "worker_id": settings.resolved_worker_id(),
         "worker_name": settings.resolved_worker_name(),
@@ -488,20 +506,7 @@ def _broker_worker_payload() -> dict[str, object]:
         "active_jobs": active_jobs,
         "max_concurrency": max_concurrent_jobs,
         "max_concurrent_jobs": max_concurrent_jobs,
-        "metadata": {
-            "comfy_base_url": settings.comfy_base_url,
-            "comfy_reachable": is_comfy_healthy(),
-            "comfy_queue_running": comfy_queue["running"] if comfy_queue else None,
-            "comfy_queue_pending": comfy_queue["pending"] if comfy_queue else None,
-            # Cloud provider + instance id let the deploy UI cross-check this
-            "provider": settings.worker_provider,
-            "instance_id": settings.worker_instance_id,
-            "performance": _performance_snapshot(),
-            "performance_window": _STATS_WINDOW,
-            "active_jobs": active_jobs,
-            "max_concurrent_jobs": max_concurrent_jobs,
-            "warmed_asset_groups": warmed,
-        },
+        "metadata": metadata,
     }
 
 
