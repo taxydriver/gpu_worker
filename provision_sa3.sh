@@ -34,11 +34,22 @@ if [ -z "${HF_TOKEN:-}" ]; then
   exit 1
 fi
 
-log "Stable Audio 3: venv + pip (setuptools first to avoid build-wheel errors)"
+log "Stable Audio 3: venv + pip (torch from the CUDA index FIRST)"
 python3 -m venv --system-site-packages "$WORKSPACE/sa3_spike"
-"$WORKSPACE/sa3_spike/bin/pip" -q install -U pip setuptools wheel
-"$WORKSPACE/sa3_spike/bin/pip" -q install stable-audio-3 \
-  || "$WORKSPACE/sa3_spike/bin/pip" -q install "git+https://github.com/Stability-AI/stable-audio-3.git"
+"$WORKSPACE/sa3_spike/bin/pip" install -U pip setuptools wheel
+# The stable-audio-3 repo is built for `uv`: its pyproject pins torch==2.7.1 /
+# torchaudio==2.7.1 and routes them to the PyTorch cu126 index via
+# [tool.uv.sources] — which pip does NOT read. Left to pip, torch resolves against
+# PyPI alongside transformers>=5.8.0 / numpy>=2.2.6 / huggingface-hub>=1.7.1 and
+# the resolver backtracks forever (the observed install stall, 2026-07-23). So
+# install the pinned torch pair from the CUDA wheel index up front — this both
+# gets the GPU build and satisfies the heaviest constraint before the git install,
+# so pip no longer backtracks across every torch version.
+"$WORKSPACE/sa3_spike/bin/pip" install torch==2.7.1 torchaudio==2.7.1 \
+  --index-url https://download.pytorch.org/whl/cu126
+# There is no `stable-audio-3` package on PyPI — install the lib straight from git
+# (no -q, so setup progress shows in the deploy logs). torch is already satisfied.
+"$WORKSPACE/sa3_spike/bin/pip" install "git+https://github.com/Stability-AI/stable-audio-3.git"
 
 log "Downloading stable-audio-3-medium snapshot (~10.4GB, gated)"
 HF_TOKEN="$HF_TOKEN" "$WORKSPACE/sa3_spike/bin/python" - <<'PY'

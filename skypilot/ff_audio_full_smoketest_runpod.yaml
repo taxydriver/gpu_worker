@@ -1,0 +1,92 @@
+# FilmForge — FULL audio department smoke test on RunPod (SkyPilot).
+#
+# Proves the whole sound stage installs + runs on one bare 24GB box:
+#   - SA3 (music)      -> sa3_infer.py            (the real worker path)
+#   - Parler (Telugu)  -> ParlerTTS, mirrors _run_tts_dialogue / parler_server.py
+#   - Chatterbox (EN)  -> chatterbox-tts standalone (NOTE: not yet wired into the
+#                         worker; this only proves it installs + generates)
+# Each model runs in its OWN python process so GPU memory is freed between them
+# (no 3-model VRAM stack). Standalone: no worker/registration/broker/backend.
+#
+# Uploads the LOCAL gpu_worker (workdir) so uncommitted provision fixes are used
+# without pushing. HF_TOKEN (gated Indic Parler + SA3) injected at launch.
+#
+# Launch:
+#   ~/.venvs/skypilot/bin/sky launch -c ff-audio-smoke \
+#     gpu_worker/skypilot/ff_audio_full_smoketest_runpod.yaml -y --secret HF_TOKEN=hf_xxx
+# Pull clips:  scp ff-audio-smoke:/workspace/out/* ~/Downloads/
+# Teardown:    ~/.venvs/skypilot/bin/sky down -y ff-audio-smoke
+
+resources:
+  infra: runpod
+  accelerators: {RTX4090:1, L40S:1, A100-80GB:1}
+  use_spot: false
+  disk_size: 100   # 3 venvs each pip-install torch + ~17GB models + HF cache
+
+workdir: /Users/vamsee/ML/projects/Filmforge/gpu_worker
+
+envs:
+  HF_HOME: /workspace/hf_cache
+  # Injected at launch as a secret: HF_TOKEN
+
+setup: |
+  set -euo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export HF_HUB_ENABLE_HF_TRANSFER=0
+  mkdir -p "$HF_HOME" /workspace/out
+
+  rm -rf /workspace/gpu_worker
+  cp -r ~/sky_workdir /workspace/gpu_worker
+  cd /workspace/gpu_worker
+
+  # Music (SA3) + both dialogue models (Chatterbox EN + Parler Telugu).
+  WORKSPACE=/workspace bash provision_sa3.sh
+  WORKSPACE=/workspace bash provision_tts.sh all
+
+run: |
+  set -uo pipefail   # NOT -e: we want all three attempted + reported independently
+  export HF_HOME=/workspace/hf_cache
+  cd /workspace/gpu_worker
+  mkdir -p /workspace/out
+
+  echo "=== 1/3  SA3 music ==="
+  /workspace/sa3_spike/bin/python sa3_infer.py \
+    --prompt "warm cinematic orchestral score, slow strings, hopeful" \
+    --seconds 8 --out /workspace/out/music.mp3 && echo "OK music" || echo "FAILED music"
+
+  echo "=== 2/3  Parler Telugu (real dialogue path) ==="
+  /workspace/parler_spike/bin/python - <<'PY' || echo "FAILED parler"
+  import soundfile as sf, torch
+  from parler_tts import ParlerTTSForConditionalGeneration
+  from transformers import AutoTokenizer
+  mid = "ai4bharat/indic-parler-tts"
+  model = ParlerTTSForConditionalGeneration.from_pretrained(mid).to("cuda")
+  tok = AutoTokenizer.from_pretrained(mid)
+  dtok = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path)
+  desc = "Lalitha speaks in a clear, calm, expressive voice with natural Telugu pronunciation, recorded closely with little background noise."
+  text = "నమస్కారం, నేను మాయ. మీ సినిమా సిద్ధంగా ఉంది."
+  d = dtok(desc, return_tensors="pt").to("cuda")
+  p = tok(text, return_tensors="pt").to("cuda")
+  gen = model.generate(input_ids=d.input_ids, attention_mask=d.attention_mask,
+                       prompt_input_ids=p.input_ids, prompt_attention_mask=p.attention_mask)
+  audio = gen.cpu().to(torch.float32).numpy().squeeze()
+  sf.write("/workspace/out/telugu.wav", audio, model.config.sampling_rate)
+  print("wrote telugu.wav", audio.shape, model.config.sampling_rate)
+  PY
+  echo "OK parler (if no FAILED above)"
+
+  echo "=== 3/3  Chatterbox English (standalone; not yet worker-wired) ==="
+  /workspace/tts_spike/bin/python - <<'PY' || echo "FAILED chatterbox"
+  import torchaudio as ta
+  from chatterbox.tts import ChatterboxTTS
+  model = ChatterboxTTS.from_pretrained(device="cuda")
+  wav = model.generate("Your film is ready. Shall we begin the screening?")
+  ta.save("/workspace/out/english.wav", wav, model.sr)
+  print("wrote english.wav", tuple(wav.shape), model.sr)
+  PY
+  echo "OK chatterbox (if no FAILED above)"
+
+  echo "=== RESULTS ==="
+  ls -la /workspace/out/
+  for f in /workspace/out/*; do file "$f"; done
+  echo "=== FULL AUDIO SMOKE TEST DONE ==="

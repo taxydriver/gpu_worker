@@ -1,0 +1,67 @@
+# FilmForge — Stable Audio 3 STANDALONE smoke test on RunPod (SkyPilot).
+#
+# Purpose: prove the music department works on a bare RunPod box WITHOUT the
+# backend/broker. Box comes up → provisions SA3 (sa3_spike venv) → generates one
+# music clip via sa3_infer.py → reports the output file. No worker, no
+# registration, no ComfyUI, no tunnel.
+#
+# Barebox strategy (per ff_worker_audio_runpod.yaml): NO image_id — SkyPilot's
+# clean runpod/base ubuntu — and let provision_sa3.sh's venv pip-install torch.
+# Weights land in /workspace (HF_HOME) per the root-fs-full lesson.
+#
+# PREREQ (once): HF token whose account accepted the gated
+# stabilityai/stable-audio-3-medium license.
+#
+# Launch (you supply the token — never committed):
+#   ~/.venvs/skypilot/bin/sky launch -c ff-sa3-smoke \
+#     gpu_worker/skypilot/ff_audio_sa3_smoketest_runpod.yaml -y \
+#     --secret HF_TOKEN=hf_xxx
+# Pull the clip down:  ~/.venvs/skypilot/bin/sky scp ff-sa3-smoke:/workspace/sa3_smoketest.mp3 .
+# Teardown:            ~/.venvs/skypilot/bin/sky down -y ff-sa3-smoke
+
+resources:
+  infra: runpod
+  accelerators: {RTX4090:1, L40S:1, A100-80GB:1}   # 24GB+ is plenty for SA3
+  use_spot: false
+  disk_size: 80   # ~10GB SA3 weights + torch + HF cache + headroom (was 150 —
+                  # smaller disk qualifies more hosts, RunPod capacity is tight)
+
+# Upload the LOCAL gpu_worker (this checkout) instead of git-cloning from GitHub,
+# so we can test uncommitted fixes to provision_sa3.sh without pushing first.
+# SkyPilot syncs this to ~/sky_workdir on the box (respects .gitignore).
+workdir: /Users/vamsee/ML/projects/Filmforge/gpu_worker
+
+envs:
+  HF_HOME: /workspace/hf_cache
+  # Injected at launch as a secret: HF_TOKEN
+
+setup: |
+  set -euo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export HF_HUB_ENABLE_HF_TRANSFER=0   # provisioner venv has no hf_transfer
+  mkdir -p "$HF_HOME"
+
+  # Use the uploaded local checkout (workdir) instead of a git clone.
+  rm -rf /workspace/gpu_worker
+  cp -r ~/sky_workdir /workspace/gpu_worker
+
+  # Provision only SA3 (creates /workspace/sa3_spike, downloads the gated model).
+  cd /workspace/gpu_worker
+  WORKSPACE=/workspace bash provision_sa3.sh
+
+run: |
+  set -euo pipefail
+  export HF_HOME=/workspace/hf_cache
+  cd /workspace/gpu_worker
+  echo "=== Generating SA3 music clip ==="
+  /workspace/sa3_spike/bin/python sa3_infer.py \
+    --prompt "warm cinematic orchestral score, slow strings, hopeful, film trailer" \
+    --seconds 12 \
+    --out /workspace/sa3_smoketest.mp3
+  echo "=== Result ==="
+  ls -la /workspace/sa3_smoketest.mp3
+  file /workspace/sa3_smoketest.mp3 || true
+  # Report duration if ffprobe is around (best-effort).
+  ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 \
+    /workspace/sa3_smoketest.mp3 2>/dev/null || echo "(ffprobe not available — size check above is the proof)"
+  echo "=== SA3 SMOKE TEST DONE ==="

@@ -1,0 +1,63 @@
+# FilmForge — VOICE E2E on VAST: parler_server + worker app, broker-aware Maya
+# /speak path. Vast twin of ff_audio_e2e_runpod.yaml (RunPod capacity was dry).
+# Bare Vast ubuntu (no image_id): apt the basics, then same flow as RunPod twin.
+# provision_tts.sh is torch-first (2026-07-24 fix) so setup cannot silently stall.
+#
+# Launch:
+#   ~/.venvs/skypilot/bin/sky launch -c ff-voice-e2e -d \
+#     gpu_worker/skypilot/ff_audio_e2e_vast.yaml -y --secret HF_TOKEN=hf_xxx
+# Teardown:  ~/.venvs/skypilot/bin/sky down -y ff-voice-e2e
+
+resources:
+  infra: vast
+  accelerators: {RTX3090:1, RTX4090:1, L40S:1, A100-80GB:1}   # 24GB+ tier
+  use_spot: false   # director tests interactively — don't get preempted mid-demo
+  ports: 9000
+  disk_size: 60
+
+workdir: /Users/vamsee/ML/projects/Filmforge/gpu_worker
+
+envs:
+  HF_HOME: /workspace/hf_cache
+  WORKER_CAPABILITIES: "tts_dialogue"
+  REGISTER_WITH_BACKEND: "false"   # registered with the LOCAL broker manually
+  # HF_TOKEN injected at launch (gated Indic Parler)
+
+setup: |
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl git python3 python3-dev python3-pip python3-venv build-essential
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+  mkdir -p /workspace/hf_cache
+  export HF_HOME=/workspace/hf_cache HF_HUB_ENABLE_HF_TRANSFER=0
+  rm -rf /workspace/gpu_worker
+  cp -r ~/sky_workdir /workspace/gpu_worker
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -q -r requirements.txt
+  WORKSPACE=/workspace bash provision_tts.sh parler   # torch-first — no stall
+
+run: |
+  set -uo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export PARLER_PORT=9101
+  pkill -f parler_server 2>/dev/null || true
+  nohup /workspace/parler_spike/bin/python /workspace/gpu_worker/parler_server.py \
+    >/tmp/parler.log 2>&1 &
+  pkill -f "cloudflared tunnel" || true
+  : >/tmp/ff_tunnel.log
+  nohup /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:9000 --no-autoupdate >/tmp/ff_tunnel.log 2>&1 &
+  WORKER_URL=""
+  for _ in $(seq 1 40); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  echo "WORKER_TUNNEL_URL=$WORKER_URL" | tee /tmp/worker_url.txt
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port 9000

@@ -1,0 +1,75 @@
+# FilmForge — VOICE E2E on RunPod: parler_server + worker app, for the
+# broker-aware Maya /speak path. Parler-only (voice) — SA3/Chatterbox omitted so
+# the box is fast + cheap; /speak only needs tts_dialogue.
+#
+# Flow this proves: rail /speak → backend /api/render-broker/voice-worker →
+# {this box}/tts (worker app :9000, public tunnel) → resident parler_server
+# (:9101) → wav. The box is registered with the LOCAL broker manually (its tunnel
+# is reachable FROM the dev machine, so the local backend need not be exposed).
+#
+# Uploads local gpu_worker (workdir) so the uncommitted /tts proxy is present.
+# Launch DETACHED so the box keeps serving:
+#   ~/.venvs/skypilot/bin/sky launch -c ff-audio-e2e -d \
+#     gpu_worker/skypilot/ff_audio_e2e_runpod.yaml -y --secret HF_TOKEN=hf_xxx
+# Worker URL:  ssh ff-audio-e2e cat /tmp/worker_url.txt
+# Teardown:    ~/.venvs/skypilot/bin/sky down -y ff-audio-e2e
+
+resources:
+  infra: runpod
+  accelerators: {RTX4090:1, L40S:1, A100-80GB:1}
+  use_spot: false
+  disk_size: 60   # parler ~2GB + flan-t5 ~3GB + torch + worker venv
+
+workdir: /Users/vamsee/ML/projects/Filmforge/gpu_worker
+
+envs:
+  HF_HOME: /workspace/hf_cache
+  WORKER_CAPABILITIES: "tts_dialogue"
+  REGISTER_WITH_BACKEND: "false"   # we register with the LOCAL broker manually
+  # HF_TOKEN injected at launch (gated Indic Parler)
+
+setup: |
+  set -euo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export HF_HUB_ENABLE_HF_TRANSFER=0
+  mkdir -p "$HF_HOME"
+  rm -rf /workspace/gpu_worker
+  cp -r ~/sky_workdir /workspace/gpu_worker
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -q -r requirements.txt
+  WORKSPACE=/workspace bash provision_tts.sh parler   # Maya's Indic/Telugu voice
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+
+run: |
+  set -uo pipefail
+  export HF_HOME=/workspace/hf_cache
+  export PARLER_PORT=9101
+  # HF_TOKEN (--secret) is in the run env so parler_server can pull the gated
+  # model if setup didn't cache it. provision runs in setup, so it's usually cached.
+
+  # 1) Resident parler_server (:9101) — loads ~4GB, serves /tts. Maya's voice.
+  pkill -f parler_server 2>/dev/null || true
+  nohup /workspace/parler_spike/bin/python /workspace/gpu_worker/parler_server.py \
+    >/tmp/parler.log 2>&1 &
+
+  # 2) cloudflared tunnel for the worker app (:9000) — public URL the rail calls.
+  #    Full path: /usr/local/bin (where setup installs it) isn't always on PATH here.
+  pkill -f "cloudflared tunnel" || true
+  : >/tmp/ff_tunnel.log
+  nohup /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:9000 --no-autoupdate >/tmp/ff_tunnel.log 2>&1 &
+  WORKER_URL=""
+  for _ in $(seq 1 40); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  echo "WORKER_TUNNEL_URL=$WORKER_URL" | tee /tmp/worker_url.txt
+
+  # 3) Worker app (:9000) in the foreground so the job stays UP and serving.
+  #    No COMFY_START_CMD -> comfy watchdog disables itself (audio-only box).
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port 9000

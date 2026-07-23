@@ -1066,6 +1066,38 @@ def _run_tts_dialogue(request: RunRequest, total_started: float) -> RunResponse:
         )
 
 
+@app.post("/tts")
+def tts_direct(payload: dict):
+    """Low-latency dialogue TTS for Maya's interactive voice (the rail's /speak).
+
+    Proxies straight to the resident parler_server (:9101), bypassing the broker
+    /run job path + slot/heartbeat accounting so Maya's voice never queues behind
+    renders. Body: {text, description?}. Returns audio/wav. This is the endpoint
+    the rail reaches after discovering this worker via the broker's
+    /api/render-broker/voice-worker.
+    """
+    from fastapi.responses import Response
+
+    text = str((payload or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty text")
+    port = os.environ.get("PARLER_PORT", "9101")
+    try:
+        resp = requests.post(
+            f"http://127.0.0.1:{port}/tts",
+            json={"text": text, "description": (payload or {}).get("description")},
+            timeout=120,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"parler_server unreachable: {exc}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"parler_server returned {resp.status_code}: {resp.text[:200]}",
+        )
+    return Response(content=resp.content, media_type="audio/wav")
+
+
 def _gpu_free_mib() -> int:
     """Free VRAM on GPU 0 in MiB; 0 on any failure (treated as 'tight')."""
     try:

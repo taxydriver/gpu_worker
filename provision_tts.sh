@@ -49,10 +49,15 @@ provision_parler() {
     log "ERROR: Parler repo is gated — set HF_TOKEN (accept terms at hf.co/ai4bharat/indic-parler-tts first)."
     return 1
   fi
-  log "Parler: venv + pip + snapshot (gated, using HF_TOKEN)"
+  log "Parler: venv + pip (torch FIRST) + snapshot (gated, using HF_TOKEN)"
   python3 -m venv --system-site-packages "$WORKSPACE/parler_spike"
   "$WORKSPACE/parler_spike/bin/pip" -q install --upgrade pip
-  "$WORKSPACE/parler_spike/bin/pip" -q install "git+https://github.com/huggingface/parler-tts.git" soundfile
+  # torch first: on a bare box, letting the parler-tts git install resolve torch
+  # sends pip's resolver into silent hours-long backtracking (observed 2026-07-23/24,
+  # same failure as provision_sa3.sh — see discovery sa3-barebox-install-stall).
+  # Satisfying the heaviest dep up front makes the git install resolve instantly.
+  "$WORKSPACE/parler_spike/bin/pip" install torch torchaudio
+  "$WORKSPACE/parler_spike/bin/pip" install "git+https://github.com/huggingface/parler-tts.git" soundfile
   HF_TOKEN="$HF_TOKEN" "$WORKSPACE/parler_spike/bin/python" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
