@@ -54,18 +54,6 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
         },
     ],
-    "stable_audio_v1": [
-        {
-            "name": "stable_audio_checkpoint",
-            "path": "/workspace/ComfyUI/models/checkpoints/stable-audio-open-1.0.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/stable-audio-open-1.0_repackaged/resolve/main/stable-audio-open-1.0.safetensors",
-        },
-        {
-            "name": "stable_audio_t5",
-            "path": "/workspace/ComfyUI/models/clip/t5-base.safetensors",
-            "url": "https://huggingface.co/ComfyUI-Wiki/t5-base/resolve/main/t5-base.safetensors",
-        },
-    ],
     # LTX-2.3 Fast (distilled) — T2V/I2V with native audio. Uses ComfyUI's built-in
     # LTX-2 nodes only (no custom node). Requires a recent ComfyUI build (>= the one
     # shipping LTXAVTextEncoderLoader / the LTX-2.3 AV nodes). The distilled checkpoint
@@ -87,7 +75,7 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
     # Per-character identity LoRAs (FilmForge-trained, WAN 2.2 I2V). OPT-IN — gated by
     # the `character_loras` capability (see CAPABILITY_ASSET_GROUPS), which base WAN
     # deploys do NOT declare. To "also deploy the LoRAs", add it to the worker caps:
-    #   WORKER_CAPABILITIES=flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras
+    #   WORKER_CAPABILITIES=flux2_stills,wan_i2v,ltx_i2v,character_loras
     # then the worker preloads + serves this group (and /assets/ensure allows warming
     # it). Workflows reference loras/<character>/... and chain them after the lightx2v
     # loaders at strength ~0.7. Hosted on a public HF repo (tokenless download, like
@@ -181,9 +169,6 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "flux_stills_v1": ["flux_stills_v1"],
     "wan_i2v": ["wan_i2v_v1"],
     "wan_i2v_v1": ["wan_i2v_v1"],
-    "stable_audio": ["stable_audio_v1"],
-    "stable_audio1": ["stable_audio_v1"],
-    "stable_audio_v1": ["stable_audio_v1"],
     "ltx_av": ["ltx_i2v_v1"],
     "ltx_i2v": ["ltx_i2v_v1"],
     "ltx_t2v": ["ltx_i2v_v1"],

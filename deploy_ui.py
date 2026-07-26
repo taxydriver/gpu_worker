@@ -2443,8 +2443,8 @@ input:focus,select:focus{outline:none;border-color:#7c3aed}
         </div>
         <div class="fg"><label>Preload Models</label>
           <select id="v-fresh-warm">
-            <option value="flux_stills_v1,wan_i2v_v1,stable_audio_v1,ltx_i2v_v1">Flux + WAN + Audio + LTX</option>
-            <option value="flux_stills_v1,wan_i2v_v1,stable_audio_v1">Flux + WAN + Audio</option>
+            <option value="flux_stills_v1,wan_i2v_v1,ltx_i2v_v1">Flux + WAN + LTX</option>
+            <option value="flux_stills_v1,wan_i2v_v1">Flux + WAN</option>
             <option value="wan_i2v_v1,ltx_i2v_v1">WAN + LTX</option>
             <option value="flux_stills_v1,wan_i2v_v1">Flux + WAN</option>
             <option value="ltx_i2v_v1">LTX 2.3 Fast only</option>
@@ -3843,7 +3843,6 @@ function formatWorkerEta(etaByAssetGroup) {
   const labels = {
     flux_stills_v1: 'flux',
     wan_i2v_v1: 'wan',
-    stable_audio_v1: 'audio',
     ltx_i2v_v1: 'ltx',
   };
   return Object.entries(etaByAssetGroup)

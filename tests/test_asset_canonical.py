@@ -15,7 +15,14 @@ def test_legacy_aliases_resolve_to_canonical():
     # Legacy capability names → canonical asset-group names
     assert canonical_asset_group("wan_i2v") == "wan_i2v_v1"
     assert canonical_asset_group("flux2_stills") == "flux_stills_v1"
-    assert canonical_asset_group("stable_audio") == "stable_audio_v1"
+    assert canonical_asset_group("stable_audio3") == "stable_audio3_v1"
+
+
+def test_retired_stable_audio1_aliases_are_unknown():
+    # The legacy Stable Audio 1 ComfyUI path is retired (SA3 is the audio engine).
+    assert canonical_asset_group("stable_audio") is None
+    assert canonical_asset_group("stable_audio1") is None
+    assert canonical_asset_group("stable_audio_v1") is None
 
 
 
