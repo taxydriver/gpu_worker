@@ -28,10 +28,20 @@
 # Teardown:       sky down -y ff-audio
 
 resources:
-  infra: runpod
+  # US-pinned: identical $0.27 across 25 US zones, and this box serves Maya's
+  # interactive voice — an unpinned optimizer picked AU (2026-07-26 dryrun),
+  # adding round-trip latency for nothing.
+  infra: runpod/US
   # 24GB is enough: SA3 ~15GB loads per job; the two dialogue models (~8GB) can
-  # stay resident. L40S/A100 as availability fallbacks.
-  accelerators: {RTX4090:1, L40S:1, A100-80GB:1}
+  # stay resident. Cheapest-first (RunPod catalog $/hr, 2026-07-26): A5000 24GB
+  # $0.27, L4 24GB $0.39, A40 48GB $0.44 as the availability fallback. The old
+  # list (RTX4090 $0.69 / L40S $0.99 / A100-80GB $1.39) never had the Vast twin's
+  # cost guardrail back-ported — A100-80GB on an audio box is 5x overpay.
+  accelerators: {RTXA5000:1, L4:1, A40:1}
+  # Hard ceiling. Unlike Vast, RunPod's catalog prices are real (fixed, published,
+  # no per-host mislabeling), so this filter actually binds — see discovery
+  # vast-skypilot-cheap-selection-unreliable-2026-07-25.md for why it does not on Vast.
+  max_hourly_cost: 0.50
   use_spot: false   # audio jobs are short; flip to spot later if cost demands
   ports: 9000
   disk_size: 150    # ~30GB audio weights + HF cache + per-venv torch + headroom
@@ -54,9 +64,18 @@ setup: |
   mkdir -p "$HF_HOME"
 
   # cloudflared so the broker can probe /health over a public URL.
+  # Download to a temp path, then `install` it — never `curl -o` straight to the
+  # destination. Observed 2026-07-26: curl hit an SSL eof AFTER writing all 32MB,
+  # so it returned 56, the `&& chmod +x` was skipped, and `set -e` did NOT fire
+  # (bash exempts a non-final command in an && list). Result: a complete-looking
+  # but NON-EXECUTABLE cloudflared, setup "succeeding", and the run block dying on
+  # permission-denied with no tunnel — a box that can never be probed or used.
   if ! command -v cloudflared >/dev/null 2>&1; then
-    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+    curl -fsSL --retry 3 --retry-delay 2 \
+      https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /tmp/cloudflared.dl
+    install -m 0755 /tmp/cloudflared.dl /usr/local/bin/cloudflared
+    rm -f /tmp/cloudflared.dl
   fi
 
   # Worker code from GitHub (same repo/idiom as the render variant).
