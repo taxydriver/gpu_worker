@@ -134,6 +134,28 @@ def test_drift_guard_is_a_no_op_without_a_plan() -> None:
     assert 'if test "${#WORKER_PLAN[@]}" -gt 0; then' in script
 
 
+def test_stale_resident_services_are_stopped_before_comfyui_starts() -> None:
+    """filmforge-vllm/-parler/-sa3 live on the OS VOLUME, which is reattached on
+    every deploy — so they boot even when this deploy has no vision/audio card.
+    Seen twice on 2026-07-26: an 83GB vLLM on gpu2 while that card's worker
+    advertised wan_i2v (guaranteed OOM). Must run before ComfyUI loads, so the
+    reclaimed card is already free.
+    """
+    script = _script(PLAN)
+    guard = script.index("_stop_stale_resident")
+    comfy_start = script.index('systemctl enable --now "comfyui-gpu')
+    assert guard < comfy_start, "stale residents must be stopped BEFORE ComfyUI starts"
+    # Wanted departments are the union of the plan and the capability broadcast,
+    # so a legacy caps-only audio box keeps its servers.
+    assert 'case ",${WORKER_PLAN_SPEC}," in *,vision,*) _wants_vision=1 ;; esac' in script
+    assert '*,tts_dialogue,*|*,stable_audio3,*) _wants_audio=1 ;;' in script
+
+
+def test_stale_resident_guard_is_present_without_a_plan() -> None:
+    # The no-plan case is the one that bit: 4 generation workers with a live vLLM.
+    assert "_stop_stale_resident filmforge-vllm" in _script(None)
+
+
 def test_audio_still_triggers_on_capabilities_without_a_plan() -> None:
     # The pre-plan single-department box is unchanged.
     assert "*,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;" in _script(None)

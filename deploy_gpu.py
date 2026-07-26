@@ -1698,6 +1698,42 @@ if test "$GPU_COUNT" -lt 1; then
   exit 1
 fi
 
+# ── Stop resident department services this deploy did NOT ask for ─────────────
+# filmforge-vllm / -parler / -sa3 are systemd units on the OS VOLUME, which is
+# preserved and reattached on every deploy — so they come back at boot even when
+# the new deploy has no vision/audio card. Observed twice on 2026-07-26: an 83 GB
+# vLLM sat on gpu2 while that card's worker advertised wan_i2v, i.e. a guaranteed
+# OOM on the next WAN job, and the drift guard cannot catch it (with no plan the
+# guard is a no-op, and it only ever rewrites units the plan names).
+#
+# What this box should host is the union of the plan and the capability
+# broadcast, so a legacy caps-only audio box keeps its servers. Runs BEFORE
+# ComfyUI starts, so a reclaimed card is already free when the render process
+# loads.
+_wants_vision=""
+_wants_audio=""
+case ",${{WORKER_PLAN_SPEC}}," in *,vision,*) _wants_vision=1 ;; esac
+case ",${{WORKER_PLAN_SPEC}}," in *,audio,*) _wants_audio=1 ;; esac
+case ",${{WORKER_CAPABILITIES:-}}," in *,qwen_vision,*) _wants_vision=1 ;; esac
+case ",${{WORKER_CAPABILITIES:-}}," in *,tts_dialogue,*|*,stable_audio3,*) _wants_audio=1 ;; esac
+
+_stop_stale_resident() {{
+  unit="$1"
+  reason="$2"
+  if systemctl is-active --quiet "$unit" 2>/dev/null; then
+    echo "[verda] stopping $unit — $reason (it was holding VRAM on a card this deploy renders on)" >&2
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  fi
+}}
+
+if test -z "$_wants_vision"; then
+  _stop_stale_resident filmforge-vllm "no vision card in this deploy"
+fi
+if test -z "$_wants_audio"; then
+  _stop_stale_resident filmforge-parler "no audio card in this deploy"
+  _stop_stale_resident filmforge-sa3 "no audio card in this deploy"
+fi
+
 # GPU firmware check — must happen before any CUDA call.
 # If GPU Firmware shows N/A the kernel module loaded but the GSP firmware
 # binary is absent. We try a one-shot apt repair (install firmware package +
