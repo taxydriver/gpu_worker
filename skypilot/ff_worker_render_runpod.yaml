@@ -1,0 +1,127 @@
+# FilmForge worker as a SkyPilot task — RENDER-CAPABLE variant, RunPod cloud.
+#
+# Alternative to ff_worker_render.yaml (Vast): that one is blocked by a SkyPilot
+# SSH-wait timeout race against the vastai/comfy image's slow (~6-10 min) pull —
+# see docs/discoveries/skypilot-vast-onstart-docker-image-blocker-2026-07-11.md.
+# RunPod uses a different, proven image (deploy_gpu.py's RUNPOD_IMAGE) with a much
+# shorter boot budget in the existing DIY path (RUNPOD_BOOT_TIMEOUT=300s), so it's
+# less likely to race SkyPilot's fixed 10-minute SSH-wait window.
+#
+# Reuses the exact ComfyUI path-fix deploy_gpu.py applies for this image: ComfyUI
+# actually lives at /workspace/runpod-slim/ComfyUI, not /workspace/ComfyUI, so we
+# symlink output/temp/input and add extra_model_paths.yaml so it scans our models
+# dir directly.
+#
+# Launch (broker injects backend URL + token):
+#   sky launch -c ff-worker-runpod ff_worker_render_runpod.yaml -y -d --env FILMFORGE_BACKEND_URL=… --secret WORKER_REGISTRATION_TOKEN=…
+# Teardown:  sky down -y ff-worker-runpod
+
+resources:
+  infra: runpod
+  # L40S matches deploy_gpu.py's proven RUNPOD_GPU_TYPE; A100-80GB as a fallback
+  # for availability. Both have ample VRAM for flux2 fp8.
+  accelerators: {L40S:1, A100-80GB:1}
+  use_spot: false   # deploy_gpu.py's proven RunPod path uses on-demand, not spot
+  ports: 9000
+  image_id: docker:runpod/comfyui:latest
+
+envs:
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # Injected at launch: FILMFORGE_BACKEND_URL, WORKER_REGISTRATION_TOKEN
+
+setup: |
+  set -euo pipefail
+  # cloudflared so the broker can probe /health over a public URL.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+  # Worker code from GitHub.
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+
+run: |
+  set -euo pipefail
+  WORKER_PORT=9000
+
+  # 1) RunPod path-fix (verbatim from deploy_gpu.py's proven RunPod recipe):
+  #    runpod/comfyui:latest keeps ComfyUI at /workspace/runpod-slim/ComfyUI, not
+  #    /workspace/ComfyUI — symlink output/temp/input + point models via
+  #    extra_model_paths.yaml so newly-downloaded models are found without
+  #    per-file symlinks.
+  RUNPOD_COMFY="/workspace/runpod-slim/ComfyUI"
+  COMFY_BASE_URL="http://127.0.0.1:8188"
+  if [ -f "$RUNPOD_COMFY/main.py" ]; then
+    echo "RunPod ComfyUI detected at $RUNPOD_COMFY — applying path fixes"
+    mkdir -p /workspace/ComfyUI/output /workspace/ComfyUI/temp /workspace/ComfyUI/input
+    for dir in output temp input; do
+      if [ ! -L "$RUNPOD_COMFY/$dir" ]; then
+        rm -rf "$RUNPOD_COMFY/$dir"
+        ln -sf "/workspace/ComfyUI/$dir" "$RUNPOD_COMFY/$dir"
+      fi
+    done
+    printf '%s\n' \
+      'filmforge_worker:' \
+      '    base_path: /workspace/ComfyUI/models' \
+      '    checkpoints: checkpoints' \
+      '    clip: clip' \
+      '    vae: vae' \
+      '    diffusion_models: diffusion_models' \
+      '    text_encoders: text_encoders' \
+      '    loras: loras' \
+      '    unet: unet' \
+      '    controlnet: controlnet' \
+      '    upscale_models: upscale_models' \
+      > "$RUNPOD_COMFY/extra_model_paths.yaml"
+    echo "Wrote extra_model_paths.yaml"
+  else
+    echo "ERROR: expected ComfyUI at $RUNPOD_COMFY/main.py, not found"; exit 1
+  fi
+
+  # 2) Start ComfyUI directly (this image runs main.py in a venv, no supervisord).
+  pkill -f "main.py.*--listen" 2>/dev/null || true
+  sleep 2
+  ( cd "$RUNPOD_COMFY" && source .venv-cu128/bin/activate && \
+    nohup python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header \
+      >/tmp/comfyui.log 2>&1 & )
+  COMFY_PORT=""
+  for i in $(seq 1 30); do
+    curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1 && { COMFY_PORT=8188; break; }
+    sleep 5
+  done
+  [ -z "$COMFY_PORT" ] && { echo "ERROR: ComfyUI never came up"; tail -n 60 /tmp/comfyui.log 2>/dev/null; exit 1; }
+  echo "ComfyUI up on :$COMFY_PORT"
+
+  # 3) cloudflared tunnel so the broker reaches /health.
+  pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
+  : >/tmp/ff_tunnel.log
+  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  WORKER_URL=""
+  for _ in $(seq 1 30); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  [ -z "$WORKER_URL" ] && { echo "ERROR: no tunnel URL"; exit 1; }
+  echo "Tunnel: $WORKER_URL"
+
+  # 4) Worker env: point it at ComfyUI + wire start/stop (plain pkill/relaunch —
+  #    this image has no supervisord to hand control to, per deploy_gpu.py).
+  export COMFY_BASE_URL="http://127.0.0.1:$COMFY_PORT"
+  export COMFY_OUTPUT_DIR=/workspace/ComfyUI/output
+  export COMFY_TEMP_DIR=/workspace/ComfyUI/temp
+  export COMFY_INPUT_DIR=/workspace/ComfyUI/input
+  export COMFY_STOP_CMD="pkill -f 'main.py.*--listen' 2>/dev/null || true"
+  export COMFY_START_CMD="cd $RUNPOD_COMFY && source .venv-cu128/bin/activate && nohup python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header >>/tmp/comfyui.log 2>&1 & sleep 15"
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-runpod-$(hostname)"
+
+  # 5) Start the worker (warms models into /workspace/ComfyUI/models, self-registers).
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT"

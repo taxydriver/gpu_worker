@@ -1,0 +1,80 @@
+# FilmForge worker as a SkyPilot task — SEAM PROOF variant (no ComfyUI, no render).
+#
+# Proves the integration seam only: SkyPilot provisions a box, git-clones the worker,
+# it self-registers with the render broker, and the broker's /health probe (via the
+# cloudflared tunnel) marks it `online`. Rendering is deferred (needs the ComfyUI-image
+# + model-store decision — see the plan). Targets Vast, where bare-box + plumbing already
+# worked in the spike.
+#
+# Launch (broker injects the token + backend URL at runtime):
+#   sky launch -c ff-seam ff_worker_seam.yaml \
+#     --env FILMFORGE_BACKEND_URL=... --secret WORKER_REGISTRATION_TOKEN=...
+# Teardown:  sky down -y ff-seam
+
+resources:
+  infra: vast
+  # Broad pool so the live Vast search has room (single-SKU pins were scarce in the spike).
+  accelerators: {RTX3090:1, RTX4090:1, RTX5090:1, RTX5880-Ada:1, L40S:1, RTXPRO6000WS:1}
+  use_spot: true
+  ports: 9000              # gpu_worker FastAPI (Vast supports open_ports)
+  disk_size: 60
+
+envs:
+  # Registration contract (worker reads these via config.py; self-registers at import).
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # Injected at launch (do NOT hardcode secrets here):
+  #   FILMFORGE_BACKEND_URL   — the broker base URL the worker registers against
+  #   WORKER_REGISTRATION_TOKEN — broker worker token (pass via --secret)
+
+setup: |
+  set -euo pipefail
+
+  # cloudflared — a bare SkyPilot box has no /opt/instance-tools; install the binary so the
+  # broker (which actively probes /health) can reach this worker over a public URL.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+
+  # Worker code from GitHub (NOT a local tree — SkyPilot runs headless). Fixes reach boxes
+  # only via commit+push to main (origin/main 8413b90+).
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+
+run: |
+  set -euo pipefail
+  WORKER_PORT=9000
+
+  # 1. Open the cloudflared tunnel FIRST and capture the public URL — the worker must have
+  #    WORKER_PUBLIC_URL in its env before it starts, because it self-registers at import.
+  #    (Recipe ported from deploy_gpu.py's proven tunnel block.)
+  pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
+  : >/tmp/ff_tunnel.log
+  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate \
+    >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  WORKER_URL=""
+  for _ in $(seq 1 30); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break
+    sleep 2
+  done
+  if [ -z "$WORKER_URL" ]; then
+    echo "ERROR: cloudflared did not return a public URL"; tail -n 40 /tmp/ff_tunnel.log; exit 1
+  fi
+  echo "Tunnel up: $WORKER_URL"
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-$(hostname)"
+  # No ComfyUI here → advertise no capabilities; the worker still registers + probes online.
+  # (Render capability comes later with the ComfyUI-image + model-store step.)
+
+  # 2. Start the worker (registers at import with the public URL above). Correct module path:
+  #    app.py uses absolute `gpu_worker.*` imports, so run from the clone's PARENT dir.
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT"

@@ -1,0 +1,106 @@
+# FilmForge worker as a SkyPilot task — RENDER-CAPABLE variant (ComfyUI + models).
+#
+# Builds on the seam proof by running ComfyUI on the box so the worker can render.
+# Reuses the SAME proven Vast image deploy_gpu.py uses (vastai/comfy) via SkyPilot's
+# docker image_id, so we don't build ComfyUI from scratch. The worker auto-warms its
+# models from HF into /workspace/ComfyUI/models/ — which is ComfyUI's NATIVE models dir
+# on this image, so no path-fixup / extra_model_paths needed (unlike the RunPod image).
+#
+# Launch (broker injects backend URL + token):
+#   sky launch -c ff-worker ff_worker_render.yaml -y -d --env FILMFORGE_BACKEND_URL=… --secret WORKER_REGISTRATION_TOKEN=…
+# Teardown:  sky down -y ff-worker
+
+resources:
+  infra: vast
+  # ≥24GB VRAM for flux2 fp8; cuda-12.9 image wants a recent card. Broad pool for capacity.
+  accelerators: {RTX4090:1, RTX5090:1, L40S:1, RTXPRO6000WS:1, A100-80GB:1}
+  use_spot: true
+  ports: 9000
+  disk_size: 150                 # flux2 (~33GB) + LoRAs + i2v models + ComfyUI headroom
+  # The exact proven ComfyUI image deploy_gpu.py rents (ComfyUI at /workspace/ComfyUI:18188).
+  image_id: docker:vastai/comfy:v0.15.1-cuda-12.9-py312
+
+# vastai/comfy ships /root world-writable, so sshd StrictModes refuses SkyPilot's
+# injected key (deploy_gpu.py papers over this with a Vast onstart chmod). Fix it
+# the same way here — passed straight through to the Vast create API.
+config:
+  vast:
+    create_instance_kwargs:
+      # NOTE: 'onstart' takes a local FILE PATH (SkyPilot reads it and passes the
+      # contents through); 'onstart_cmd' takes the inline command string we want.
+      onstart_cmd: "chmod go-w /root; chmod 700 /root/.ssh 2>/dev/null || true"
+
+envs:
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # Injected at launch: FILMFORGE_BACKEND_URL, WORKER_REGISTRATION_TOKEN
+
+setup: |
+  set -euo pipefail
+  # cloudflared so the broker can probe /health over a public URL.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+  # Worker code from GitHub.
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -r requirements.txt
+
+run: |
+  set -euo pipefail
+  WORKER_PORT=9000
+
+  # 1) Start ComfyUI. SkyPilot overrides the container entrypoint, so the image's
+  #    supervisord auto-start didn't fire — bring it up, then fall back to a direct
+  #    launch if supervisor isn't wired the way we expect. Image serves on :18188.
+  pgrep -x supervisord >/dev/null 2>&1 || supervisord 2>/dev/null || \
+    supervisord -c /etc/supervisor/supervisord.conf 2>/dev/null || true
+  sleep 3
+  supervisorctl start comfyui 2>/dev/null || true
+  COMFY_PORT=""
+  for i in $(seq 1 30); do
+    curl -fsS http://127.0.0.1:18188/system_stats >/dev/null 2>&1 && { COMFY_PORT=18188; break; }
+    curl -fsS http://127.0.0.1:8188/system_stats  >/dev/null 2>&1 && { COMFY_PORT=8188;  break; }
+    sleep 5
+  done
+  if [ -z "$COMFY_PORT" ]; then
+    echo "supervisor path failed — starting ComfyUI directly on :18188" >&2
+    cd /workspace/ComfyUI && nohup python main.py --listen 0.0.0.0 --port 18188 --enable-cors-header \
+      >/tmp/comfyui.log 2>&1 &
+    for i in $(seq 1 48); do curl -fsS http://127.0.0.1:18188/system_stats >/dev/null 2>&1 && { COMFY_PORT=18188; break; }; sleep 5; done
+  fi
+  [ -z "$COMFY_PORT" ] && { echo "ERROR: ComfyUI never came up"; tail -n 60 /tmp/comfyui.log 2>/dev/null; exit 1; }
+  echo "ComfyUI up on :$COMFY_PORT"
+
+  # 2) cloudflared tunnel so the broker reaches /health.
+  pkill -f "cloudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
+  : >/tmp/ff_tunnel.log
+  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  WORKER_URL=""
+  for _ in $(seq 1 30); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  [ -z "$WORKER_URL" ] && { echo "ERROR: no tunnel URL"; exit 1; }
+  echo "Tunnel: $WORKER_URL"
+
+  # 3) Worker env: point it at ComfyUI + wire supervisor start/stop so it can recycle
+  #    ComfyUI after warming models (the worker's proven prod contract).
+  export COMFY_BASE_URL="http://127.0.0.1:$COMFY_PORT"
+  export COMFY_OUTPUT_DIR=/workspace/ComfyUI/output
+  export COMFY_TEMP_DIR=/workspace/ComfyUI/temp
+  export COMFY_INPUT_DIR=/workspace/ComfyUI/input
+  export COMFY_START_CMD="supervisorctl start comfyui"
+  export COMFY_STOP_CMD="supervisorctl stop comfyui"
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-render-$(hostname)"
+
+  # 4) Start the worker (warms models into /workspace/ComfyUI/models, self-registers).
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT"

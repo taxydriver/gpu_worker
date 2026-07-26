@@ -1,0 +1,157 @@
+# FilmForge VISION worker as a SkyPilot task — VAST cloud.
+#
+# The vision department on a cheap 24GB Vast box: Qwen3-VL-8B-Instruct served
+# by vLLM (OpenAI-compatible), the same endpoint shape the backend's
+# QwenVisionProviderAdapter already speaks. One department per box (never
+# render or audio models) — the pinned vLLM server is exactly the resident
+# co-tenant class that starved WAN and caused the OOMs (2026-07-23 directive).
+#
+# Consumption seam (BROKER-AWARE since 2026-07-24, voice-worker twin):
+#   - the run block exports WORKER_VISION_BASE_URL=<vLLM tunnel>/v1, which the
+#     worker app advertises as registration metadata `vision_base_url`
+#   - the backend's GET /api/render-broker/vision-worker resolves it from the
+#     fleet registry; with FILMFORGE_LLM_PROVIDER_VISION=qwen the LLM gateway
+#     discovers the URL live (30s cache) — no .env edit, no backend restart —
+#     and automatically falls back to OpenAI vision when no box is live or the
+#     box dies mid-flight
+#   - manual override still works: QWEN_BASE_URL in the backend .env is the
+#     fallback when discovery yields nothing (the run block still prints it)
+#   - re-run scripts/qwen_vl_eval against the remote endpoint BEFORE flipping
+#     the provider to qwen — a curl smoke proves reachability, not correctness,
+#     and there's now a tunnel hop where localhost used to be (observe loop is
+#     sync per clip)
+#
+# The worker app also runs (self-registers, cap `qwen_vision`) for fleet
+# visibility/heartbeat and as the discovery hook — vision calls themselves go
+# gateway → vLLM tunnel directly, never through the broker job queue.
+#
+# Launch:
+#   ~/.venvs/skypilot/bin/sky launch -c ff-vision ff_worker_vision_vast.yaml -y -d \
+#     --env FILMFORGE_BACKEND_URL=… \
+#     --secret WORKER_REGISTRATION_TOKEN=…
+# Idle shutdown:  sky autostop ff-vision -i 30 --down   (vision is bursty —
+#                 only needed while clip analysis runs; OpenAI remains the
+#                 provider default whenever no box is up)
+# Teardown:       sky down -y ff-vision
+
+resources:
+  infra: vast
+  # 24GB fits 8B bf16 (~16GB weights) + KV at util 0.90. Cost guardrail
+  # (Vamsee 2026-07-25): A100-80GB DROPPED so this light box can never rent an
+  # expensive card — SkyPilot picks the cheapest of these (an RTX 3090 is ~$0.12/hr
+  # in the US). Re-add A100-80GB here the day video-native analysis (N=1) needs it
+  # (video tokens are KV-hungry; the vLLM flags below already allow video input).
+  accelerators: {RTX3090:1, RTX4090:1, L40S:1}
+  use_spot: false   # gateway now auto-falls back to OpenAI if this box dies (see header);
+                    # kept non-spot for stable analysis latency — spot is Vamsee's call now
+  ports: 9000
+  disk_size: 80     # ~17GB weights + vllm venv torch + HF cache + headroom
+
+envs:
+  REGISTER_WITH_BACKEND: "true"
+  WORKER_HEARTBEAT_SECONDS: "60"
+  # Fleet registry presence only — no broker job routes to this cap today.
+  WORKER_CAPABILITIES: "qwen_vision"
+  HF_HOME: /workspace/hf_cache
+  # Must match the backend's QWEN_VISION_MODEL default (llm/gateway.py).
+  QWEN_VISION_MODEL: "Qwen/Qwen3-VL-8B-Instruct"
+  # Injected at launch: FILMFORGE_BACKEND_URL, WORKER_REGISTRATION_TOKEN
+
+setup: |
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl git python3 python3-dev python3-pip python3-venv build-essential
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+  mkdir -p /workspace/hf_cache
+  export HF_HOME=/workspace/hf_cache HF_HUB_ENABLE_HF_TRANSFER=0
+
+  # Worker code from GitHub (registration/heartbeat only on this box).
+  if [ -d /workspace/gpu_worker/.git ]; then
+    git -C /workspace/gpu_worker pull --ff-only
+  else
+    git clone https://github.com/taxydriver/gpu_worker.git /workspace/gpu_worker
+  fi
+  cd /workspace/gpu_worker
+  python3 -m venv .venv
+  .venv/bin/pip install -q -r requirements.txt
+
+  # vLLM in its own venv (it pins its own torch — no torch-first dance needed).
+  # 0.11.x = the Qwen3-VL support line incl. video input (0.11.2 = last patch,
+  # PyPI-verified 2026-07-24); pinned so a box rebuilt months later serves the
+  # same stack.
+  python3 -m venv /workspace/vllm_venv
+  /workspace/vllm_venv/bin/pip install -q --upgrade pip
+  /workspace/vllm_venv/bin/pip install -q "vllm==0.11.2"
+
+run: |
+  set -uo pipefail
+  export HF_HOME=/workspace/hf_cache
+
+  # Resident vLLM vision server — the LLM gateway's QWEN_BASE_URL target.
+  # Dedicated box ⇒ take (almost) the whole GPU, unlike the 0.25-fraction
+  # sidecar. image:4 mirrors today's per-clip keyframe calls; video:1 is the
+  # forward door for video-native analysis (needs a 48GB card to actually use).
+  pkill -f "vllm serve" 2>/dev/null || true
+  nohup /workspace/vllm_venv/bin/vllm serve "$QWEN_VISION_MODEL" \
+    --served-model-name "$QWEN_VISION_MODEL" \
+    --host 0.0.0.0 --port 8000 \
+    --trust-remote-code \
+    --max-model-len 16384 \
+    --gpu-memory-utilization 0.90 \
+    --limit-mm-per-prompt '{"image": 4, "video": 1}' \
+    >/tmp/vllm.log 2>&1 &
+
+  echo "Waiting for vLLM (first boot downloads ~17GB of weights)..."
+  VLLM_UP=""
+  for _ in $(seq 1 240); do
+    if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then VLLM_UP=1; break; fi
+    sleep 5
+  done
+  [ -z "$VLLM_UP" ] && { echo "ERROR: vLLM never became healthy (see /tmp/vllm.log)"; tail -50 /tmp/vllm.log; exit 1; }
+
+  # Tunnel 1: vLLM — this URL is what the backend needs.
+  pkill -f "cloudflared tunnel" 2>/dev/null || true
+  : >/tmp/qwen_tunnel.log
+  nohup /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate \
+    >/tmp/qwen_tunnel.log 2>&1 &
+  QWEN_URL=""
+  for _ in $(seq 1 40); do
+    QWEN_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/qwen_tunnel.log | tail -n1 || true)"
+    [ -n "$QWEN_URL" ] && break; sleep 2
+  done
+  [ -z "$QWEN_URL" ] && { echo "ERROR: no vLLM tunnel URL"; exit 1; }
+  echo "=================================================================="
+  echo "QWEN_BASE_URL=${QWEN_URL}/v1"
+  echo "  → backend .env: QWEN_BASE_URL=${QWEN_URL}/v1"
+  echo "  → backend .env: FILMFORGE_LLM_PROVIDER_VISION=qwen (AFTER eval passes)"
+  echo "=================================================================="
+  echo "${QWEN_URL}/v1" >/tmp/qwen_url.txt
+
+  # Tunnel 2: worker app, so registration/liveness probing reach it.
+  : >/tmp/ff_tunnel.log
+  nohup /usr/local/bin/cloudflared tunnel --url http://127.0.0.1:9000 --no-autoupdate \
+    >/tmp/ff_tunnel.log 2>&1 &
+  WORKER_URL=""
+  for _ in $(seq 1 40); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  [ -z "$WORKER_URL" ] && { echo "ERROR: no worker tunnel URL"; exit 1; }
+  echo "Worker tunnel: $WORKER_URL" | tee /tmp/worker_url.txt
+
+  # No COMFY_START_CMD / COMFY_BASE_URL: vision-only box, comfy watchdog disabled.
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-vision-vast-$(hostname)"
+  # Advertise the vLLM tunnel in registration metadata (vision_base_url) so the
+  # backend's GET /api/render-broker/vision-worker discovery can hand it to the
+  # LLM gateway — no .env edit / backend restart needed to consume this box.
+  export WORKER_VISION_BASE_URL="${QWEN_URL}/v1"
+
+  # Worker app (self-registers with the backend, advertises qwen_vision).
+  cd /workspace
+  /workspace/gpu_worker/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port 9000

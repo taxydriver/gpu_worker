@@ -1,0 +1,184 @@
+# FilmForge worker as a SkyPilot task — BARE-BOX RENDER variant, RunPod cloud.
+#
+# Same from-scratch ComfyUI install as ff_worker_render_barebox.yaml (which is PROVEN
+# end-to-end on Vast — real flux2 frame rendered, docs/discoveries/
+# skypilot-render-e2e-proven-two-bugs-2026-07-11.md). This is the RunPod twin: the
+# ONLY differences from the Vast barebox are the resources block below — the setup:
+# and run: blocks are byte-identical (bare ubuntu install, cuDNN patch, the [m]ain.py
+# pkill bracket-trick fix, COMFY_HEALTH_TIMEOUT_SEC, WORKER_CAPABILITIES scoping).
+#
+# WHY this should work where the earlier RunPod attempt didn't: that one used the
+# prebuilt docker:runpod/comfyui:latest image, which (a) lacked rsync so SkyPilot's
+# own file-mount failed, and (b) stalled the file-mount reproducibly
+# (docs/discoveries/skypilot-runpod-rsync-stall-2026-07-11.md). A bare box (no
+# image_id) uses SkyPilot's default runpod/base:1.0.2-ubuntu2204 — a clean ubuntu
+# base SkyPilot itself defaults to, so its file-mount is expected to work — and our
+# setup: installs everything from scratch, exactly like the working Vast box.
+#
+# Launch (broker injects backend URL + token):
+#   sky launch -c ff-worker-runpod-barebox ff_worker_render_runpod_barebox.yaml -y -d --env FILMFORGE_BACKEND_URL=… --secret WORKER_REGISTRATION_TOKEN=…
+# Teardown:  sky down -y ff-worker-runpod-barebox
+
+resources:
+  infra: runpod
+  # BROAD pool so SkyPilot has many hosts to land on. First attempt pinned
+  # {L40S, A100-80GB} → RunPod only had them in Iceland (IS), whose POP has flaky
+  # network (SkyPilot's own runtime download hung there ~5min, same POP as the
+  # earlier prebuilt-image file-mount stall). Widening the pool (the proven Vast
+  # "any-of set" trick) got a Canada-Montreal box that cleared every stall step.
+  #
+  # ⚠️ GPU CHOICE MATTERS FOR THE flux2 RENDER (not just availability): flux2's
+  # weights are fp8 (flux2_dev_fp8mixed). Cards with NATIVE fp8 — Ada Lovelace
+  # (RTX4090, L40, L40S, RTX6000-Ada) and Blackwell (RTX5090) — run it fast and
+  # in-budget (proven on a Vast RTX5090). Ampere cards (A40, RTXA6000, A100) have
+  # NO fp8 hardware → they emulate/upcast, which balloons VRAM (OOM risk) and is
+  # slow. So this list is ordered/scoped to fp8-native cards; if you must fall
+  # back to Ampere for availability, expect the render to be marginal.
+  accelerators: {RTX4090:1, L40:1, L40S:1, RTX6000-Ada:1, RTX5090:1}
+  use_spot: false   # deploy_gpu.py's proven RunPod path is on-demand, not spot
+  ports: 9000
+  # disk_size → RunPod container_disk_in_gb (sky/provision/runpod/utils.py). 200GB
+  # holds the full warmed asset set — same sizing rationale as the Vast barebox
+  # (see WORKER_CAPABILITIES below). NO image_id → SkyPilot's clean
+  # runpod/base:1.0.2-ubuntu2204 base, NOT runpod/comfyui (missing rsync + stalled).
+  disk_size: 200
+
+setup: |
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+
+  apt-get update -qq
+  apt-get install -y -qq --no-install-recommends \
+    ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv \
+    build-essential ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+
+  # cloudflared so the broker can probe /health over a public URL.
+  if ! command -v cloudflared >/dev/null 2>&1; then
+    curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+  fi
+
+  WORKER_ROOT=/opt/filmforge_gpu_worker
+  COMFY_ROOT=/workspace/ComfyUI
+
+  # Worker code from GitHub (fixes reach boxes only via commit+push to main).
+  if [ -d "$WORKER_ROOT/.git" ]; then
+    git -C "$WORKER_ROOT" pull --ff-only
+  else
+    rm -rf "$WORKER_ROOT"
+    git clone https://github.com/taxydriver/gpu_worker.git "$WORKER_ROOT"
+  fi
+  # Matches deploy_gpu.py's own convention: WORKER_MODULE_DIR = dirname(WORKER_ROOT),
+  # symlinked so `gpu_worker.*` absolute imports resolve when run from /opt.
+  ln -sfn "$WORKER_ROOT" /opt/gpu_worker
+
+  python3 -m venv "$WORKER_ROOT/.venv"
+  "$WORKER_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools -q
+  "$WORKER_ROOT/.venv/bin/python" -m pip install -r "$WORKER_ROOT/requirements.txt" -q
+
+  # ComfyUI from scratch — deploy_gpu.py's proven recipe (verda_fresh_install_script),
+  # minus the Verda-specific /dev/vdb volume mount.
+  if [ -d "$COMFY_ROOT/.git" ]; then
+    git -C "$COMFY_ROOT" pull --ff-only
+  else
+    rm -rf "$COMFY_ROOT"
+    git clone https://github.com/comfyanonymous/ComfyUI.git "$COMFY_ROOT"
+  fi
+
+  python3 -m venv "$COMFY_ROOT/.venv"
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools -q
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --index-url https://download.pytorch.org/whl/cu130 -q \
+    'torch==2.11.0' 'torchvision==0.26.0' 'torchaudio==2.11.0'
+  "$COMFY_ROOT/.venv/bin/python" -m pip install -r "$COMFY_ROOT/requirements.txt" -q
+
+  mkdir -p "$COMFY_ROOT/custom_nodes"
+  [ -d "$COMFY_ROOT/custom_nodes/ComfyUI-VideoHelperSuite" ] || \
+    git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git "$COMFY_ROOT/custom_nodes/ComfyUI-VideoHelperSuite" || true
+  [ -d "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus" ] || \
+    git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus.git "$COMFY_ROOT/custom_nodes/ComfyUI_IPAdapter_plus" || true
+
+  # FilmForge cuDNN patch custom node (disables cuDNN SDPA; prevents "No valid
+  # execution plans built" on Blackwell/unsupported GPUs). Base64-encoded to avoid
+  # a heredoc terminator at column 0, which would close this YAML block scalar
+  # early (same underlying issue the RunPod yaml hit with extra_model_paths.yaml,
+  # there worked around with printf instead — this file is too large for that).
+  mkdir -p "$COMFY_ROOT/custom_nodes/filmforge_cuda_patch"
+  echo 'IiIiRmlsbUZvcmdlOiBkaXNhYmxlIGN1RE5OIFNEUEEgb24gQ29tZnlVSSBzdGFydHVwLgoKRGVwbG95ZWQgYXMgYSBDb21meVVJIGN1c3RvbSBub2RlOgogIC93b3Jrc3BhY2UvQ29tZnlVSS9jdXN0b21fbm9kZXMvZmlsbWZvcmdlX2N1ZGFfcGF0Y2gvX19pbml0X18ucHkKClJ1bnMgYmVmb3JlIGFueSBtb2RlbCBpcyBsb2FkZWQsIHNldHRpbmcgdG9yY2ggYmFja2VuZCBmbGFncyB0aGF0IHByZXZlbnQKImN1RE5OIEZyb250ZW5kIGVycm9yOiBObyB2YWxpZCBleGVjdXRpb24gcGxhbnMgYnVpbHQiIG9uIEJsYWNrd2VsbCAoQjMwMCwKU00gMTAueCkgYW5kIG90aGVyIEdQVXMgd2hlcmUgY3VETk4gaGFzIG5vIGNvbXBpbGVkIGZ1c2lvbiBwbGFuIGZvciB0aGUKYXR0ZW50aW9uIGtlcm5lbHMgaXQgYXR0ZW1wdHMgdG8gdXNlLgoiIiIKCmltcG9ydCBsb2dnaW5nIGFzIF9sb2dnaW5nCgpfbG9nID0gX2xvZ2dpbmcuZ2V0TG9nZ2VyKCJmaWxtZm9yZ2UuY3VkYV9wYXRjaCIpCgp0cnk6CiAgICBpbXBvcnQgdG9yY2ggYXMgX3RvcmNoCgogICAgIyDilIDilIAgU3RhcnR1cCBkaWFnbm9zdGljcyDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgIF9sb2cuaW5mbygKICAgICAgICAiW2ZpbG1mb3JnZV0gdG9yY2g9JXMgY3VkYT0lcyBjdWRubj0lcyIsCiAgICAgICAgX3RvcmNoLl9fdmVyc2lvbl9fLAogICAgICAgIF90b3JjaC52ZXJzaW9uLmN1ZGEsCiAgICAgICAgX3RvcmNoLmJhY2tlbmRzLmN1ZG5uLnZlcnNpb24oKSwKICAgICkKICAgIGlmIF90b3JjaC5jdWRhLmlzX2F2YWlsYWJsZSgpOgogICAgICAgIF9sb2cuaW5mbygKICAgICAgICAgICAgIltmaWxtZm9yZ2VdIGRldmljZT0lcyBjYXBhYmlsaXR5PSVzIiwKICAgICAgICAgICAgX3RvcmNoLmN1ZGEuZ2V0X2RldmljZV9uYW1lKDApLAogICAgICAgICAgICBfdG9yY2guY3VkYS5nZXRfZGV2aWNlX2NhcGFiaWxpdHkoMCksCiAgICAgICAgKQoKICAgIHRyeToKICAgICAgICBpbXBvcnQgeGZvcm1lcnMgYXMgX3hmCiAgICAgICAgX2xvZy5pbmZvKCJbZmlsbWZvcmdlXSB4Zm9ybWVycz0lcyIsIF94Zi5fX3ZlcnNpb25fXykKICAgIGV4Y2VwdCBJbXBvcnRFcnJvcjoKICAgICAgICBfbG9nLmluZm8oIltmaWxtZm9yZ2VdIHhmb3JtZXJzPW5vdF9pbnN0YWxsZWQiKQoKICAgICMg4pSA4pSAIGN1RE5OIFNEUEEgZGlzYWJsZSDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIDilIAKICAgICMgRGlzYWJsaW5nIHRoZSBjdUROTiBTRFAgYmFja2VuZCBwcmV2ZW50cyAiTm8gdmFsaWQgZXhlY3V0aW9uIHBsYW5zIGJ1aWx0IgogICAgIyBlcnJvcnMgb24gYXJjaGl0ZWN0dXJlcyB3aGVyZSBjdUROTiA5LnggaGFzIG5vIHByZWNvbXBpbGVkIGZ1c2lvbiBwbGFuCiAgICAjIChCbGFja3dlbGwgU00gMTAueCwgZWFybHkgQjIwMC9CMzAwIHN1cHBvcnQpLiAgVGhlIHRocmVlIHJlbWFpbmluZwogICAgIyBiYWNrZW5kcyAoZmxhc2gsIG1lbV9lZmZpY2llbnQsIG1hdGgpIGFyZSBhbHdheXMgZW5hYmxlZCBhcyB0aGUgZmFsbGJhY2sKICAgICMgY2hhaW47IG1hdGhfc2RwIGluIHBhcnRpY3VsYXIgaXMgYSB1bml2ZXJzYWwgc29mdHdhcmUgZmFsbGJhY2suCiAgICBfdG9yY2guYmFja2VuZHMuY3VkYS5lbmFibGVfY3Vkbm5fc2RwKEZhbHNlKQogICAgX3RvcmNoLmJhY2tlbmRzLmN1ZGEuZW5hYmxlX2ZsYXNoX3NkcChUcnVlKQogICAgX3RvcmNoLmJhY2tlbmRzLmN1ZGEuZW5hYmxlX21lbV9lZmZpY2llbnRfc2RwKFRydWUpCiAgICBfdG9yY2guYmFja2VuZHMuY3VkYS5lbmFibGVfbWF0aF9zZHAoVHJ1ZSkKICAgIF90b3JjaC5iYWNrZW5kcy5jdWRubi5iZW5jaG1hcmsgPSBGYWxzZQoKICAgIF9sb2cuaW5mbygKICAgICAgICAiW2ZpbG1mb3JnZV0gY3VETk4gU0RQQSBkaXNhYmxlZDsgZmxhc2g9JXMgbWVtX2VmZmljaWVudD0lcyBtYXRoPSVzIiwKICAgICAgICBfdG9yY2guYmFja2VuZHMuY3VkYS5mbGFzaF9zZHBfZW5hYmxlZCgpLAogICAgICAgIF90b3JjaC5iYWNrZW5kcy5jdWRhLm1lbV9lZmZpY2llbnRfc2RwX2VuYWJsZWQoKSwKICAgICAgICBfdG9yY2guYmFja2VuZHMuY3VkYS5tYXRoX3NkcF9lbmFibGVkKCksCiAgICApCgogICAgIyDilIDilIAgR1BVIHNtb2tlIHRlc3Qg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACiAgICBpZiBfdG9yY2guY3VkYS5pc19hdmFpbGFibGUoKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGltcG9ydCB0b3JjaC5ubi5mdW5jdGlvbmFsIGFzIF9GCgogICAgICAgICAgICAjIFRpbnkgdGVuc29yIGFsbG9jYXRpb24KICAgICAgICAgICAgX3QgPSBfdG9yY2guemVyb3MoNCwgZGV2aWNlPSJjdWRhIikKCiAgICAgICAgICAgICMgVGlueSBjb252MmQKICAgICAgICAgICAgX3ggPSBfdG9yY2gucmFuZG4oMSwgMSwgNCwgNCwgZGV2aWNlPSJjdWRhIikKICAgICAgICAgICAgX3cgPSBfdG9yY2gucmFuZG4oMSwgMSwgMiwgMiwgZGV2aWNlPSJjdWRhIikKICAgICAgICAgICAgX0YuY29udjJkKF94LCBfdykKCiAgICAgICAgICAgICMgVGlueSBzY2FsZWRfZG90X3Byb2R1Y3RfYXR0ZW50aW9uIOKAlCB1c2VzIHRoZSBwYXRjaGVkIGJhY2tlbmRzCiAgICAgICAgICAgIF9xID0gX3RvcmNoLnJhbmRuKDEsIDEsIDQsIDgsIGRldmljZT0iY3VkYSIpCiAgICAgICAgICAgIF9rID0gX3RvcmNoLnJhbmRuKDEsIDEsIDQsIDgsIGRldmljZT0iY3VkYSIpCiAgICAgICAgICAgIF92ID0gX3RvcmNoLnJhbmRuKDEsIDEsIDQsIDgsIGRldmljZT0iY3VkYSIpCiAgICAgICAgICAgIF9GLnNjYWxlZF9kb3RfcHJvZHVjdF9hdHRlbnRpb24oX3EsIF9rLCBfdikKCiAgICAgICAgICAgIF9sb2cuaW5mbygiW2ZpbG1mb3JnZV0gR1BVIHNtb2tlIHRlc3Q6IFBBU1MiKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgX3Ntb2tlX2V4YzoKICAgICAgICAgICAgX2xvZy5lcnJvcigiW2ZpbG1mb3JnZV0gR1BVIHNtb2tlIHRlc3Q6IEZBSUwg4oCUICVzIiwgX3Ntb2tlX2V4YykKCmV4Y2VwdCBFeGNlcHRpb24gYXMgX2V4YzoKICAgIF9sb2cud2FybmluZygiW2ZpbG1mb3JnZV0gY3VETk4gcGF0Y2ggZmFpbGVkOiAlcyIsIF9leGMpCgojIFJlcXVpcmVkIGJ5IENvbWZ5VUkgdG8gcmVjb2duaXNlIHRoaXMgYXMgYSB2YWxpZCBleHRlbnNpb24KTk9ERV9DTEFTU19NQVBQSU5HUyA9IHt9Ck5PREVfRElTUExBWV9OQU1FX01BUFBJTkdTID0ge30K' | base64 -d > "$COMFY_ROOT/custom_nodes/filmforge_cuda_patch/__init__.py"
+
+  for req in "$COMFY_ROOT"/custom_nodes/*/requirements.txt; do
+    if [ -f "$req" ]; then
+      "$COMFY_ROOT/.venv/bin/python" -m pip install -r "$req" -q || true
+    fi
+  done
+  # Custom node requirements.txt files often list torchvision without an index
+  # URL, letting pip pull the CPU-only PyPI wheel and clobber the CUDA build.
+  # Re-pin after the loop so the CUDA wheels always win.
+  "$COMFY_ROOT/.venv/bin/python" -m pip install --force-reinstall --no-deps -q \
+    --index-url https://download.pytorch.org/whl/cu130 \
+    'torch==2.11.0' 'torchvision==0.26.0' 'torchaudio==2.11.0'
+
+run: |
+  set -euo pipefail
+  WORKER_PORT=9000
+  COMFY_ROOT=/workspace/ComfyUI
+  WORKER_ROOT=/opt/filmforge_gpu_worker
+
+  # 1) Start ComfyUI (native layout — we installed it ourselves at the exact path
+  #    the worker expects, so no path-fixup/symlinks needed, unlike the prebuilt
+  #    image attempts).
+  # NOTE the "[m]ain.py" bracket trick throughout: a plain `pkill -f 'main.py.*--listen'`
+  # regex ALSO matches pkill's own shell command line (which literally contains
+  # "main.py ... --listen"), so pkill SIGTERMs its own parent — which reliably breaks
+  # the worker watchdog's restart_comfy() (it dies at the stop step, never restarts
+  # ComfyUI). "[m]ain.py" matches the process but the pattern string no longer contains
+  # the literal "main.py", so it can't self-match. (Root-caused live 2026-07-11.)
+  pkill -f "[m]ain.py.*--listen" 2>/dev/null || true
+  sleep 2
+  ( cd "$COMFY_ROOT" && nohup .venv/bin/python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header \
+      >/tmp/comfyui.log 2>&1 & )
+  COMFY_PORT=""
+  for i in $(seq 1 60); do
+    curl -fsS http://127.0.0.1:8188/system_stats >/dev/null 2>&1 && { COMFY_PORT=8188; break; }
+    sleep 5
+  done
+  if [ -z "$COMFY_PORT" ]; then
+    echo "ERROR: ComfyUI never came up"; tail -n 80 /tmp/comfyui.log 2>/dev/null; exit 1
+  fi
+  echo "ComfyUI up on :$COMFY_PORT"
+
+  # 2) cloudflared tunnel so the broker reaches /health.
+  pkill -f "[c]loudflared tunnel --url http://127.0.0.1:$WORKER_PORT" || true
+  : >/tmp/ff_tunnel.log
+  nohup cloudflared tunnel --url "http://127.0.0.1:$WORKER_PORT" --no-autoupdate >/tmp/ff_tunnel.log 2>&1 </dev/null &
+  WORKER_URL=""
+  for _ in $(seq 1 30); do
+    WORKER_URL="$(grep -aEo 'https://[-a-z0-9]+\.trycloudflare\.com' /tmp/ff_tunnel.log | tail -n1 || true)"
+    [ -n "$WORKER_URL" ] && break; sleep 2
+  done
+  if [ -z "$WORKER_URL" ]; then
+    echo "ERROR: no tunnel URL"; exit 1
+  fi
+  echo "Tunnel: $WORKER_URL"
+
+  # 3) Worker env.
+  export COMFY_BASE_URL="http://127.0.0.1:$COMFY_PORT"
+  export COMFY_OUTPUT_DIR="$COMFY_ROOT/output"
+  export COMFY_TEMP_DIR="$COMFY_ROOT/temp"
+  export COMFY_INPUT_DIR="$COMFY_ROOT/input"
+  # [m]ain.py bracket trick again — this COMFY_STOP_CMD is what the worker's own
+  # watchdog runs on every restart, so a self-matching pattern here is the exact
+  # thing that pins ComfyUI down in a restart loop. Must stay bracketed.
+  export COMFY_STOP_CMD="pkill -f '[m]ain.py.*--listen' 2>/dev/null || true"
+  export COMFY_START_CMD="cd $COMFY_ROOT && nohup .venv/bin/python main.py --listen 0.0.0.0 --port 8188 --enable-cors-header >>/tmp/comfyui.log 2>&1 & sleep 15"
+  # comfy-kitchen + comfy-aimdo init on Blackwell cold-starts in ~50-60s, right at
+  # the worker's 60s default — give the watchdog's post-restart readiness poll more
+  # grace so a slow-but-fine boot isn't declared failed.
+  export COMFY_HEALTH_TIMEOUT_SEC=150
+  export WORKER_PUBLIC_URL="$WORKER_URL"
+  export WORKER_NAME="sky-barebox-$(hostname)"
+
+  # 4) Start the worker (warms models into $COMFY_ROOT/models, self-registers).
+  #    Run from /opt (parent of the /opt/gpu_worker symlink) — app.py uses
+  #    absolute `gpu_worker.*` imports, matching deploy_gpu.py's own convention.
+  cd /opt
+  "$WORKER_ROOT/.venv/bin/python" -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT"
