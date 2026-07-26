@@ -10,9 +10,23 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="${WORKSPACE:-/mnt/data}"
 PARLER_VENV="$WORKSPACE/parler_spike"
-UNIT_WORKER="/etc/systemd/system/filmforge-worker-gpu0.service"
+# On a multi-GPU box with a per-GPU department plan, the deploy passes the card
+# the sound stage owns: the resident servers must be pinned to it or they load
+# onto GPU 0 and starve a render worker (the co-tenancy OOM this split exists to
+# prevent). Unset = single-department box, no pinning, worker unit is gpu0.
+AUDIO_GPU_INDEX="${AUDIO_GPU_INDEX:-}"
+UNIT_WORKER="/etc/systemd/system/filmforge-worker-gpu${AUDIO_GPU_INDEX:-0}.service"
+# The plan already writes audio capabilities into the worker unit; only the
+# legacy single-box path needs step 4 to patch them in.
+AUDIO_SKIP_WORKER_CAPS="${AUDIO_SKIP_WORKER_CAPS:-}"
 
 log() { echo "[setup_audio] $*"; }
+
+pin_gpu_line() {
+  if [ -n "$AUDIO_GPU_INDEX" ]; then
+    echo "Environment=CUDA_VISIBLE_DEVICES=$AUDIO_GPU_INDEX"
+  fi
+}
 
 # 1) Runtime HF cache on the big volume (root-fs-full lesson §6d).
 if [ -d "$WORKSPACE" ] && [ ! -L /root/.cache/huggingface ]; then
@@ -39,6 +53,7 @@ After=network.target
 [Service]
 Environment=HF_HOME=$WORKSPACE/hf_cache
 Environment=PARLER_PORT=9101
+$(pin_gpu_line)
 ExecStart=$PARLER_VENV/bin/python $REPO_DIR/parler_server.py
 Restart=on-failure
 RestartSec=10
@@ -62,6 +77,7 @@ After=network.target
 [Service]
 Environment=HF_HOME=$WORKSPACE/hf_cache
 Environment=SA3_PORT=9102
+$(pin_gpu_line)
 WorkingDirectory=$REPO_DIR
 ExecStart=$SA3_VENV/bin/python $REPO_DIR/sa3_server.py
 Restart=on-failure
@@ -79,7 +95,9 @@ else
 fi
 
 # 4) Advertise audio capabilities on the worker (quoted Environment line!).
-if [ -f "$UNIT_WORKER" ] && ! grep -q "stable_audio3" "$UNIT_WORKER"; then
+if [ -n "$AUDIO_SKIP_WORKER_CAPS" ]; then
+  log "worker capabilities owned by the deploy plan — leaving $UNIT_WORKER untouched"
+elif [ -f "$UNIT_WORKER" ] && ! grep -q "stable_audio3" "$UNIT_WORKER"; then
   python3 - <<PY
 import re
 path = "$UNIT_WORKER"

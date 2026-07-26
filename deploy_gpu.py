@@ -51,8 +51,8 @@ DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
 DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
 DEFAULT_VERDA_HOSTNAME = "filmforge-verda-worker"
 DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
-# Models on the data volume: default warm set (flux 71 + wan 38 + stable_audio 6 + ltx 70)
-# ≈ 186 GB; +juggernaut 10 ≈ 196 GB. 300 GB leaves ~100 GB for ComfyUI outputs/temp/.part
+# Models on the data volume: default warm set (flux 71 + wan 38 + ltx 70)
+# ≈ 180 GB; +juggernaut 10 ≈ 190 GB. 300 GB leaves ~100 GB for ComfyUI outputs/temp/.part
 # download slack (LTX checkpoint alone is 46 GB) and the next model. See
 # Filmforge/backend/docs/discoveries/ltx-2-3-gpu-worker-install-2026-05-30.md.
 DEFAULT_VERDA_FRESH_STORAGE_SIZE = 300
@@ -66,7 +66,7 @@ DEFAULT_PYTORCH_INDEX_URL = "https://download.pytorch.org/whl/cu130"
 _TORCH_PIN = "torch==2.11.0"
 _TORCHVISION_PIN = "torchvision==0.26.0"
 _TORCHAUDIO_PIN = "torchaudio==2.11.0"
-DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "stable_audio_v1", "ltx_i2v_v1", "character_loras_v1"]
+DEFAULT_VERDA_FRESH_WARM_GROUPS = ["flux_stills_v1", "wan_i2v_v1", "ltx_i2v_v1", "character_loras_v1"]
 
 # Ordered list of candidate identity files to try when none is specified
 _CANDIDATE_IDENTITIES = [
@@ -456,7 +456,7 @@ test -n "${{WORKER_NAME:-}}" && ENV_VARS+=(WORKER_NAME="${{WORKER_NAME}}")
 test -n "${{WORKER_PUBLIC_URL:-}}" && ENV_VARS+=(WORKER_PUBLIC_URL="${{WORKER_PUBLIC_URL}}")
 test -n "${{WORKER_GPU_NAME:-}}" && ENV_VARS+=(WORKER_GPU_NAME="${{WORKER_GPU_NAME}}")
 test -n "${{WORKER_VRAM_GB:-}}" && ENV_VARS+=(WORKER_VRAM_GB="${{WORKER_VRAM_GB}}")
-ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}")
+ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}")
 test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && ENV_VARS+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
 test -n "${{WORKER_API_TOKEN:-}}" && ENV_VARS+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
 
@@ -738,7 +738,7 @@ start_worker_no_systemd() {{
   worker_env+=(WORKER_PROVIDER="vast")
   worker_env+=(WORKER_GPU_NAME="$GPU_NAME")
   worker_env+=(WORKER_VRAM_GB="$VRAM_GB")
-  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}")
+  worker_env+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}")
   worker_env+=(WORKER_ID_FILE="/workspace/.filmforge_worker_gpu${{idx}}.id")
   worker_env+=(MODEL_DOWNLOAD_TIMEOUT_SEC="7200")
   worker_env+=(COMFY_HEALTH_TIMEOUT_SEC="180")
@@ -807,7 +807,7 @@ Environment=WORKER_NAME=filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=vast
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio1,ltx_i2v,character_loras}}"
+Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}"
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
 Environment=COMFY_HEALTH_TIMEOUT_SEC=180
@@ -1569,6 +1569,41 @@ def _wait_for_verda_ssh(ip: str, identity: Path, timeout_sec: int) -> None:
     raise RuntimeError(f"Timed out waiting for SSH on Verda instance {ip}")
 
 
+# Departments a single GPU slot can serve on a multi-GPU box. One GPU = one
+# department stays the law (the resident co-tenants starved WAN); a 4-GPU box
+# just gets to run several departments side by side, one per card.
+WORKER_PLAN_DEPARTMENTS = ("generation", "vision", "audio", "none")
+
+# Vamsee's 4-GPU Verda layout (2026-07-26): two generation workers (FLUX/WAN
+# share the ComfyUI process and evict between phases), one vision worker
+# (resident vLLM/Qwen3-VL), one audio worker (resident Parler + SA3).
+DEFAULT_4GPU_WORKER_PLAN = ("generation", "generation", "vision", "audio")
+
+
+def parse_worker_plan(spec: str) -> list[str]:
+    """Parse a --*-worker-plan spec ("generation,generation,vision,audio").
+
+    Index in the list == GPU index. Returns [] for an empty spec (homogeneous
+    box, every worker gets the same capabilities — the pre-plan behavior).
+    """
+    if not (spec or "").strip():
+        return []
+    plan = [token.strip().lower() for token in spec.split(",") if token.strip()]
+    unknown = sorted(set(plan) - set(WORKER_PLAN_DEPARTMENTS))
+    if unknown:
+        raise RuntimeError(
+            f"Unknown worker-plan department(s): {', '.join(unknown)}. "
+            f"Valid: {', '.join(WORKER_PLAN_DEPARTMENTS)}"
+        )
+    if plan.count("vision") > 1 or plan.count("audio") > 1:
+        raise RuntimeError(
+            "At most one vision and one audio GPU per box: their servers are "
+            "resident singletons bound to a fixed port, so a second copy would "
+            "fight for the port and the same model cache."
+        )
+    return plan
+
+
 def verda_rehydrate_script(
     *,
     public_ip: str,
@@ -1578,6 +1613,8 @@ def verda_rehydrate_script(
     remote_root: str,
     patch_content: str = "",
     semantic_port: int = 8082,
+    worker_plan: list[str] | None = None,
+    vllm_port: int = 8100,
 ) -> str:
     if patch_content:
         _rehydrate_patch_block = (
@@ -1599,6 +1636,8 @@ PUBLIC_IP={shlex.quote(public_ip)}
 WORKER_PORT_BASE={worker_port}
 COMFY_PORT_BASE={comfy_port}
 WORKER_COUNT_REQUESTED={worker_count}
+WORKER_PLAN_SPEC={shlex.quote(",".join(worker_plan or []))}
+VLLM_PORT={vllm_port}
 REMOTE_ROOT={shlex.quote(remote_root)}
 COMFY_ROOT="/workspace/ComfyUI"
 WORKER_ROOT="/opt/filmforge_gpu_worker"
@@ -1616,6 +1655,44 @@ GPU_COUNT="$PHYSICAL_GPU_COUNT"
 if test "$WORKER_COUNT_REQUESTED" -gt 0 && test "$WORKER_COUNT_REQUESTED" -le "$PHYSICAL_GPU_COUNT"; then
   GPU_COUNT="$WORKER_COUNT_REQUESTED"
 fi
+
+# ── Per-GPU department plan ───────────────────────────────────────────────────
+# A plan assigns each GPU index its own department ("generation,generation,
+# vision,audio"). Empty spec = the old homogeneous box: every worker gets the
+# same WORKER_CAPABILITIES. The plan sizes the box: a 4-entry plan on a 4-GPU
+# machine wins over WORKER_COUNT_REQUESTED, and is truncated (never padded) to
+# the physical GPU count so no worker is pinned to a card that doesn't exist.
+WORKER_PLAN=()
+if test -n "$WORKER_PLAN_SPEC"; then
+  IFS=',' read -r -a WORKER_PLAN <<< "$WORKER_PLAN_SPEC"
+  PLAN_COUNT="${{#WORKER_PLAN[@]}}"
+  if test "$PLAN_COUNT" -gt "$PHYSICAL_GPU_COUNT"; then
+    echo "[verda] WARNING: worker plan has $PLAN_COUNT entries but the box has $PHYSICAL_GPU_COUNT GPU(s); truncating." >&2
+    PLAN_COUNT="$PHYSICAL_GPU_COUNT"
+  fi
+  GPU_COUNT="$PLAN_COUNT"
+  echo "[verda] worker plan: ${{WORKER_PLAN[*]:0:$GPU_COUNT}}"
+fi
+
+dept_for_idx() {{
+  if test "${{#WORKER_PLAN[@]}}" -eq 0; then
+    echo "generation"
+  else
+    echo "${{WORKER_PLAN[$1]}}"
+  fi
+}}
+
+# Capabilities a GPU advertises, by department. Generation honors an explicit
+# WORKER_CAPABILITIES override (that's how the rent UI narrows a render box);
+# vision/audio are fixed sets — their capability IS their department.
+caps_for_dept() {{
+  case "$1" in
+    vision) echo "qwen_vision" ;;
+    audio)  echo "tts_dialogue,stable_audio3" ;;
+    *)      echo "${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}" ;;
+  esac
+}}
+
 if test "$GPU_COUNT" -lt 1; then
   echo "[verda] ERROR: No GPUs detected by nvidia-smi" >&2
   exit 1
@@ -1983,12 +2060,23 @@ echo "VRAM: ${{VRAM_GB}} GB → ComfyUI flag: ${{COMFY_VRAM_FLAG:-'(none, dynami
 {_rehydrate_patch_block}
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  dept="$(dept_for_idx "$idx")"
   comfy_port=$((COMFY_PORT_BASE + idx))
   worker_port=$((WORKER_PORT_BASE + idx))
   comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
-  mkdir -p "$comfy_user_dir" "$COMFY_ROOT/temp/gpu${{idx}}"
 
-  cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
+  if test "$dept" = "none"; then
+    echo "[verda] gpu${{idx}}: department=none — no worker started"
+    continue
+  fi
+
+  # ComfyUI is the generation runtime only. A vision/audio GPU runs a resident
+  # server instead (vLLM / Parler+SA3), and a second ComfyUI process on that card
+  # would just hold VRAM the resident model needs — the co-tenancy that caused
+  # the WAN OOMs in the first place.
+  if test "$dept" = "generation"; then
+    mkdir -p "$comfy_user_dir" "$COMFY_ROOT/temp/gpu${{idx}}"
+    cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
 [Unit]
 Description=ComfyUI GPU ${{idx}}
 After=network-online.target
@@ -2005,38 +2093,65 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 UNIT
+    unit_after="network-online.target comfyui-gpu${{idx}}.service"
+  else
+    unit_after="network-online.target"
+  fi
 
   cat > "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
 [Unit]
-Description=FilmForge GPU Worker API GPU ${{idx}}
-After=network-online.target comfyui-gpu${{idx}}.service
-Wants=network-online.target comfyui-gpu${{idx}}.service
+Description=FilmForge GPU Worker API GPU ${{idx}} (${{dept}})
+After=${{unit_after}}
+Wants=${{unit_after}}
 
 [Service]
 Type=simple
 WorkingDirectory=$WORKER_MODULE_DIR
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
-Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
-Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
-Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
 Environment=WORKER_HOST=0.0.0.0
 Environment=WORKER_PORT=${{worker_port}}
-Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}
+Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}-${{dept}}
 Environment=WORKER_PROVIDER=verda
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
-Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,stable_audio,ltx_i2v,character_loras}}"
+Environment="WORKER_CAPABILITIES=$(caps_for_dept "$dept")"
 Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
-Environment=COMFY_HEALTH_TIMEOUT_SEC=180
-Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
-Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
 Environment=WORKER_MAX_CONCURRENT_JOBS=1
 Environment=WORKER_HEARTBEAT_SECONDS=30
 Environment=RENDER_BROKER_HEARTBEAT_SEC=30
 UNIT
+
+  if test "$dept" = "generation"; then
+    cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
+Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
+Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
+Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
+Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
+Environment=COMFY_HEALTH_TIMEOUT_SEC=180
+Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
+Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
+UNIT
+  fi
+
+  # Vision worker: registration metadata carries the vLLM base URL, which is how
+  # the backend's GET /api/render-broker/vision-worker hands it to the LLM
+  # gateway (no .env edit, no backend restart). Verda boxes have a public IP, so
+  # this is the direct address — no cloudflared hop like the Vast/SkyPilot yaml.
+  if test "$dept" = "vision"; then
+    echo "Environment=WORKER_VISION_BASE_URL=http://${{PUBLIC_IP}}:${{VLLM_PORT}}/v1" \
+      >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
+
+  # Non-generation workers get a deliberately dead ComfyUI address: the default
+  # (:8188) is gpu0's ComfyUI, so leaving it unset would make an audio/vision
+  # worker report comfy_reachable=true and — if a render ever slipped past the
+  # capability gate — execute it on somebody else's GPU.
+  if test "$dept" != "generation"; then
+    echo "Environment=COMFY_BASE_URL=http://127.0.0.1:1" \
+      >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  fi
 
   if test -n "${{FILMFORGE_BACKEND_URL:-}}"; then
     echo "Environment=FILMFORGE_BACKEND_URL=${{FILMFORGE_BACKEND_URL}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
@@ -2066,10 +2181,12 @@ done
 
 systemctl daemon-reload
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  test "$(dept_for_idx "$idx")" = "generation" || continue
   systemctl enable --now "comfyui-gpu${{idx}}.service"
 done
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  test "$(dept_for_idx "$idx")" = "generation" || continue
   port=$((COMFY_PORT_BASE + idx))
   stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
   rm -f "$stats_file"
@@ -2087,10 +2204,12 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
 done
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  test "$(dept_for_idx "$idx")" != "none" || continue
   systemctl enable --now "filmforge-worker-gpu${{idx}}.service"
 done
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  test "$(dept_for_idx "$idx")" != "none" || continue
   port=$((WORKER_PORT_BASE + idx))
   for _ in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:${{port}}/health" >/tmp/filmforge_worker_gpu${{idx}}_health.json 2>/dev/null; then
@@ -2110,20 +2229,101 @@ done
 echo "GPU_COUNT=${{GPU_COUNT}}"
 df -h /mnt/data
 
-# ── Audio department (opt-in via WORKER_CAPABILITIES) ─────────────────────────
-# tts_dialogue / stable_audio3 in the capability list makes this box the sound
-# stage too: provision the model stacks (idempotent — instant when the /mnt/data
-# volume already carries them) and install the resident Parler voice server via
-# setup_audio_services.sh. Guarded subshell: audio failures degrade to warnings,
-# never kill a render deploy.
+# Which GPU (if any) the plan assigned to each resident department. Empty when
+# there is no plan — then the legacy WORKER_CAPABILITIES check below decides.
+VISION_GPU_IDX=""
+AUDIO_GPU_IDX=""
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  case "$(dept_for_idx "$idx")" in
+    vision) VISION_GPU_IDX="$idx" ;;
+    audio)  AUDIO_GPU_IDX="$idx" ;;
+  esac
+done
+
+# ── Vision department (plan: a GPU assigned "vision") ─────────────────────────
+# Resident vLLM serving Qwen3-VL, pinned to its own card. The venv and the HF
+# cache live on /mnt/data so a rehydrate of the cached volume pair skips both the
+# ~2min vllm install and the ~17GB weight download. Guarded subshell: a vision
+# failure must never kill a render deploy — the LLM gateway falls back to OpenAI.
 (
 set +e
-case ",${{WORKER_CAPABILITIES:-}}," in
-  *,tts_dialogue,*|*,stable_audio3,*)
-    echo "[audio] audio capabilities requested — setting up the sound stage"
+if test -n "$VISION_GPU_IDX"; then
+  echo "[vision] gpu${{VISION_GPU_IDX}} → vLLM ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} on :${{VLLM_PORT}}"
+  VLLM_VENV=/mnt/data/vllm_venv
+  if ! test -x "$VLLM_VENV/bin/vllm"; then
+    python3 -m venv "$VLLM_VENV"
+    "$VLLM_VENV/bin/pip" install -q --upgrade pip
+    # 0.11.x = the Qwen3-VL support line incl. video input; pinned so a box
+    # rebuilt months later serves the same stack (matches ff_worker_vision_vast.yaml).
+    "$VLLM_VENV/bin/pip" install -q "vllm==0.11.2" || echo "[vision] WARN: vllm install failed" >&2
+  fi
+  if test -x "$VLLM_VENV/bin/vllm"; then
+    cat > /etc/systemd/system/filmforge-vllm.service <<UNIT
+[Unit]
+Description=FilmForge resident vLLM vision server (Qwen3-VL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CUDA_VISIBLE_DEVICES=${{VISION_GPU_IDX}}
+Environment=HF_HOME=/mnt/data/hf_cache
+Environment=HF_HUB_ENABLE_HF_TRANSFER=0
+ExecStart=$VLLM_VENV/bin/vllm serve ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --served-model-name ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --host 0.0.0.0 --port ${{VLLM_PORT}} --trust-remote-code --max-model-len 16384 --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{{"image":4,"video":1}}'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable -q filmforge-vllm
+    systemctl restart filmforge-vllm
+    # Bounded wait: a warm volume is up in ~60s, a first-ever boot downloads
+    # ~17GB. Don't hold the deploy hostage for that — the worker already
+    # advertises the URL and the gateway falls back to OpenAI until it answers.
+    VLLM_UP=""
+    for _ in $(seq 1 36); do
+      if curl -fsS "http://127.0.0.1:${{VLLM_PORT}}/health" >/dev/null 2>&1; then VLLM_UP=1; break; fi
+      sleep 5
+    done
+    if test -n "$VLLM_UP"; then
+      echo "[vision] vLLM healthy — QWEN_BASE_URL=http://${{PUBLIC_IP}}:${{VLLM_PORT}}/v1"
+    else
+      echo "[vision] WARN: vLLM not healthy after 3min (still downloading weights?) — journalctl -u filmforge-vllm" >&2
+    fi
+  fi
+fi
+)
+
+# ── Audio department ──────────────────────────────────────────────────────────
+# The sound stage (resident Parler voice + SA3 music): provision the model
+# stacks (idempotent — instant when the /mnt/data volume already carries them)
+# and install the servers via setup_audio_services.sh. Selected either by the
+# per-GPU plan (AUDIO_GPU_IDX, which also pins the servers to that card) or, on
+# a homogeneous box, by tts_dialogue/stable_audio3 in WORKER_CAPABILITIES.
+# Guarded subshell: audio failures degrade to warnings, never kill a deploy.
+(
+set +e
+_audio_wanted=""
+if test -n "$AUDIO_GPU_IDX"; then
+  _audio_wanted=1
+elif test "${{#WORKER_PLAN[@]}}" -eq 0; then
+  case ",${{WORKER_CAPABILITIES:-}}," in
+    *,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;
+  esac
+fi
+if test -n "$_audio_wanted"; then
+    echo "[audio] setting up the sound stage${{AUDIO_GPU_IDX:+ on gpu$AUDIO_GPU_IDX}}"
     cd "$WORKER_ROOT"
     export WORKSPACE=/mnt/data
     export HF_HUB_ENABLE_HF_TRANSFER=0
+    # Pin the resident servers to the plan's audio card, and leave the worker
+    # unit alone — the plan already wrote its capabilities.
+    if test -n "$AUDIO_GPU_IDX"; then
+      export AUDIO_GPU_INDEX="$AUDIO_GPU_IDX"
+      export AUDIO_SKIP_WORKER_CAPS=1
+    fi
     if [ -n "${{HF_TOKEN:-}}" ]; then
       bash provision_tts.sh || echo "[audio] WARN: provision_tts.sh failed" >&2
       bash provision_sa3.sh || echo "[audio] WARN: provision_sa3.sh failed" >&2
@@ -2131,9 +2331,51 @@ case ",${{WORKER_CAPABILITIES:-}}," in
       echo "[audio] HF_TOKEN not set — skipping model downloads (volume assumed provisioned)"
     fi
     bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
-    ;;
-esac
+fi
 )
+
+# ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
+# The provisioners above are shell scripts read from the box's git checkout of
+# gpu_worker, NOT from the deploy we just piped in — so an older checkout can
+# still be carrying the pre-plan setup_audio_services.sh, which bolts
+# tts_dialogue/stable_audio3 onto filmforge-worker-gpu0 and restarts it. That
+# silently recreates the exact department mix this plan exists to prevent
+# (observed on the first live 4-GPU deploy, 2026-07-26). The plan is the truth:
+# rewrite any unit whose capabilities drifted from it and say so loudly.
+if test "${{#WORKER_PLAN[@]}}" -gt 0; then
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" != "none" || continue
+    unit="/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+    test -f "$unit" || continue
+    want="$(caps_for_dept "$dept")"
+    have="$(grep -m1 '^Environment=.*WORKER_CAPABILITIES=' "$unit" | sed -e 's/.*WORKER_CAPABILITIES=//' -e 's/"$//')"
+    if test "$have" != "$want"; then
+      echo "[verda] WARNING: gpu${{idx}} ($dept) capabilities drifted from the plan — was '$have', restoring '$want'" >&2
+      sed -i "s|^Environment=\\"WORKER_CAPABILITIES=.*\\"$|Environment=\\"WORKER_CAPABILITIES=${{want}}\\"|" "$unit"
+      systemctl daemon-reload
+      systemctl restart "filmforge-worker-gpu${{idx}}.service"
+    fi
+  done
+
+  # Same drift, second half: an old setup_audio_services.sh writes the resident
+  # Parler/SA3 units with NO CUDA_VISIBLE_DEVICES, so both load onto GPU 0 and
+  # sit in a render card's VRAM. Re-pin them to the plan's audio card.
+  if test -n "$AUDIO_GPU_IDX"; then
+    for svc in filmforge-parler filmforge-sa3; do
+      unit="/etc/systemd/system/$svc.service"
+      test -f "$unit" || continue
+      want="Environment=CUDA_VISIBLE_DEVICES=$AUDIO_GPU_IDX"
+      if ! grep -qxF "$want" "$unit"; then
+        echo "[verda] WARNING: $svc is not pinned to gpu${{AUDIO_GPU_IDX}} — re-pinning" >&2
+        sed -i '/^Environment=CUDA_VISIBLE_DEVICES=/d' "$unit"
+        sed -i "/^\\[Service\\]/a $want" "$unit"
+        systemctl daemon-reload
+        systemctl restart "$svc"
+      fi
+    done
+  fi
+fi
 
 # ── Semantic search service ───────────────────────────────────────────────────
 # Run the whole block in a guarded subshell: the outer script is `set -e`, so any
@@ -2542,7 +2784,10 @@ def _verda_env_vars(args: argparse.Namespace) -> list[str]:
         (item.split("=", 1)[1] for item in env_vars if item.startswith("WORKER_CAPABILITIES=")),
         os.getenv("WORKER_CAPABILITIES", ""),
     )
-    if ("tts_dialogue" in caps or "stable_audio3" in caps) and "HF_TOKEN" not in existing_keys:
+    # A per-GPU plan with an "audio" card needs HF_TOKEN just the same, and its
+    # audio capabilities never appear in the broadcast WORKER_CAPABILITIES.
+    plan_wants_audio = "audio" in parse_worker_plan(getattr(args, "verda_worker_plan", "") or "")
+    if (plan_wants_audio or "tts_dialogue" in caps or "stable_audio3" in caps) and "HF_TOKEN" not in existing_keys:
         value = _read_env_value(args.backend_env, "HF_TOKEN") or os.getenv("HF_TOKEN")
         if not value:
             token_file = Path.home() / ".cache" / "huggingface" / "token"
@@ -2641,6 +2886,8 @@ def verda_deploy(args: argparse.Namespace) -> int:
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
         patch_content=_patch_path.read_text() if _patch_path.exists() else "",
+        worker_plan=parse_worker_plan(getattr(args, "verda_worker_plan", "")),
+        vllm_port=getattr(args, "verda_vllm_port", 8100),
     )
     env_exports = build_env_exports(env_vars)
     if env_exports:
@@ -2796,6 +3043,8 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
         patch_content=_patch_path.read_text() if _patch_path.exists() else "",
+        worker_plan=parse_worker_plan(getattr(args, "verda_worker_plan", "")),
+        vllm_port=getattr(args, "verda_vllm_port", 8100),
     )
     env_exports = build_env_exports(env_vars)
     if env_exports:
@@ -3305,6 +3554,21 @@ fi
         else:
             script = remote_script(args.remote_root, args.worker_port)
         if getattr(args, "qwen_sidecar", False):
+            # One GPU = one department: the Qwen vision sidecar pins ~25% of VRAM
+            # and starved the render models (an OOM cause), so it must not share a
+            # generation GPU. If this box carries any render capability, refuse —
+            # give vision its own box.
+            _caps_str = next(
+                (v.split("=", 1)[1] for v in env_vars if v.startswith("WORKER_CAPABILITIES=")),
+                os.getenv("WORKER_CAPABILITIES", "flux2_stills,wan_i2v,ltx_i2v,character_loras"),
+            )
+            _gen = {"flux2_stills", "wan_i2v", "ltx_i2v"}
+            if _gen & {c.strip() for c in _caps_str.split(",")}:
+                raise SystemExit(
+                    "--qwen-sidecar cannot share a generation GPU (one box = one "
+                    "department). Deploy Qwen vision on its own box, or set "
+                    "WORKER_CAPABILITIES to a non-render set."
+                )
             env_vars.append("ENABLE_QWEN_SIDECAR=true")
             env_vars.append(f"QWEN_MODEL={args.qwen_model}")
             env_vars.append(f"QWEN_GPU_FRACTION={args.qwen_gpu_fraction}")
@@ -3627,6 +3891,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("VERDA_WORKER_COUNT", "0")),
         help="Number of GPU worker services to start, one per GPU (each pinned to its own CUDA device). 0 (default) auto-detects and uses every physical GPU on the box, so a multi-GPU box uses all its GPUs. Set a lower value to leave some GPUs unused. Per-GPU inference concurrency is a separate setting, not this.",
+    )
+    parser.add_argument(
+        "--verda-worker-plan",
+        default=os.getenv("VERDA_WORKER_PLAN", ""),
+        help=(
+            "Per-GPU department plan for a multi-GPU box, comma-separated, index = GPU index. "
+            "Valid entries: " + ", ".join(WORKER_PLAN_DEPARTMENTS) + ". "
+            "Example: '" + ",".join(DEFAULT_4GPU_WORKER_PLAN) + "' puts FLUX/WAN on GPUs 0-1, "
+            "the Qwen3-VL vLLM server on GPU 2 and the Parler+SA3 sound stage on GPU 3, all sharing "
+            "the one /mnt/data volume. Sizes the box (overrides --verda-worker-count). "
+            "Empty (default) = every worker gets the same WORKER_CAPABILITIES."
+        ),
+    )
+    parser.add_argument(
+        "--verda-vllm-port",
+        type=int,
+        default=int(os.getenv("VERDA_VLLM_PORT", "8100")),
+        help="Port for the resident vLLM vision server when the plan has a 'vision' GPU. Default: 8100",
     )
     parser.add_argument(
         "--verda-fresh-os-image",
