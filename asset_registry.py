@@ -136,6 +136,59 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Kim2091/UltraSharp/resolve/main/4x-UltraSharp.pth",
         },
     ],
+    # Opt-in: InfiniteTalk / MultiTalk audio-driven talking shots. WAN **2.1**-based —
+    # a SEPARATE weight set beside wan_i2v_v1's 2.2 stack (incl. its own lightx2v LoRA
+    # and VAE), so this is never implied by wan_i2v. Runs at 25 fps vs our 16.
+    # Needs Kijai's ComfyUI-WanVideoWrapper custom node too, which asset_manager cannot
+    # install — hence the PROVISIONERS entry below runs *in addition to* these downloads.
+    # wav2vec (TencentGameMate/chinese-wav2vec2-base) is NOT listed: the wrapper's
+    # DownloadAndLoadWav2VecModel node fetches it on first run.
+    # Spike-validated 2026-07-28 (A1 "Wow. It works." / A2 two-shot):
+    # spikes/audio_dialogue/, docs/AUDIO_DIALOGUE_RESEARCH_2026-07-28.md.
+    "infinitetalk_v1": [
+        {
+            "name": "wan21_i2v_base",
+            "path": "/workspace/ComfyUI/models/diffusion_models/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors",
+        },
+        {
+            "name": "infinitetalk_single",
+            "path": "/workspace/ComfyUI/models/diffusion_models/Wan2_1-InfiniTetalk-Single_fp16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/InfiniteTalk/Wan2_1-InfiniTetalk-Single_fp16.safetensors",
+        },
+        {
+            "name": "infinitetalk_multi",
+            "path": "/workspace/ComfyUI/models/diffusion_models/Wan2_1-InfiniteTalk-Multi_fp16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/InfiniteTalk/Wan2_1-InfiniteTalk-Multi_fp16.safetensors",
+        },
+        {
+            "name": "wan21_vae",
+            "path": "/workspace/ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors",
+        },
+        {
+            "name": "wan21_text_encoder",
+            "path": "/workspace/ComfyUI/models/text_encoders/umt5-xxl-enc-fp8_e4m3fn.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-fp8_e4m3fn.safetensors",
+        },
+        {
+            # MUST be Comfy-Org's repackage, NOT Kijai's
+            # open-clip-xlm-roberta-large-vit-huge-14_visual_fp16. The A1 graph
+            # loads this through STOCK `CLIPVisionLoader`, which inspects the
+            # state dict and rejects Kijai's visual-only extract outright:
+            # "clip vision file is invalid and does not contain a valid vision
+            # model" (ComfyUI nodes.py:1062). Verified by A1 passing on this
+            # file and failing on the other, 2026-08-01.
+            "name": "wan21_clip_vision",
+            "path": "/workspace/ComfyUI/models/clip_vision/clip_vision_h.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors",
+        },
+        {
+            "name": "wan21_lightx2v_lora",
+            "path": "/workspace/ComfyUI/models/loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+        },
+    ],
     # --- Provisioner-backed audio groups (NOT single-file ComfyUI models) ---------------
     # These run as standalone pip packages in isolated venvs (their transformers pins
     # conflict with each other and with ComfyUI), loading whole HF-repo snapshots via
@@ -161,6 +214,9 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
 PROVISIONERS: dict[str, str] = {
     "tts_dialogue_v1": "gpu_worker/provision_tts.sh",
     "stable_audio3_v1": "gpu_worker/provision_sa3.sh",
+    # Runs IN ADDITION to infinitetalk_v1's file downloads: installs the custom node
+    # the graphs need. Weights stay with asset_manager so they cache on the data volume.
+    "infinitetalk_v1": "gpu_worker/provision_infinitetalk.sh",
 }
 
 
@@ -196,6 +252,12 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "stable_audio3": ["stable_audio3_v1"],
     "stable_audio_3": ["stable_audio3_v1"],
     "stable_audio3_v1": ["stable_audio3_v1"],
+    # Opt-in: audio-driven talking shots (InfiniteTalk single / MultiTalk two-shot).
+    # Deliberately NOT implied by wan_i2v — it is a whole second WAN 2.1 weight set.
+    "infinitetalk": ["infinitetalk_v1"],
+    "talking_shot": ["infinitetalk_v1"],
+    "multitalk": ["infinitetalk_v1"],
+    "infinitetalk_v1": ["infinitetalk_v1"],
 }
 
 
