@@ -67,20 +67,48 @@ def _sanitize_trim(
     return round(start, 3), round(end, 3)
 
 
+def _cadence_filter_chain(fps: int) -> str:
+    """The Director's approved conform chain (backend `render/cadence.py`).
+
+    WAN 2.2 I2V generates at 16 fps. A bare `-r 24` does not resample motion, it
+    DUPLICATES one frame in three — measured at 32% frozen frames in the
+    delivered cut, with a cadence less regular than the 16 fps source. The fix
+    interpolates to 48 with motion compensation, averages adjacent frame pairs
+    for a synthetic 180 degree shutter (2 frames of 48 = 1/48 s of smear inside
+    a 1/24 s frame), then decimates to `fps`. The shutter blur is part of the
+    ruling, not an embellishment.
+
+    Kept byte-compatible with the backend by hand, like the rest of this file.
+    G46 is still open: nothing upstream can author a cadence, so `fps` still
+    arrives as the request default.
+    """
+    return (
+        f"minterpolate=fps={fps * 2}:mi_mode=mci:me_mode=bidir:mc_mode=aobmc:vsbmc=1,"
+        f"tmix=frames=2:weights='1 1',"
+        f"fps={fps}"
+    )
+
+
 def _normalize_cmd(
     raw: str, norm: str, w: int, h: int, fps: int,
     trim_start: Optional[float] = None, trim_dur: Optional[float] = None,
 ) -> list[str]:
     """Ported from backend `_build_normalize_clip_command`: scale+pad to target,
-    fix fps, strip audio, re-encode to a concat-friendly H.264."""
+    conform to the delivery cadence, strip audio, re-encode to a concat-friendly
+    H.264.
+
+    Per clip, before concat: interpolating across a concat seam would invent
+    motion between two unrelated shots.
+    """
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+        f"{_cadence_filter_chain(fps)}"
     )
     cmd = ["ffmpeg", "-y", "-i", raw]
     if trim_start is not None and trim_dur is not None:
         cmd += ["-ss", f"{trim_start:.3f}", "-t", f"{trim_dur:.3f}"]
-    cmd += ["-vf", vf, "-r", str(fps), "-an", "-c:v", "libx264",
+    cmd += ["-vf", vf, "-an", "-c:v", "libx264",
             "-preset", "veryfast", "-pix_fmt", "yuv420p", norm]
     return cmd
 
