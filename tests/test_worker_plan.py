@@ -29,6 +29,15 @@ def _script(plan: list[str] | None = None, **kwargs) -> str:
     )
 
 
+def _fresh_script() -> str:
+    return deploy_gpu.verda_fresh_install_script(
+        worker_repo_url="https://example.com/worker.git",
+        comfy_repo_url="https://example.com/comfy.git",
+        pytorch_index_url="https://example.com/torch",
+        remote_root="/opt/filmforge_gpu_worker",
+    )
+
+
 # ── plan parsing ──────────────────────────────────────────────────────────────
 
 
@@ -64,6 +73,48 @@ def test_script_is_valid_bash(tmp_path: Path) -> None:
     subprocess.run(["bash", "-n", str(path)], check=True)
 
 
+def test_fresh_install_script_is_valid_bash(tmp_path: Path) -> None:
+    path = tmp_path / "fresh-install.sh"
+    path.write_text(_fresh_script())
+    subprocess.run(["bash", "-n", str(path)], check=True)
+
+
+def test_fresh_install_only_formats_a_safely_blank_data_volume() -> None:
+    script = _fresh_script()
+
+    assert "wipefs -n --noheadings --output TYPE /dev/vdb" in script
+    assert script.count("dd if=/dev/vdb bs=4M") == 2
+    assert "refusing to format it automatically" in script
+    assert "mkfs.ext4 -F /dev/vdb" in script
+    assert "touch /mnt/data/.filmforge-bootstrap-complete" in script
+
+
+def test_fresh_install_repairs_inconsistent_verda_ubuntu_mirror() -> None:
+    script = _fresh_script()
+
+    assert "apt-get install --simulate" in script
+    assert "https://archive.ubuntu.com/ubuntu/" in script
+    assert "https://security.ubuntu.com/ubuntu/" in script
+    assert "switching to canonical HTTPS mirrors" in script
+    assert "/var/backups/filmforge-apt" in script
+    assert ".filmforge-original" not in script
+
+
+def test_rehydrate_requires_an_initialized_ext4_data_volume() -> None:
+    script = _script(PLAN)
+
+    assert 'if test "$VDB_FS" != "ext4"; then' in script
+    assert "deploy preflight should bootstrap an incomplete volume pair" in script
+
+
+def test_rehydrate_repairs_nvswitch_fabric_startup_race_once() -> None:
+    script = _script(PLAN)
+
+    assert "test -e /dev/nvidia-nvswitchctl" in script
+    assert "timeout 180 systemctl restart nvidia-fabricmanager.service" in script
+    assert "provider-side GPU fabric fault" in script
+
+
 def test_plan_reaches_the_script() -> None:
     assert "WORKER_PLAN_SPEC=generation,generation,vision,audio" in _script(PLAN)
 
@@ -73,6 +124,12 @@ def test_no_plan_keeps_the_homogeneous_box() -> None:
     assert "WORKER_PLAN_SPEC=''" in script
     # Every worker still falls back to the same capability broadcast.
     assert "${WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}" in script
+
+
+def test_worker_units_honor_deploy_concurrency_environment() -> None:
+    script = _script(PLAN)
+    assert "Environment=WORKER_MAX_CONCURRENT_JOBS=${WORKER_MAX_CONCURRENT_JOBS:-10}" in script
+    assert "Environment=WORKER_MAX_CONCURRENT_JOBS=1" not in script
 
 
 def test_capabilities_are_per_department() -> None:
@@ -87,6 +144,11 @@ def test_comfyui_only_starts_on_generation_cards() -> None:
     # a second ComfyUI on the vision card would hold VRAM the resident vLLM needs.
     assert script.count('test "$(dept_for_idx "$idx")" = "generation" || continue') == 2
     assert 'if test "$dept" = "generation"; then' in script
+
+
+def test_comfyui_uses_a_per_gpu_database() -> None:
+    script = _script(PLAN)
+    assert "--database-url sqlite:///${comfy_user_dir}/comfyui.db" in script
 
 
 def test_vision_card_advertises_the_vllm_url_for_discovery() -> None:

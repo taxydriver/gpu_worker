@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     render_broker_worker_name: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_NAME")
     render_broker_worker_public_url: str | None = Field(default=None, alias="RENDER_BROKER_WORKER_PUBLIC_URL")
     render_broker_heartbeat_sec: int = Field(default=30, alias="RENDER_BROKER_HEARTBEAT_SEC")
-    render_broker_max_concurrency: int = Field(default=1, alias="RENDER_BROKER_MAX_CONCURRENCY")
+    render_broker_max_concurrency: int = Field(default=10, alias="RENDER_BROKER_MAX_CONCURRENCY")
 
     # Phase 1 worker-pool env vars (new naming convention)
     filmforge_backend_url: str | None = Field(default=None, alias="FILMFORGE_BACKEND_URL")
@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     worker_gpu_name: str | None = Field(default=None, alias="WORKER_GPU_NAME")
     worker_vram_gb: float | None = Field(default=None, alias="WORKER_VRAM_GB")
     worker_capabilities: str | None = Field(default=None, alias="WORKER_CAPABILITIES")
-    worker_max_concurrent_jobs: int = Field(default=1, alias="WORKER_MAX_CONCURRENT_JOBS")
+    worker_max_concurrent_jobs: int = Field(default=10, alias="WORKER_MAX_CONCURRENT_JOBS")
     worker_registration_token: str | None = Field(default=None, alias="WORKER_REGISTRATION_TOKEN")
     worker_api_token: str | None = Field(default=None, alias="WORKER_API_TOKEN")
     worker_heartbeat_seconds: int = Field(default=60, alias="WORKER_HEARTBEAT_SECONDS")
@@ -158,7 +158,7 @@ class Settings(BaseSettings):
             return self.worker_max_concurrent_jobs
         if self.render_broker_max_concurrency and self.render_broker_max_concurrency > 0:
             return self.render_broker_max_concurrency
-        return 1
+        return 10
 
 
 @lru_cache(maxsize=1)

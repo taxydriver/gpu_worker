@@ -89,6 +89,7 @@ def run(
     cwd: Path | None = None,
     capture_output: bool = False,
     check: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     log(f"+ {shlex.join(cmd)}")
     return subprocess.run(
@@ -98,6 +99,7 @@ def run(
         text=True,
         capture_output=capture_output,
         check=check,
+        timeout=timeout,
     )
 
 
@@ -254,6 +256,154 @@ def add_default_host_key_policy(cmd: list[str]) -> list[str]:
         "-o", "LogLevel=ERROR",
         *cmd[1:],
     ]
+
+
+def add_default_ssh_liveness_policy(cmd: list[str]) -> list[str]:
+    """Bound connection setup and detect an interrupted cloud VM promptly."""
+    defaults = (
+        ("ConnectTimeout", "8"),
+        ("BatchMode", "yes"),
+        ("ServerAliveInterval", "15"),
+        ("ServerAliveCountMax", "3"),
+    )
+    additions: list[str] = []
+    for option, value in defaults:
+        if not has_ssh_option(cmd, option):
+            additions.extend(["-o", f"{option}={value}"])
+    if not additions:
+        return cmd
+    return [cmd[0], *additions, *cmd[1:]]
+
+
+def _run_verda_ssh_script(
+    ssh_cmd: list[str],
+    script: str,
+    *,
+    timeout_sec: int,
+    capture_output: bool,
+    operation: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return run(
+            [*ssh_cmd, "bash", "-s"],
+            input_text=script,
+            capture_output=capture_output,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Timed out after {timeout_sec}s while {operation}; "
+            "the Verda VM may have been interrupted or become unreachable"
+        ) from exc
+
+
+_VERDA_REHYDRATE_STATE_PROBE = r"""#!/usr/bin/env bash
+set -u
+
+data_state="missing"
+if test -b /dev/vdb; then
+  fs_type="$(blkid -s TYPE -o value /dev/vdb 2>/dev/null || true)"
+  if test -n "$fs_type"; then
+    data_state="filesystem:$fs_type"
+  else
+    signatures="$(wipefs -n --noheadings --output TYPE /dev/vdb 2>/dev/null | tr -d '[:space:]' || true)"
+    size_bytes="$(blockdev --getsize64 /dev/vdb 2>/dev/null || true)"
+    sample_bytes=$((4 * 1024 * 1024))
+    samples_are_zero=0
+    if test -z "$signatures" && test "${size_bytes:-0}" -ge "$sample_bytes"; then
+      last_sample=$(((size_bytes - sample_bytes) / sample_bytes))
+      if cmp -s <(dd if=/dev/vdb bs=4M count=1 status=none) \
+                <(dd if=/dev/zero bs=4M count=1 status=none) \
+          && cmp -s <(dd if=/dev/vdb bs=4M skip="$last_sample" count=1 status=none) \
+                    <(dd if=/dev/zero bs=4M count=1 status=none); then
+        samples_are_zero=1
+      fi
+    fi
+    if test "$samples_are_zero" -eq 1; then
+      data_state="blank"
+    else
+      data_state="unknown"
+    fi
+  fi
+fi
+
+worker_ready=0
+comfy_ready=0
+bootstrap_ready=0
+test -x /opt/filmforge_gpu_worker/.venv/bin/python && worker_ready=1
+test -x /workspace/ComfyUI/.venv/bin/python && comfy_ready=1
+if test "$data_state" = "filesystem:ext4"; then
+  if mountpoint -q /mnt/data 2>/dev/null; then
+    test -f /mnt/data/.filmforge-bootstrap-complete && bootstrap_ready=1
+  else
+    probe_mount="/run/filmforge-data-probe"
+    mkdir -p "$probe_mount"
+    if mount -o ro,noload /dev/vdb "$probe_mount" 2>/dev/null; then
+      test -f "$probe_mount/.filmforge-bootstrap-complete" && bootstrap_ready=1
+      umount "$probe_mount" 2>/dev/null || true
+    fi
+    rmdir "$probe_mount" 2>/dev/null || true
+  fi
+fi
+
+printf 'DATA_STATE=%s\n' "$data_state"
+printf 'WORKER_READY=%s\n' "$worker_ready"
+printf 'COMFY_READY=%s\n' "$comfy_ready"
+printf 'BOOTSTRAP_READY=%s\n' "$bootstrap_ready"
+"""
+
+
+def _probe_verda_rehydrate_state(ssh_cmd: list[str]) -> dict[str, str]:
+    """Read enough remote state to distinguish a reusable pair from a failed fresh install."""
+    result = _run_verda_ssh_script(
+        ssh_cmd,
+        _VERDA_REHYDRATE_STATE_PROBE,
+        timeout_sec=60,
+        capture_output=True,
+        operation="checking the attached Verda volumes",
+    )
+    state: dict[str, str] = {}
+    for line in (result.stdout or "").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in {
+            "DATA_STATE", "WORKER_READY", "COMFY_READY", "BOOTSTRAP_READY"
+        }:
+            state[key] = value.strip()
+    missing = {
+        "DATA_STATE", "WORKER_READY", "COMFY_READY", "BOOTSTRAP_READY"
+    } - state.keys()
+    if missing:
+        raise RuntimeError(
+            "Could not determine whether the attached Verda volumes are reusable; "
+            f"probe omitted {', '.join(sorted(missing))}"
+        )
+    return state
+
+
+def _verda_pair_needs_bootstrap(state: dict[str, str]) -> bool:
+    """Return true for a safe-to-initialize or partially installed Verda pair."""
+    data_state = state["DATA_STATE"]
+    if data_state == "blank":
+        return True
+    if data_state == "filesystem:ext4":
+        return (
+            state["BOOTSTRAP_READY"] != "1"
+            or state["WORKER_READY"] != "1"
+            or state["COMFY_READY"] != "1"
+        )
+    if data_state == "missing":
+        raise RuntimeError("Verda data volume is not present as /dev/vdb; refusing to deploy")
+    if data_state == "unknown":
+        raise RuntimeError(
+            "Verda data volume has no recognized filesystem but is not safely blank; "
+            "refusing to format it automatically"
+        )
+    if data_state.startswith("filesystem:"):
+        fs_type = data_state.split(":", 1)[1]
+        raise RuntimeError(
+            f"Verda data volume uses unsupported filesystem {fs_type!r}; expected ext4"
+        )
+    raise RuntimeError(f"Unexpected Verda data-volume state {data_state!r}")
 
 
 def add_default_identity(cmd: list[str], override: Path | None = None) -> list[str]:
@@ -442,7 +592,7 @@ ENV_VARS+=(COMFY_STOP_CMD="$COMFY_STOP_CMD")
 ENV_VARS+=(COMFY_START_CMD="$COMFY_START_CMD")
 ENV_VARS+=(WORKER_PROVIDER="${{WORKER_PROVIDER:-dedicated_worker}}")
 test -n "${{WORKER_INSTANCE_ID:-}}" && ENV_VARS+=(WORKER_INSTANCE_ID="${{WORKER_INSTANCE_ID}}")
-ENV_VARS+=(WORKER_MAX_CONCURRENT_JOBS="${{WORKER_MAX_CONCURRENT_JOBS:-1}}")
+ENV_VARS+=(WORKER_MAX_CONCURRENT_JOBS="${{WORKER_MAX_CONCURRENT_JOBS:-10}}")
 ENV_VARS+=(WORKER_HEARTBEAT_SECONDS="${{WORKER_HEARTBEAT_SECONDS:-60}}")
 
 # Only include these if they're not empty
@@ -743,8 +893,8 @@ start_worker_no_systemd() {{
   worker_env+=(MODEL_DOWNLOAD_TIMEOUT_SEC="7200")
   worker_env+=(COMFY_HEALTH_TIMEOUT_SEC="180")
   worker_env+=(COMFY_STOP_CMD="pkill -f 'main.py.*--port ${{comfy_port}}' || true")
-  worker_env+=(COMFY_START_CMD="cd $COMFY_ROOT && CUDA_VISIBLE_DEVICES=${{idx}} $COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory $COMFY_ROOT/user_gpu${{idx}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}} >> /tmp/comfyui_gpu${{idx}}.log 2>&1 &")
-  worker_env+=(WORKER_MAX_CONCURRENT_JOBS="1")
+  worker_env+=(COMFY_START_CMD="cd $COMFY_ROOT && CUDA_VISIBLE_DEVICES=${{idx}} $COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory $COMFY_ROOT/user_gpu${{idx}} --database-url sqlite:///$COMFY_ROOT/user_gpu${{idx}}/comfyui.db --temp-directory $COMFY_ROOT/temp/gpu${{idx}} >> /tmp/comfyui_gpu${{idx}}.log 2>&1 &")
+  worker_env+=(WORKER_MAX_CONCURRENT_JOBS="${{WORKER_MAX_CONCURRENT_JOBS:-10}}")
   worker_env+=(WORKER_HEARTBEAT_SECONDS="30")
   worker_env+=(RENDER_BROKER_HEARTBEAT_SEC="30")
   worker_env+=(TMPDIR="/tmp")
@@ -774,7 +924,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$COMFY_ROOT
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-ExecStart=$COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory ${{comfy_user_dir}} --temp-directory ${{comfy_temp_dir}}
+ExecStart=$COMFY_PYTHON main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --user-directory ${{comfy_user_dir}} --database-url sqlite:///${{comfy_user_dir}}/comfyui.db --temp-directory ${{comfy_temp_dir}}
 Restart=always
 RestartSec=5
 
@@ -813,7 +963,7 @@ Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
 Environment=COMFY_HEALTH_TIMEOUT_SEC=180
 Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
 Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
-Environment=WORKER_MAX_CONCURRENT_JOBS=1
+Environment=WORKER_MAX_CONCURRENT_JOBS=${{WORKER_MAX_CONCURRENT_JOBS:-10}}
 Environment=WORKER_HEARTBEAT_SECONDS=30
 Environment=RENDER_BROKER_HEARTBEAT_SEC=30
 UNIT
@@ -859,7 +1009,7 @@ else
     comfy_temp_dir="$COMFY_ROOT/temp/gpu${{idx}}"
     nohup env CUDA_VISIBLE_DEVICES="$idx" "$COMFY_PYTHON" "$COMFY_ROOT/main.py" \\
       --listen 127.0.0.1 --port "$comfy_port" --enable-cors-header \\
-      --user-directory "$comfy_user_dir" --temp-directory "$comfy_temp_dir" \\
+      --user-directory "$comfy_user_dir" --database-url "sqlite:///$comfy_user_dir/comfyui.db" --temp-directory "$comfy_temp_dir" \\
       >/tmp/comfyui_gpu${{idx}}.log 2>&1 </dev/null &
   done
 fi
@@ -1810,6 +1960,12 @@ fi
 
 mkdir -p /mnt/data
 if ! mountpoint -q /mnt/data; then
+  VDB_FS="$(blkid -s TYPE -o value /dev/vdb 2>/dev/null || true)"
+  if test "$VDB_FS" != "ext4"; then
+    echo "[verda] ERROR: /dev/vdb is not an initialized ext4 data volume (detected: ${{VDB_FS:-none}})." >&2
+    echo "[verda] The deploy preflight should bootstrap an incomplete volume pair before rehydration." >&2
+    exit 1
+  fi
   mount /dev/vdb /mnt/data
 fi
 VDB_UUID="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
@@ -2011,7 +2167,27 @@ else
   echo "[verda] CUDA OK: driver=$_cuda_driver_major torch_cuda=$_torch_cuda_ver (no index available for repair)" >&2
 fi
 
-# Blackwell GPUs can be slow to enter compute-ready state after module load.
+# NVSwitch boxes (A100/H100 SXM) require Fabric Manager before CUDA can create
+# a context. Verda occasionally starts it before the assigned GPUs are online;
+# one bounded restart repairs that race. A restart that fails or hangs indicates
+# a provider-side NVLink/NVSwitch fault, so keep the volume pair and replace the
+# VM instead of registering workers that will fail every job with CUDA error 802.
+if test -e /dev/nvidia-nvswitchctl \
+   && ! "$COMFY_ROOT/.venv/bin/python" -c \
+        "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
+        >/dev/null 2>&1; then
+  echo "[verda] CUDA unavailable on NVSwitch box; restarting NVIDIA Fabric Manager once..." >&2
+  systemctl reset-failed nvidia-fabricmanager.service 2>/dev/null || true
+  if ! timeout 180 systemctl restart nvidia-fabricmanager.service; then
+    systemctl kill --kill-whom=all nvidia-fabricmanager.service 2>/dev/null || true
+    echo "[verda] ERROR: NVIDIA Fabric Manager could not initialize the NVSwitch topology." >&2
+    echo "[verda] This VM has a provider-side GPU fabric fault; preserve the volumes and replace the VM." >&2
+    journalctl -u nvidia-fabricmanager.service -n 30 --no-pager >&2 || true
+    exit 1
+  fi
+fi
+
+# GPUs can be slow to enter compute-ready state after module/fabric init.
 # Retry up to 5× (50s max) before treating unavailability as fatal.
 for _cuda_try in 1 2 3 4 5; do
   if "$COMFY_ROOT/.venv/bin/python" -c \
@@ -2033,6 +2209,10 @@ if not torch.cuda.is_available():
 print("ComfyUI CUDA device=" + torch.cuda.get_device_name(0))
 PY
 then
+  if test -e /dev/nvidia-nvswitchctl; then
+    echo "[verda] NVIDIA Fabric Manager state: $(systemctl is-active nvidia-fabricmanager.service 2>/dev/null || true)" >&2
+    journalctl -u nvidia-fabricmanager.service -n 30 --no-pager >&2 || true
+  fi
   echo "ComfyUI PyTorch CUDA validation failed; refusing to register an unusable worker" >&2
   exit 1
 fi
@@ -2122,7 +2302,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$COMFY_ROOT
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --use-pytorch-cross-attention ${{COMFY_VRAM_FLAG}} --user-directory ${{comfy_user_dir}} --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
+ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --use-pytorch-cross-attention ${{COMFY_VRAM_FLAG}} --user-directory ${{comfy_user_dir}} --database-url sqlite:///${{comfy_user_dir}}/comfyui.db --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
 Restart=always
 RestartSec=5
 
@@ -2154,7 +2334,7 @@ Environment="WORKER_CAPABILITIES=$(caps_for_dept "$dept")"
 Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
-Environment=WORKER_MAX_CONCURRENT_JOBS=1
+Environment=WORKER_MAX_CONCURRENT_JOBS=${{WORKER_MAX_CONCURRENT_JOBS:-10}}
 Environment=WORKER_HEARTBEAT_SECONDS=30
 Environment=RENDER_BROKER_HEARTBEAT_SEC=30
 UNIT
@@ -2647,21 +2827,88 @@ apt_retry() {{
   apt-get "$@"
 }}
 
-apt_retry update
-apt_retry install -y --no-install-recommends \\
-  ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv \\
+BOOTSTRAP_PACKAGES=(
+  ca-certificates curl git rsync python3 python3-dev python3-pip python3-venv
   build-essential e2fsprogs ffmpeg libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+)
+
+repair_ubuntu_package_sources() {{
+  # Some Verda base images point at a regional cloud mirror whose InRelease
+  # files are current but whose noble-updates/security Packages indexes are
+  # empty. apt-get update then succeeds while every install is unsatisfiable.
+  # Move only Ubuntu's own sources to the canonical HTTPS endpoints; leave
+  # NVIDIA CUDA and Docker repositories untouched.
+  test -f /etc/os-release || return 1
+  . /etc/os-release
+  test "${{ID:-}}" = "ubuntu" || return 1
+
+  local source_file backup_dir backup_file
+  backup_dir="/var/backups/filmforge-apt"
+  mkdir -p "$backup_dir"
+  for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    test -f "$source_file" || continue
+    if grep -Eq '(clouds\\.archive\\.ubuntu\\.com/ubuntu|security\\.ubuntu\\.com/ubuntu)' "$source_file"; then
+      backup_file="$backup_dir/${{source_file##*/}}.original"
+      test -f "$backup_file" || cp -a "$source_file" "$backup_file"
+      sed -Ei \
+        -e 's#https?://[^[:space:]]*clouds\\.archive\\.ubuntu\\.com/ubuntu/?#https://archive.ubuntu.com/ubuntu/#g' \
+        -e 's#http://security\\.ubuntu\\.com/ubuntu/?#https://security.ubuntu.com/ubuntu/#g' \
+        "$source_file"
+    fi
+  done
+
+  # Zero-byte indexes from the broken mirror otherwise remain valid cache
+  # entries because its release metadata itself was successfully downloaded.
+  find /var/lib/apt/lists -maxdepth 1 -type f -size 0 -delete 2>/dev/null || true
+  apt_retry update -o Acquire::Retries=3
+}}
+
+apt_retry update
+if ! apt-get install --simulate --no-install-recommends "${{BOOTSTRAP_PACKAGES[@]}}" >/dev/null 2>&1; then
+  echo "[verda] Ubuntu package catalog is inconsistent; switching to canonical HTTPS mirrors..." >&2
+  repair_ubuntu_package_sources
+fi
+if ! apt-get install --simulate --no-install-recommends "${{BOOTSTRAP_PACKAGES[@]}}" >/dev/null 2>&1; then
+  echo "[verda] ERROR: Ubuntu package dependencies remain unsatisfiable after mirror repair." >&2
+  apt-get install --simulate --no-install-recommends "${{BOOTSTRAP_PACKAGES[@]}}" >&2 || true
+  exit 1
+fi
+apt_retry install -y --no-install-recommends "${{BOOTSTRAP_PACKAGES[@]}}"
 
 mkdir -p /opt /workspace "$REMOTE_ROOT"
 
-# Mount the 150G data volume at /mnt/data early so it's available — but do
+# Mount the persistent data volume at /mnt/data early so it's available — but do
 # NOT bind-mount onto /workspace/ComfyUI/* yet. Cloning ComfyUI needs to
 # `rm -rf "$COMFY_ROOT"` if a stub exists, and that fails on bind mounts
 # with "Device or resource busy". We move the asset dirs onto the data
 # volume AFTER ComfyUI is installed (see _bind_comfy_asset_dirs below).
 if test -b /dev/vdb; then
-  if ! blkid /dev/vdb >/dev/null 2>&1; then
+  VDB_FS="$(blkid -s TYPE -o value /dev/vdb 2>/dev/null || true)"
+  if test -z "$VDB_FS"; then
+    # A previous fresh deploy can fail before its new data volume is formatted.
+    # Only initialize a volume that has no known signatures and whose leading
+    # and trailing 4 MiB samples are zero. Anything else requires inspection.
+    VDB_SIGNATURES="$(wipefs -n --noheadings --output TYPE /dev/vdb 2>/dev/null | tr -d '[:space:]' || true)"
+    VDB_SIZE="$(blockdev --getsize64 /dev/vdb 2>/dev/null || true)"
+    SAMPLE_BYTES=$((4 * 1024 * 1024))
+    if test -n "$VDB_SIGNATURES" || test "${{VDB_SIZE:-0}}" -lt "$SAMPLE_BYTES"; then
+      echo "[verda] ERROR: /dev/vdb has no mountable filesystem and cannot be proven blank; refusing to format." >&2
+      exit 1
+    fi
+    LAST_SAMPLE=$(((VDB_SIZE - SAMPLE_BYTES) / SAMPLE_BYTES))
+    if ! cmp -s <(dd if=/dev/vdb bs=4M count=1 status=none) \
+               <(dd if=/dev/zero bs=4M count=1 status=none) \
+        || ! cmp -s <(dd if=/dev/vdb bs=4M skip="$LAST_SAMPLE" count=1 status=none) \
+                  <(dd if=/dev/zero bs=4M count=1 status=none); then
+      echo "[verda] ERROR: /dev/vdb contains unrecognized data; refusing to format it automatically." >&2
+      exit 1
+    fi
+    echo "[verda] Initializing blank data volume /dev/vdb as ext4..." >&2
     mkfs.ext4 -F /dev/vdb
+    VDB_FS="ext4"
+  elif test "$VDB_FS" != "ext4"; then
+    echo "[verda] ERROR: Unsupported filesystem '$VDB_FS' on /dev/vdb; expected ext4." >&2
+    exit 1
   fi
   mkdir -p /mnt/data
   if ! mountpoint -q /mnt/data; then
@@ -2774,6 +3021,7 @@ if mountpoint -q /mnt/data; then
     fi
     mount --bind "/mnt/data/ComfyUI/$dir" "$COMFY_ROOT/$dir"
   done
+  touch /mnt/data/.filmforge-bootstrap-complete
 fi
 
 echo "FRESH_INSTALL_DONE=1"
@@ -2864,6 +3112,66 @@ def _verda_billing_flags(args: argparse.Namespace, *, fresh: bool) -> list[str]:
     return flags
 
 
+def _wait_for_interrupted_verda_pair(
+    args: argparse.Namespace,
+    *,
+    timeout_sec: int = 180,
+) -> bool:
+    """Wait until a discontinued spot VM is gone and both reusable volumes detach."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            instance = _verda_instance_by_hostname(args, args.verda_hostname)
+            volumes = _verda_json(args, "volume", "list", timeout=60)
+            os_volume = _verda_find_volume(volumes, args.verda_os_volume_id)
+            data_volume = _verda_find_volume(volumes, args.verda_data_volume_id)
+            detached = all(
+                str(volume.get("status") or "").lower() == "detached"
+                for volume in (os_volume, data_volume)
+            )
+            if instance is None and detached:
+                return True
+        except RuntimeError as exc:
+            log(f"  Waiting for interrupted Verda resources ({exc})...")
+        time.sleep(5)
+    return False
+
+
+def verda_deploy_with_spot_retries(args: argparse.Namespace) -> int:
+    """Resume a reusable-volume deploy when Verda preempts spot during SSH work."""
+    try:
+        max_attempts = max(1, int(os.getenv("VERDA_SPOT_DEPLOY_ATTEMPTS", "3")))
+    except ValueError:
+        max_attempts = 3
+    if _verda_contract(args) != "spot":
+        max_attempts = 1
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return verda_deploy(args)
+        except subprocess.CalledProcessError as exc:
+            # ssh returns 255 when the remote host disappears. With spot, Verda
+            # detaches the preserved OS+data pair, and the idempotent bootstrap
+            # can continue on a replacement VM without redoing completed work.
+            if exc.returncode != 255 or attempt >= max_attempts:
+                raise
+            log(
+                f"[verda] Spot VM disconnected during deploy (attempt {attempt}/{max_attempts}); "
+                "waiting for preserved volumes to detach..."
+            )
+            if not _wait_for_interrupted_verda_pair(args):
+                raise RuntimeError(
+                    "Verda spot VM disconnected, but its reusable volumes did not "
+                    "become detached within 180s"
+                ) from exc
+            log(
+                f"[verda] Preserved volumes are detached; provisioning replacement "
+                f"attempt {attempt + 1}/{max_attempts}..."
+            )
+
+    raise RuntimeError("Verda spot deployment attempts exhausted")
+
+
 def verda_deploy(args: argparse.Namespace) -> int:
     identity = (args.ssh_identity or Path.home() / ".ssh" / "id_ed25519").expanduser()
     if not identity.exists():
@@ -2911,6 +3219,42 @@ def verda_deploy(args: argparse.Namespace) -> int:
     ssh_command = f"ssh -i {identity} root@{ip}"
     ssh_cmd, _, _ = parse_ssh_command(ssh_command)
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
+    ssh_cmd = add_default_ssh_liveness_policy(ssh_cmd)
+
+    pair_state = _probe_verda_rehydrate_state(ssh_cmd)
+    log(
+        "Verda reusable-pair state: "
+        f"data={pair_state['DATA_STATE']} "
+        f"worker_ready={pair_state['WORKER_READY']} "
+        f"comfy_ready={pair_state['COMFY_READY']} "
+        f"bootstrap_ready={pair_state['BOOTSTRAP_READY']}"
+    )
+    if _verda_pair_needs_bootstrap(pair_state):
+        log(
+            "Incomplete reusable Verda volume pair detected; "
+            "bootstrapping the attached OS and data volumes before rehydration..."
+        )
+        _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
+        install_script = verda_fresh_install_script(
+            worker_repo_url=args.verda_worker_repo_url,
+            comfy_repo_url=args.verda_comfy_repo_url,
+            pytorch_index_url=args.verda_pytorch_index_url,
+            remote_root=args.remote_root,
+            patch_content=_patch_path.read_text() if _patch_path.exists() else "",
+        )
+        _run_verda_ssh_script(
+            ssh_cmd,
+            install_script,
+            timeout_sec=args.verda_install_timeout,
+            capture_output=False,
+            operation="bootstrapping the incomplete Verda volume pair",
+        )
+        verified_state = _probe_verda_rehydrate_state(ssh_cmd)
+        if _verda_pair_needs_bootstrap(verified_state):
+            raise RuntimeError(
+                "Verda bootstrap command completed but the worker stack is still incomplete"
+            )
+        log("Verda volume pair bootstrap completed; continuing with worker startup.")
 
     env_vars = _verda_env_vars(args)
 
@@ -2943,7 +3287,13 @@ def verda_deploy(args: argparse.Namespace) -> int:
 
     log("Running Verda post-boot worker fixup...")
     try:
-        remote_result = run([*ssh_cmd, "bash", "-s"], input_text=script, capture_output=True)
+        remote_result = _run_verda_ssh_script(
+            ssh_cmd,
+            script,
+            timeout_sec=args.verda_install_timeout,
+            capture_output=True,
+            operation="starting workers on the rehydrated Verda VM",
+        )
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -3047,6 +3397,7 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
     ssh_command = f"ssh -i {identity} root@{ip}"
     ssh_cmd, _, _ = parse_ssh_command(ssh_command)
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
+    ssh_cmd = add_default_ssh_liveness_policy(ssh_cmd)
 
     _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     install_script = verda_fresh_install_script(
@@ -3058,7 +3409,16 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
     )
     log("Installing worker stack on fresh Verda OS volume...")
     try:
-        install_result = run([*ssh_cmd, "bash", "-s"], input_text=install_script, capture_output=True)
+        # Stream the long install directly into the deploy log. Besides making
+        # progress visible, this avoids buffering tens of minutes of output in
+        # memory while the dashboard appears frozen.
+        install_result = _run_verda_ssh_script(
+            ssh_cmd,
+            install_script,
+            timeout_sec=args.verda_install_timeout,
+            capture_output=False,
+            operation="installing the worker stack on the fresh Verda VM",
+        )
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -3088,7 +3448,13 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
 
     log("Starting workers on fresh Verda VM...")
     try:
-        remote_result = run([*ssh_cmd, "bash", "-s"], input_text=script, capture_output=True)
+        remote_result = _run_verda_ssh_script(
+            ssh_cmd,
+            script,
+            timeout_sec=args.verda_install_timeout,
+            capture_output=True,
+            operation="starting workers on the fresh Verda VM",
+        )
     except subprocess.CalledProcessError as exc:
         if exc.stdout:
             print(exc.stdout, end="")
@@ -4011,6 +4377,12 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for the Verda VM SSH service. Default: 300",
     )
     parser.add_argument(
+        "--verda-install-timeout",
+        type=int,
+        default=int(os.getenv("VERDA_INSTALL_TIMEOUT_SEC", "3600")),
+        help="Maximum seconds for each Verda remote install/start command. Default: 3600",
+    )
+    parser.add_argument(
         "--remote-root",
         default=DEFAULT_REMOTE_ROOT,
         help=f"Remote install root. Default: {DEFAULT_REMOTE_ROOT}",
@@ -4126,7 +4498,7 @@ def main() -> int:
         if args.vast:
             return vast_deploy(args)
         if args.verda:
-            return verda_deploy(args)
+            return verda_deploy_with_spot_retries(args)
         if args.verda_fresh:
             return verda_fresh_deploy(args)
 

@@ -193,8 +193,8 @@ _MAX_EXECUTION_SLOTS = max(1, get_settings().resolved_max_concurrent_jobs())
 _EXECUTION_SEMAPHORE = threading.BoundedSemaphore(value=_MAX_EXECUTION_SLOTS)
 
 # Last model family run, so we only release VRAM when it actually changes (see
-# _free_vram_on_group_switch). Single execution slot (WORKER_MAX_CONCURRENT_JOBS
-# defaults to 1), so a plain global is race-free.
+# _free_vram_on_group_switch). ComfyUI owns the actual GPU execution queue; this
+# value is a best-effort resident-model hint for the API's concurrent callers.
 _LAST_ASSET_GROUP: str | None = None
 
 # Monotonic count of jobs that have finished executing (success or failure).

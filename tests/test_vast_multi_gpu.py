@@ -98,6 +98,11 @@ def test_multi_gpu_script_is_gpu_agnostic_and_starts_comfy_per_gpu() -> None:
     assert "WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${idx}.id" in script
     # Honors WORKER_PUBLIC_URLS so every gpuN gets a routable public URL.
     assert "WORKER_PUBLIC_URLS" in script
+    # The Infra deploy value is exported into this script; the template must not
+    # overwrite it with the historical hardcoded single-job limit.
+    assert 'WORKER_MAX_CONCURRENT_JOBS="${WORKER_MAX_CONCURRENT_JOBS:-10}"' in script
+    assert "Environment=WORKER_MAX_CONCURRENT_JOBS=${WORKER_MAX_CONCURRENT_JOBS:-10}" in script
+    assert "Environment=WORKER_MAX_CONCURRENT_JOBS=1" not in script
 
 
 def test_legacy_single_worker_script_does_not_start_comfy() -> None:
