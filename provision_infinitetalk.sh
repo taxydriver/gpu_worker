@@ -18,6 +18,16 @@ COMFY=${COMFY_DIR:-/workspace/ComfyUI}
 PY="$COMFY/.venv/bin/python"
 PIP="$PY -m pip install --break-system-packages"
 
+# This script is invoked both during box rehydration and from the worker's
+# asset ensure path.  Serialise those callers on the persistent Comfy volume:
+# without this lock a fresh box can clone/update custom_nodes concurrently.
+LOCK_FILE="$COMFY/.filmforge_infinitetalk.provision.lock"
+exec 9>"$LOCK_FILE"
+flock -w "${INFINITETALK_PROVISION_LOCK_TIMEOUT_SEC:-1800}" 9 || {
+  echo "[infinitetalk] FATAL: timed out waiting for provision lock" >&2
+  exit 1
+}
+
 [ -x "$PY" ] || { echo "[infinitetalk] FATAL: no ComfyUI venv at $PY" >&2; exit 1; }
 
 node () {  # node <dir-name> <git-url>
@@ -34,9 +44,10 @@ node () {  # node <dir-name> <git-url>
 node ComfyUI-WanVideoWrapper https://github.com/kijai/ComfyUI-WanVideoWrapper
 node ComfyUI-VideoHelperSuite https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 
-# soundfile/librosa back the wav2vec audio embedding path in the wrapper's
-# talking nodes; they are not in either node's requirements.txt.
-$PIP -q soundfile librosa || echo "[infinitetalk] WARN: audio deps failed" >&2
+# These back the wav2vec audio embedding path in the wrapper's talking nodes.
+# A partial install must fail provisioning; readiness otherwise withholds the
+# capability, but a successful provision must mean its dependency set exists.
+$PIP -q soundfile librosa transformers
 
 # --- two-speaker closure-staleness patch --------------------------------------
 # Any human_num==2 render (MultiTalk two-shot) dies at the first sampling step

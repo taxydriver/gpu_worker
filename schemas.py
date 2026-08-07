@@ -36,6 +36,7 @@ class HealthResponse(BaseModel):
     gpu_name: str | None = None
     vram_gb: float | None = None
     capabilities: list[str] = Field(default_factory=list)
+    infinitetalk_readiness: dict[str, Any] | None = None
     active_jobs: int = 0
     max_concurrent_jobs: int = 1
     download_status: dict[str, Any] | None = None
@@ -145,6 +146,7 @@ class ComfyInputFile(BaseModel):
     source_path: str | None = None
     source_url: str | None = None
     source_data: str | None = None  # base64-encoded file bytes (used when URL is not remotely reachable)
+    content_type: str | None = None
     type: str = "input"
     subfolder: str = ""
 

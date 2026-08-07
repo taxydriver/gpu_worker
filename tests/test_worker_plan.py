@@ -223,6 +223,26 @@ def test_audio_still_triggers_on_capabilities_without_a_plan() -> None:
     assert "*,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;" in _script(None)
 
 
+def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
+    script = _script(PLAN)
+    provision = script.index("bash provision_infinitetalk.sh")
+    restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+    assert provision < restart
+    assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+
+
+def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:
+    provisioner = Path(deploy_gpu.__file__).with_name("provision_infinitetalk.sh")
+    source = provisioner.read_text()
+    subprocess.run(["bash", "-n", str(provisioner)], check=True)
+
+    assert 'LOCK_FILE="$COMFY/.filmforge_infinitetalk.provision.lock"' in source
+    assert 'flock -w "${INFINITETALK_PROVISION_LOCK_TIMEOUT_SEC:-1800}" 9' in source
+    # The mutating clone path is strictly after the lock acquisition, so both
+    # rehydrate and asset-manager ensure calls use the same filesystem lock.
+    assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
+
+
 def test_hf_token_is_injected_for_a_plan_with_audio(monkeypatch, tmp_path: Path) -> None:
     from types import SimpleNamespace
 

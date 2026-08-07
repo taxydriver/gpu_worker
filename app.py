@@ -21,7 +21,12 @@ from fastapi.responses import FileResponse
 import requests
 
 from gpu_worker.asset_canonical import canonical_asset_group, canonicalize_groups
-from gpu_worker.asset_manager import active_download_status, ensure_asset_group, is_asset_group_warm
+from gpu_worker.asset_manager import (
+    active_download_status,
+    ensure_asset_group,
+    ensure_asset_group_provisioned,
+    is_asset_group_warm,
+)
 from gpu_worker.asset_registry import (
     ASSET_REGISTRY,
     asset_group_supported_by_capabilities,
@@ -46,6 +51,11 @@ from gpu_worker.comfy_process import (
     run_gpu_smoke_test,
 )
 from gpu_worker.config import get_settings
+from gpu_worker.infinitetalk import (
+    INFINITETALK_ASSET_GROUP,
+    check_infinitetalk_readiness,
+    normalize_approved_mpeg_to_wav,
+)
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.stitch import stitch_clips, upload_via_signed_put
 from gpu_worker.schemas import (
@@ -110,7 +120,7 @@ threading.Thread(
 ).start()
 
 _STILL_ASSET_GROUPS = {"flux_stills_v1"}
-_VIDEO_ASSET_GROUPS = {"wan_i2v_v1"}
+_VIDEO_ASSET_GROUPS = {"wan_i2v_v1", "infinitetalk_v1"}
 _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0
 _BASE_VIDEO_SEC = 30.0
@@ -248,6 +258,58 @@ def _asset_group_mismatch_error(asset_group: str) -> ValueError:
         f"Worker does not support asset_group={asset_group!r}. "
         f"WORKER_CAPABILITIES={declared_text}; supported asset groups={supported_text}"
     )
+
+
+def _advertised_capabilities() -> tuple[list[str], dict | None]:
+    """Return only capabilities whose runtime contract is actually present."""
+
+    raw_capabilities = get_settings().resolved_capabilities() or sorted(ASSET_REGISTRY)
+    capabilities = canonicalize_groups(raw_capabilities)
+    infinitetalk_readiness = None
+    if INFINITETALK_ASSET_GROUP in capabilities:
+        readiness = check_infinitetalk_readiness()
+        infinitetalk_readiness = readiness.as_dict()
+        if not readiness.ready:
+            capabilities.remove(INFINITETALK_ASSET_GROUP)
+    return capabilities, infinitetalk_readiness
+
+
+def _ensure_runtime_provisioned(asset_group: str) -> bool:
+    """Keep this runtime hook narrow: legacy audio provisioners retain their path."""
+
+    if canonical_asset_group(asset_group) != INFINITETALK_ASSET_GROUP:
+        return False
+    return ensure_asset_group_provisioned(INFINITETALK_ASSET_GROUP)
+
+
+def _normalize_infinitetalk_audio_inputs(
+    comfy_payload: dict,
+    comfy_input_files: list[ComfyInputFile],
+    *,
+    job_id: str,
+) -> dict:
+    """Replace approved MPEG inputs in the A1 graph with job-scoped 16 kHz WAVs."""
+
+    input_root = Path(get_settings().comfy_input_dir).expanduser().resolve(strict=False)
+    for file_spec in comfy_input_files:
+        if file_spec.input_name != "audio":
+            continue
+        if (file_spec.content_type or "").lower() != "audio/mpeg":
+            raise ValueError("InfiniteTalk audio input must be approved audio/mpeg")
+        node = comfy_payload.get(str(file_spec.node_id))
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            raise ValueError(f"InfiniteTalk audio node is missing: {file_spec.node_id}")
+        staged_name = node["inputs"].get(file_spec.input_name)
+        if not isinstance(staged_name, str) or not staged_name:
+            raise ValueError(f"InfiniteTalk audio input is missing: {file_spec.node_id}")
+        source = (input_root / staged_name).resolve(strict=False)
+        try:
+            source.relative_to(input_root)
+        except ValueError as exc:
+            raise ValueError("InfiniteTalk staged audio escapes Comfy input") from exc
+        normalized = normalize_approved_mpeg_to_wav(source, job_id=job_id)
+        node["inputs"][file_spec.input_name] = str(normalized.relative_to(input_root))
+    return comfy_payload
 
 
 def _note_job_completed() -> None:
@@ -462,8 +524,7 @@ def _broker_worker_payload() -> dict[str, object]:
     if free_vram_mb is None and settings.worker_vram_gb is not None:
         free_vram_mb = int(settings.worker_vram_gb * 1024)
 
-    raw_capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
-    capabilities = canonicalize_groups(raw_capabilities)
+    capabilities, infinitetalk_readiness = _advertised_capabilities()
     public_url = settings.resolved_worker_public_url()
 
     with _WARMED_GROUPS_LOCK:
@@ -484,6 +545,7 @@ def _broker_worker_payload() -> dict[str, object]:
         "active_jobs": active_jobs,
         "max_concurrent_jobs": max_concurrent_jobs,
         "warmed_asset_groups": warmed,
+        "infinitetalk_readiness": infinitetalk_readiness,
     }
     if settings.worker_vision_base_url:
         # Vision boxes: the vLLM tunnel URL the backend's LLM gateway should call
@@ -606,19 +668,22 @@ def _preflight_download_all() -> None:
         return
     LOGGER.info("[preflight] downloading %d asset group(s): %s", len(groups), groups)
 
-    downloaded_any = False
+    runtime_changed = False
     failed_groups: list[str] = []
     for group in groups:
         try:
             result = ensure_asset_group(group)
             if result.downloaded_assets:
-                downloaded_any = True
+                runtime_changed = True
                 LOGGER.info(
                     "[preflight] %s — downloaded %s in %.1fs",
                     group, result.downloaded_assets, result.download_sec,
                 )
             else:
                 LOGGER.info("[preflight] %s — already cached (%.2fs check)", group, result.asset_check_sec)
+            if _ensure_runtime_provisioned(group):
+                runtime_changed = True
+                LOGGER.info("[preflight] %s — provisioner completed", group)
             # Mark this asset group as warmed
             with _WARMED_GROUPS_LOCK:
                 _WARMED_GROUPS.add(group)
@@ -630,16 +695,16 @@ def _preflight_download_all() -> None:
         LOGGER.error("[preflight] incomplete; failed group(s): %s", failed_groups)
         return
 
-    if downloaded_any:
+    if runtime_changed:
         with _ACTIVE_JOBS_LOCK:
             active = _ACTIVE_JOBS
         if active > 0:
             LOGGER.info(
-                "[preflight] new models downloaded but %d job(s) active — deferring ComfyUI restart",
+                "[preflight] runtime changed but %d job(s) active — deferring ComfyUI restart",
                 active,
             )
         else:
-            LOGGER.info("[preflight] new models downloaded — restarting ComfyUI once")
+            LOGGER.info("[preflight] runtime changed — restarting ComfyUI once")
             try:
                 restart_comfy()
                 LOGGER.info("[preflight] ComfyUI restarted, worker ready")
@@ -879,7 +944,7 @@ def ensure_assets(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="asset_groups must not be empty")
 
     results: list[EnsureAssetGroupResult] = []
-    downloaded_any = False
+    runtime_changed = False
     for asset_group in requested_groups:
         if not _asset_group_allowed(asset_group):
             raise HTTPException(
@@ -888,7 +953,9 @@ def ensure_assets(
             )
         ensure_result = ensure_asset_group(asset_group)
         if ensure_result.downloaded_assets:
-            downloaded_any = True
+            runtime_changed = True
+        if _ensure_runtime_provisioned(asset_group):
+            runtime_changed = True
         with _WARMED_GROUPS_LOCK:
             _WARMED_GROUPS.add(asset_group)
         results.append(
@@ -901,7 +968,7 @@ def ensure_assets(
         )
 
     restart_performed = False
-    if downloaded_any:
+    if runtime_changed:
         restart_comfy()
         restart_performed = True
 
@@ -947,7 +1014,7 @@ def health() -> HealthResponse:
     with _ACTIVE_JOBS_LOCK:
         active_jobs = _ACTIVE_JOBS
 
-    capabilities = settings.resolved_capabilities() or sorted(ASSET_REGISTRY)
+    capabilities, infinitetalk_readiness = _advertised_capabilities()
 
     return HealthResponse(
         ok=True,
@@ -961,6 +1028,7 @@ def health() -> HealthResponse:
         gpu_name=settings.worker_gpu_name,
         vram_gb=settings.worker_vram_gb,
         capabilities=capabilities,
+        infinitetalk_readiness=infinitetalk_readiness,
         active_jobs=active_jobs,
         max_concurrent_jobs=settings.resolved_max_concurrent_jobs(),
         download_status=active_download_status(),
@@ -1323,11 +1391,18 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         with _WARMED_GROUPS_LOCK:
             _WARMED_GROUPS.add(request.asset_group)
 
-        if downloaded_assets:
+        provisioned = _ensure_runtime_provisioned(request.asset_group)
+        if downloaded_assets or provisioned:
             timings.restart_sec = restart_comfy()
             restart_performed = True
 
         prepared_payload = apply_comfy_input_files(request.comfy_payload, request.comfy_input_files)
+        if canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP:
+            prepared_payload = _normalize_infinitetalk_audio_inputs(
+                prepared_payload,
+                request.comfy_input_files,
+                job_id=request.job_id,
+            )
         expected_prompt_sec = _initial_prompt_eta_sec(request.asset_group, resolution_bucket)
         stage_started = time.monotonic()
         if progress is not None:

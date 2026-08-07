@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -16,7 +17,7 @@ import portalocker
 import requests
 from pydantic import BaseModel
 
-from gpu_worker.asset_registry import get_asset_group
+from gpu_worker.asset_registry import PROVISIONERS, get_asset_group
 from gpu_worker.config import get_settings
 from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
 
@@ -31,6 +32,8 @@ _DOWNLOAD_STATUS: dict[str, object] | None = None
 # status once it has been live past this window.
 _DOWNLOAD_STATUS_MIN_ELAPSED_SEC = 3.0
 _HF_INCOMPLETE_GLOB = "*.incomplete"
+_PROVISIONED_GROUPS: set[str] = set()
+_PROVISIONED_GROUPS_LOCK = Lock()
 
 # HuggingFace resolve URL pattern: .../resolve/<revision>/<path_in_repo>
 _HF_URL_RE = re.compile(
@@ -653,3 +656,37 @@ def ensure_asset_group(asset_group: str) -> EnsureAssetsResult:
         asset_check_sec=asset_check_sec,
         download_sec=download_sec,
     )
+
+
+def ensure_asset_group_provisioned(asset_group: str) -> bool:
+    """Run a group-specific provisioner once in this worker process.
+
+    Provisioners install runtime pieces asset downloads cannot express (for
+    example Comfy custom nodes). They run before the caller decides whether a
+    Comfy restart is needed, so unloaded nodes are never advertised as ready.
+    """
+
+    relative_script = PROVISIONERS.get(asset_group)
+    if not relative_script:
+        return False
+    with _PROVISIONED_GROUPS_LOCK:
+        if asset_group in _PROVISIONED_GROUPS:
+            return False
+        repo_root = Path(__file__).resolve().parents[1]
+        script = repo_root / relative_script
+        if not script.is_file():
+            raise RuntimeError(f"Provisioner missing for {asset_group}: {script}")
+        try:
+            subprocess.run(
+                ["bash", str(script)],
+                cwd=repo_root,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()[:1000]
+            raise RuntimeError(f"Provisioner failed for {asset_group}: {detail}") from exc
+        _PROVISIONED_GROUPS.add(asset_group)
+        return True

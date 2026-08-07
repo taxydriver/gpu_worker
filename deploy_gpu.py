@@ -2550,6 +2550,27 @@ if test -n "$_audio_wanted"; then
 fi
 )
 
+# ── InfiniteTalk / MultiTalk Comfy extension ───────────────────────────────────
+# A1 is a generation-card runtime: its Wan 2.1 weights are handled by the worker
+# asset manager, while this provisioner installs the custom nodes and wav2vec
+# Python path. Run it only for an explicit capability selection. A restart comes
+# strictly after the provisioner so Comfy discovers the new node classes.
+_infinitetalk_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
+esac
+if test -n "$_infinitetalk_wanted"; then
+  echo "[infinitetalk] provisioning Comfy talking-shot runtime"
+  cd "$WORKER_ROOT"
+  bash provision_infinitetalk.sh
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    echo "[infinitetalk] restarting ComfyUI on generation gpu$idx after provisioning"
+    systemctl restart "comfyui-gpu${{idx}}.service"
+  done
+fi
+
 # ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
 # The provisioners above are shell scripts read from the box's git checkout of
 # gpu_worker, NOT from the deploy we just piped in — so an older checkout can
