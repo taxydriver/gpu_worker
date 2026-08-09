@@ -189,6 +189,34 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
         },
     ],
+    # --- ReCamMaster: parametric camera re-shoot (video→video) --------------------------
+    # KwaiVGI ReCamMaster on Wan2.1-T2V-1.3B: re-renders a FINISHED clip along a new
+    # parametric camera trajectory — the move classes prompt-level WAN 2.2 measures dead
+    # (pan/tilt/translate/arc; backend discoveries/wan22-camera-move-reliability-2026-07-23.md).
+    # N=1 PASSED + director-ratified 2026-07-24 on the DiffSynth harness
+    # (discoveries/recammaster-reshoot-n1-2026-07-24.md); this group is the ComfyUI path via
+    # Kijai's WanVideoWrapper (the same custom node infinitetalk_v1 provisions). A SEPARATE
+    # Wan 2.1 weight set beside wan_i2v_v1's 2.2 stack — never implied by wan_i2v. Fixed
+    # I/O: 81 frames in, 832x480 out. An OPTION, never the default (director ruling
+    # 2026-07-24: slight degradation vs the master; WAN-native prompt keeps full master
+    # resolution for depth-axis moves). URLs verified 302 on HF 2026-08-10.
+    "recammaster_v1": [
+        {
+            "name": "recammaster_1_3b",
+            "path": "/workspace/ComfyUI/models/diffusion_models/Wan2_1_kwai_recammaster_1_3B_step20000_bf16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_kwai_recammaster_1_3B_step20000_bf16.safetensors",
+        },
+        {
+            "name": "wan21_vae",
+            "path": "/workspace/ComfyUI/models/vae/Wan2_1_VAE_bf16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Wan2_1_VAE_bf16.safetensors",
+        },
+        {
+            "name": "wan21_text_encoder_bf16",
+            "path": "/workspace/ComfyUI/models/text_encoders/umt5-xxl-enc-bf16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/umt5-xxl-enc-bf16.safetensors",
+        },
+    ],
     # --- Provisioner-backed audio groups (NOT single-file ComfyUI models) ---------------
     # These run as standalone pip packages in isolated venvs (their transformers pins
     # conflict with each other and with ComfyUI), loading whole HF-repo snapshots via
@@ -217,6 +245,8 @@ PROVISIONERS: dict[str, str] = {
     # Runs IN ADDITION to infinitetalk_v1's file downloads: installs the custom node
     # the graphs need. Weights stay with asset_manager so they cache on the data volume.
     "infinitetalk_v1": "gpu_worker/provision_infinitetalk.sh",
+    # Same shape as infinitetalk: file downloads above + the WanVideoWrapper custom node.
+    "recammaster_v1": "gpu_worker/provision_recammaster.sh",
 }
 
 
@@ -258,6 +288,11 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "talking_shot": ["infinitetalk_v1"],
     "multitalk": ["infinitetalk_v1"],
     "infinitetalk_v1": ["infinitetalk_v1"],
+    # Opt-in: ReCamMaster parametric camera re-shoot (video→video, Wan 2.1 1.3B).
+    # Deliberately NOT implied by wan_i2v — a separate Wan 2.1 weight set.
+    "recammaster": ["recammaster_v1"],
+    "reshoot_camera": ["recammaster_v1"],
+    "recammaster_v1": ["recammaster_v1"],
 }
 
 
