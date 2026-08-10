@@ -138,6 +138,18 @@ dedicated old-profile CAS upgrade transaction before this runbook permits it.
 
 ### Vercel DNS + Caddy edge
 
+The FilmForge infrastructure **Rent GPU** button now invokes this complete
+first-install transaction with `--secure-one-click`. It performs the immutable
+code preflight, Fly secret synchronization, Vercel A-record update, Caddy TLS
+preparation, GPU provisioning, authenticated cutover, activation, and rollback
+automatically. The UI must not manufacture the individual security variables;
+they are derived and receipt-checked server-side.
+
+One-click v1 deliberately accepts exactly one GPU worker per VM. Offers with
+multiple GPUs are rejected before any provider call until a shared multi-port
+TLS-edge contract is implemented. The manual state-machine commands below
+remain the recovery and audit interface, not normal button-click instructions.
+
 For Vercel-managed DNS, create an explicit `A` record for
 `gpu-worker.anapana.ai` to the VM's stable public IPv4. Stage Caddy as the
 versioned `caddy` edge provider; it is the only public listener (TCP 80/443 for

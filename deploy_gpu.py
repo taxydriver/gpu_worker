@@ -2859,6 +2859,59 @@ def _wait_for_verda_instance_ip(args: argparse.Namespace, hostname: str) -> tupl
     raise RuntimeError(f"Timed out waiting for Verda instance {hostname!r} to become running with an IP")
 
 
+def _resume_verda_instance(
+    args: argparse.Namespace,
+    instance_id: str,
+) -> tuple[str, str]:
+    """Resolve one exact running VM for a later secure-deploy phase.
+
+    The one-click state machine creates the paid VM only during ``stage-code``.
+    ``provision-only`` and ``activate`` must resume that exact instance rather
+    than performing another provider create.  Match every stable identity field
+    the Verda inventory exposes and fail closed on ambiguity or drift.
+    """
+
+    expected_id = str(instance_id or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F-]{16,64}", expected_id):
+        raise RuntimeError("Verda resume instance id is invalid")
+    cli = args.verda_cli.expanduser()
+    if not cli.exists():
+        raise RuntimeError(f"Verda CLI not found at {cli}")
+    log("Checking Verda auth for exact-instance resume...")
+    _verda_check(args, "auth", "show", timeout=30)
+    instances = _verda_json(args, "vm", "list", timeout=60)
+    if not isinstance(instances, list):
+        raise RuntimeError("Unexpected Verda VM inventory response")
+    matches = [
+        row
+        for row in instances
+        if isinstance(row, dict) and str(row.get("id") or "") == expected_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("Exact Verda resume instance is absent or ambiguous")
+    instance = matches[0]
+    hostname = str(instance.get("hostname") or "").strip()
+    status = str(instance.get("status") or "").strip().lower()
+    ip = str(instance.get("ip") or "").strip()
+    location = str(instance.get("location") or "").strip()
+    instance_type = str(
+        instance.get("instance_type")
+        or instance.get("instanceType")
+        or instance.get("type")
+        or ""
+    ).strip()
+    if hostname != args.verda_hostname:
+        raise RuntimeError("Exact Verda resume instance hostname drifted")
+    if status != "running" or not ip:
+        raise RuntimeError("Exact Verda resume instance is not running with an IP")
+    if location and location != args.verda_location:
+        raise RuntimeError("Exact Verda resume instance location drifted")
+    if instance_type and instance_type != args.verda_instance_type:
+        raise RuntimeError("Exact Verda resume instance type drifted")
+    log(f"Resuming exact Verda instance id={expected_id} ip={ip}")
+    return ip, expected_id
+
+
 def _wait_for_verda_ssh(ip: str, identity: Path, timeout_sec: int) -> None:
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
@@ -4461,43 +4514,46 @@ def verda_deploy(args: argparse.Namespace) -> int:
     if not identity.exists():
         raise RuntimeError(f"SSH private key not found at {identity}")
 
-    _verda_preflight(args)
-
     hostname = args.verda_hostname
-    log(
-        "Creating Verda VM "
-        f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
-        f"os_volume={args.verda_os_volume_id} data_volume={args.verda_data_volume_id} "
-        f"contract={_verda_contract(args)}"
-    )
-    create_cmd = [
-        "vm",
-        "create",
-        "--kind",
-        "gpu",
-        "--instance-type",
-        args.verda_instance_type,
-        "--location",
-        args.verda_location,
-        "--os",
-        args.verda_os_volume_id,
-        "--hostname",
-        hostname,
-        "--ssh-key",
-        args.verda_ssh_key_id,
-        "--existing-volume",
-        args.verda_data_volume_id,
-        "--wait",
-        "--wait-timeout",
-        args.verda_wait_timeout,
-    ]
-    create_cmd.extend(_verda_billing_flags(args, fresh=False))
-    create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
-    if create_output:
-        print(create_output)
+    resume_id = str(getattr(args, "verda_existing_instance_id", "") or "").strip()
+    if resume_id:
+        ip, instance_id = _resume_verda_instance(args, resume_id)
+    else:
+        _verda_preflight(args)
+        log(
+            "Creating Verda VM "
+            f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
+            f"os_volume={args.verda_os_volume_id} data_volume={args.verda_data_volume_id} "
+            f"contract={_verda_contract(args)}"
+        )
+        create_cmd = [
+            "vm",
+            "create",
+            "--kind",
+            "gpu",
+            "--instance-type",
+            args.verda_instance_type,
+            "--location",
+            args.verda_location,
+            "--os",
+            args.verda_os_volume_id,
+            "--hostname",
+            hostname,
+            "--ssh-key",
+            args.verda_ssh_key_id,
+            "--existing-volume",
+            args.verda_data_volume_id,
+            "--wait",
+            "--wait-timeout",
+            args.verda_wait_timeout,
+        ]
+        create_cmd.extend(_verda_billing_flags(args, fresh=False))
+        create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
+        if create_output:
+            print(create_output)
 
-    ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
-    log(f"Verda instance running: id={instance_id} ip={ip}")
+        ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
+        log(f"Verda instance running: id={instance_id} ip={ip}")
 
     _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
     ssh_command = f"ssh -i {identity} root@{ip}"
@@ -4522,6 +4578,13 @@ def verda_deploy(args: argparse.Namespace) -> int:
         venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
         bundle=getattr(args, "_prepared_worker_release_bundle", None),
     )
+    setattr(args, "_verda_active_instance_id", instance_id)
+    setattr(args, "_verda_active_ip", ip)
+    setattr(args, "_verda_worker_release_id", release_id)
+    setattr(args, "_verda_worker_source_root", worker_source_root)
+    setattr(args, "_verda_ssh_cmd", list(ssh_cmd))
+    setattr(args, "_verda_scp_cmd", list(scp_cmd))
+    setattr(args, "_verda_destination", destination)
     preflight_env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
     if deploy_phase == "stage-code":
         log(
@@ -4529,7 +4592,7 @@ def verda_deploy(args: argparse.Namespace) -> int:
             "unit, process, dataset, and backend work"
         )
         return 0
-    if _verda_pair_needs_bootstrap(pair_state):
+    if deploy_phase != "activate" and _verda_pair_needs_bootstrap(pair_state):
         log(
             "Incomplete reusable Verda volume pair detected; "
             "bootstrapping the attached OS and data volumes before rehydration..."
@@ -4581,7 +4644,7 @@ def verda_deploy(args: argparse.Namespace) -> int:
 
     # Upload movie data for semantic search if not already on the volume
     _movie_data = Path(__file__).parent.parent / "duku 1.0" / "duku-recs" / "data" / "tmdb_raw" / "movies_colab_last.ndjson"
-    if _movie_data.exists():
+    if deploy_phase != "activate" and _movie_data.exists():
         log(f"Uploading movie dataset ({_movie_data.stat().st_size // 1_000_000}MB) for semantic search...")
         run([*ssh_cmd, "mkdir -p /mnt/data/semantic_search"], check=False)
         scp_cmd = ["scp", f"-i{identity}", "-o", "StrictHostKeyChecking=no",
@@ -4696,54 +4759,57 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
     if not identity.exists():
         raise RuntimeError(f"SSH private key not found at {identity}")
 
-    _verda_fresh_preflight(args)
-
     hostname = args.verda_hostname
     os_volume_name = args.verda_fresh_os_volume_name or f"{hostname}-os"
     storage_name = args.verda_fresh_storage_name or f"{hostname}-models"
-    log(
-        "Creating fresh Verda VM "
-        f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
-        f"os={args.verda_fresh_os_image} os_size={args.verda_fresh_os_volume_size} "
-        f"storage={storage_name}:{args.verda_fresh_storage_size}GB "
-        f"contract={_verda_contract(args)}"
-    )
-    create_cmd = [
-        "vm",
-        "create",
-        "--kind",
-        "gpu",
-        "--instance-type",
-        args.verda_instance_type,
-        "--location",
-        args.verda_location,
-        "--os",
-        args.verda_fresh_os_image,
-        "--os-volume-size",
-        str(args.verda_fresh_os_volume_size),
-        "--os-volume-name",
-        os_volume_name,
-        "--storage-size",
-        str(args.verda_fresh_storage_size),
-        "--storage-name",
-        storage_name,
-        "--storage-type",
-        args.verda_fresh_storage_type,
-        "--hostname",
-        hostname,
-        "--ssh-key",
-        args.verda_ssh_key_id,
-        "--wait",
-        "--wait-timeout",
-        args.verda_wait_timeout,
-    ]
-    create_cmd.extend(_verda_billing_flags(args, fresh=True))
-    create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
-    if create_output:
-        print(create_output)
+    resume_id = str(getattr(args, "verda_existing_instance_id", "") or "").strip()
+    if resume_id:
+        ip, instance_id = _resume_verda_instance(args, resume_id)
+    else:
+        _verda_fresh_preflight(args)
+        log(
+            "Creating fresh Verda VM "
+            f"hostname={hostname} type={args.verda_instance_type} location={args.verda_location} "
+            f"os={args.verda_fresh_os_image} os_size={args.verda_fresh_os_volume_size} "
+            f"storage={storage_name}:{args.verda_fresh_storage_size}GB "
+            f"contract={_verda_contract(args)}"
+        )
+        create_cmd = [
+            "vm",
+            "create",
+            "--kind",
+            "gpu",
+            "--instance-type",
+            args.verda_instance_type,
+            "--location",
+            args.verda_location,
+            "--os",
+            args.verda_fresh_os_image,
+            "--os-volume-size",
+            str(args.verda_fresh_os_volume_size),
+            "--os-volume-name",
+            os_volume_name,
+            "--storage-size",
+            str(args.verda_fresh_storage_size),
+            "--storage-name",
+            storage_name,
+            "--storage-type",
+            args.verda_fresh_storage_type,
+            "--hostname",
+            hostname,
+            "--ssh-key",
+            args.verda_ssh_key_id,
+            "--wait",
+            "--wait-timeout",
+            args.verda_wait_timeout,
+        ]
+        create_cmd.extend(_verda_billing_flags(args, fresh=True))
+        create_output = _verda_check(args, *create_cmd, timeout=max(args.verda_create_timeout, 60))
+        if create_output:
+            print(create_output)
 
-    ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
-    log(f"Fresh Verda instance running: id={instance_id} ip={ip}")
+        ip, instance_id = _wait_for_verda_instance_ip(args, hostname)
+        log(f"Fresh Verda instance running: id={instance_id} ip={ip}")
 
     _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
     ssh_command = f"ssh -i {identity} root@{ip}"
@@ -4760,6 +4826,13 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
         bundle=getattr(args, "_prepared_worker_release_bundle", None),
     )
+    setattr(args, "_verda_active_instance_id", instance_id)
+    setattr(args, "_verda_active_ip", ip)
+    setattr(args, "_verda_worker_release_id", release_id)
+    setattr(args, "_verda_worker_source_root", worker_source_root)
+    setattr(args, "_verda_ssh_cmd", list(ssh_cmd))
+    setattr(args, "_verda_scp_cmd", list(scp_cmd))
+    setattr(args, "_verda_destination", destination)
     preflight_env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
     if deploy_phase == "stage-code":
         log(
@@ -4769,47 +4842,48 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         return 0
 
     _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
-    install_script = verda_fresh_install_script(
-        worker_repo_url=args.verda_worker_repo_url,
-        comfy_repo_url=args.verda_comfy_repo_url,
-        pytorch_index_url=args.verda_pytorch_index_url,
-        remote_root=args.remote_root,
-        patch_content=_patch_path.read_text() if _patch_path.exists() else "",
-        worker_source_root=worker_source_root,
-    )
-    preflight_exports = build_bootstrap_env_exports(preflight_env_vars)
-    if preflight_exports:
-        install_script = f"{preflight_exports}\n\n{install_script}"
-    log("Installing worker stack on fresh Verda OS volume...")
-    try:
-        # Stream the long install directly into the deploy log. Besides making
-        # progress visible, this avoids buffering tens of minutes of output in
-        # memory while the dashboard appears frozen.
-        install_result = _run_verda_ssh_script(
-            ssh_cmd,
-            install_script,
-            timeout_sec=args.verda_install_timeout,
-            capture_output=False,
-            operation="installing the worker stack on the fresh Verda VM",
-        )
-    except Exception as exc:
-        if getattr(exc, "stdout", None):
-            print(exc.stdout, end="")
-        if getattr(exc, "stderr", None):
-            print(exc.stderr, file=sys.stderr, end="")
-        _rollback_failed_worker_transaction_over_ssh(
-            ssh_cmd=ssh_cmd,
-            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+    if deploy_phase != "activate":
+        install_script = verda_fresh_install_script(
+            worker_repo_url=args.verda_worker_repo_url,
+            comfy_repo_url=args.verda_comfy_repo_url,
+            pytorch_index_url=args.verda_pytorch_index_url,
+            remote_root=args.remote_root,
+            patch_content=_patch_path.read_text() if _patch_path.exists() else "",
             worker_source_root=worker_source_root,
-            failed_release_id=release_id,
-            stage_receipt_paths=contract_stage_receipts,
-            deploy_phase=deploy_phase,
         )
-        raise
-    if install_result.stdout:
-        print(install_result.stdout, end="")
-    if install_result.stderr:
-        print(install_result.stderr, file=sys.stderr, end="")
+        preflight_exports = build_bootstrap_env_exports(preflight_env_vars)
+        if preflight_exports:
+            install_script = f"{preflight_exports}\n\n{install_script}"
+        log("Installing worker stack on fresh Verda OS volume...")
+        try:
+            # Stream the long install directly into the deploy log. Besides making
+            # progress visible, this avoids buffering tens of minutes of output in
+            # memory while the dashboard appears frozen.
+            install_result = _run_verda_ssh_script(
+                ssh_cmd,
+                install_script,
+                timeout_sec=args.verda_install_timeout,
+                capture_output=False,
+                operation="installing the worker stack on the fresh Verda VM",
+            )
+        except Exception as exc:
+            if getattr(exc, "stdout", None):
+                print(exc.stdout, end="")
+            if getattr(exc, "stderr", None):
+                print(exc.stderr, file=sys.stderr, end="")
+            _rollback_failed_worker_transaction_over_ssh(
+                ssh_cmd=ssh_cmd,
+                releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+                worker_source_root=worker_source_root,
+                failed_release_id=release_id,
+                stage_receipt_paths=contract_stage_receipts,
+                deploy_phase=deploy_phase,
+            )
+            raise
+        if install_result.stdout:
+            print(install_result.stdout, end="")
+        if install_result.stderr:
+            print(install_result.stderr, file=sys.stderr, end="")
 
     env_vars = _verda_env_vars(args, instance_id=instance_id)
     env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
@@ -5738,6 +5812,38 @@ def parse_args() -> argparse.Namespace:
         help=f"Hostname for the Verda VM. Default: {DEFAULT_VERDA_HOSTNAME}",
     )
     parser.add_argument(
+        "--verda-existing-instance-id",
+        default="",
+        help=(
+            "Internal secure-state-machine resume target. Later phases reuse "
+            "this exact VM instead of creating a second paid instance."
+        ),
+    )
+    parser.add_argument(
+        "--secure-one-click",
+        action="store_true",
+        help=(
+            "Run the complete first-install state machine automatically: Fly "
+            "bearer secrets, Vercel DNS, Caddy TLS, provision-only, receipt "
+            "cutover, activation, and rollback. Verda only."
+        ),
+    )
+    parser.add_argument(
+        "--worker-edge-hostname",
+        default=os.getenv("WORKER_EDGE_HOSTNAME", "gpu-worker.anapana.ai"),
+        help="Stable DNS hostname for the one-click Caddy worker edge.",
+    )
+    parser.add_argument(
+        "--worker-edge-domain",
+        default=os.getenv("WORKER_EDGE_DOMAIN", "anapana.ai"),
+        help="Vercel-managed DNS zone for the one-click worker edge.",
+    )
+    parser.add_argument(
+        "--fly-app",
+        default=os.getenv("FILMFORGE_FLY_APP", "filmforgepythonbackend"),
+        help="Fly backend app that receives worker registration and cutover proof.",
+    )
+    parser.add_argument(
         "--verda-comfy-port",
         type=int,
         default=int(os.getenv("VERDA_COMFY_PORT", "8188")),
@@ -5971,6 +6077,15 @@ def main() -> int:
     args = parse_args()
 
     try:
+        if args.secure_one_click:
+            if not (args.verda or args.verda_fresh):
+                raise RuntimeError("--secure-one-click currently supports Verda only")
+            if __package__:
+                from gpu_worker.secure_one_click import run_secure_verda_first_install
+            else:
+                from secure_one_click import run_secure_verda_first_install
+
+            return run_secure_verda_first_install(args, deploy_api=sys.modules[__name__])
         if args.runpod:
             return runpod_deploy(args)
         if args.vast:
