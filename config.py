@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 import uuid
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -69,8 +69,23 @@ class Settings(BaseSettings):
     worker_capabilities: str | None = Field(default=None, alias="WORKER_CAPABILITIES")
     worker_max_concurrent_jobs: int = Field(default=10, alias="WORKER_MAX_CONCURRENT_JOBS")
     worker_registration_token: str | None = Field(default=None, alias="WORKER_REGISTRATION_TOKEN")
-    worker_api_token: str | None = Field(default=None, alias="WORKER_API_TOKEN")
+    worker_api_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GPU_WORKER_API_TOKEN", "WORKER_API_TOKEN"),
+    )
+    worker_api_auth_mode: str = Field(default="required", alias="WORKER_API_AUTH_MODE")
+    worker_input_url_allowed_hosts: str = Field(
+        default="", alias="WORKER_INPUT_URL_ALLOWED_HOSTS"
+    )
     worker_heartbeat_seconds: int = Field(default=60, alias="WORKER_HEARTBEAT_SECONDS")
+    worker_job_registry_max_records: int = Field(
+        default=32,
+        alias="WORKER_JOB_REGISTRY_MAX_RECORDS",
+    )
+    worker_job_registry_ttl_sec: int = Field(
+        default=900,
+        alias="WORKER_JOB_REGISTRY_TTL_SEC",
+    )
     # Vision boxes only: public URL of the co-resident vLLM server (OpenAI-compatible,
     # e.g. https://<tunnel>.trycloudflare.com/v1). Advertised via registration metadata
     # so the backend's vision-worker discovery can hand it to the LLM gateway.
@@ -81,6 +96,23 @@ class Settings(BaseSettings):
     # when either trigger fires. See app._maybe_recycle_comfy.
     worker_recycle_after_jobs: int = Field(default=0, alias="WORKER_RECYCLE_AFTER_JOBS")
     worker_recycle_min_free_mib: int = Field(default=0, alias="WORKER_RECYCLE_MIN_FREE_MIB")
+
+    @field_validator("worker_api_auth_mode")
+    @classmethod
+    def _validate_worker_api_auth_mode(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"required", "development", "test"}:
+            raise ValueError(
+                "WORKER_API_AUTH_MODE must be required, development, or test"
+            )
+        return normalized
+
+    @field_validator("worker_job_registry_max_records", "worker_job_registry_ttl_sec")
+    @classmethod
+    def _validate_positive_registry_bounds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("worker job registry bounds must be positive")
+        return value
 
     def served_file_roots(self) -> dict[str, Path]:
         """Return the named roots the worker is allowed to serve files from."""
@@ -143,6 +175,15 @@ class Settings(BaseSettings):
     def resolved_registration_token(self) -> str | None:
         """Resolve registration token: Phase 1 (WORKER_REGISTRATION_TOKEN) or legacy (RENDER_BROKER_WORKER_TOKEN)."""
         return self.worker_registration_token or self.render_broker_worker_token
+
+    def resolved_input_url_allowed_hosts(self) -> set[str]:
+        """Return exact, normalized DNS names allowed for remote input fetches."""
+
+        return {
+            host.strip().lower().rstrip(".")
+            for host in self.worker_input_url_allowed_hosts.split(",")
+            if host.strip().rstrip(".")
+        }
 
     def resolved_heartbeat_seconds(self) -> int:
         """Resolve heartbeat interval: Phase 1 (WORKER_HEARTBEAT_SECONDS) or legacy (RENDER_BROKER_HEARTBEAT_SEC)."""

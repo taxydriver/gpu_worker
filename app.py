@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -40,6 +40,7 @@ from gpu_worker.comfy_client import (
     collect_output_paths,
     comfy_queue_depth,
     free_comfy_memory,
+    observe_staged_input_receipts,
     poll_for_completion,
     resolve_served_file,
     submit_prompt,
@@ -58,6 +59,12 @@ from gpu_worker.infinitetalk import (
 )
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.stitch import stitch_clips, upload_via_signed_put
+from gpu_worker.worker_auth import (
+    WorkerAPIAuthError,
+    verify_worker_api_authorization,
+    worker_api_auth_is_ready,
+)
+from gpu_worker.worker_ingress import WorkerIngressMiddleware
 from gpu_worker.schemas import (
     ActiveJobSummary,
     ClipKeyframe,
@@ -99,6 +106,10 @@ if get_settings().log_prompts_only:
     logging.getLogger("gpu_worker.prompts").propagate = False
 
 app = FastAPI(title="FilmForge GPU Worker", version="0.1.0")
+app.add_middleware(
+    WorkerIngressMiddleware,
+    settings_provider=lambda: get_settings(),
+)
 
 # Self-heal model wiring BEFORE any asset check: guarantee that the hardcoded
 # /workspace/ComfyUI/models paths resolve to the populated data volume, so we
@@ -469,19 +480,14 @@ def _require_worker_api_token(
 ) -> None:
     """FastAPI dependency to require WORKER_API_TOKEN on protected endpoints."""
     settings = get_settings()
-    expected_token = (settings.worker_api_token or "").strip()
-    if not expected_token:
-        return
-
-    bearer_token: str | None = None
-    if authorization:
-        parts = authorization.strip().split(" ", 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            bearer_token = parts[1].strip()
-
-    provided = bearer_token or ""
-    if provided != expected_token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid worker API token")
+    try:
+        verify_worker_api_authorization(
+            expected_token=settings.worker_api_token,
+            auth_mode=settings.worker_api_auth_mode,
+            authorization=authorization,
+        )
+    except WorkerAPIAuthError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from None
 
 
 def _broker_headers() -> dict[str, str]:
@@ -492,6 +498,14 @@ def _broker_headers() -> dict[str, str]:
         headers["Authorization"] = f"Bearer {token}"
         headers["X-Render-Broker-Token"] = token
     return headers
+
+
+def _worker_api_auth_ready() -> bool:
+    settings = get_settings()
+    return worker_api_auth_is_ready(
+        expected_token=settings.worker_api_token,
+        auth_mode=settings.worker_api_auth_mode,
+    )
 
 
 def _performance_snapshot() -> dict[str, dict[str, float | int]]:
@@ -574,6 +588,9 @@ def _broker_worker_payload() -> dict[str, object]:
 
 def _register_with_broker() -> None:
     settings = get_settings()
+    if not _worker_api_auth_ready():
+        LOGGER.error("[broker] worker API unavailable; registration suppressed")
+        return
     backend_url = settings.resolved_backend_url()
     if not backend_url:
         LOGGER.info("[broker] backend URL not configured — worker registration disabled")
@@ -592,6 +609,8 @@ def _register_with_broker() -> None:
 def _send_heartbeat_now() -> None:
     """Fire a single heartbeat immediately. Best-effort — never raises."""
     settings = get_settings()
+    if not _worker_api_auth_ready():
+        return
     backend_url = settings.resolved_backend_url()
     if not backend_url:
         return
@@ -610,6 +629,9 @@ def _send_heartbeat_now() -> None:
 
 def _broker_heartbeat_loop() -> None:
     settings = get_settings()
+    if not _worker_api_auth_ready():
+        LOGGER.error("[broker] worker API unavailable; heartbeat disabled")
+        return
     backend_url = settings.resolved_backend_url()
     if not backend_url:
         return
@@ -726,7 +748,11 @@ class _JobRecord:
     """Mutable state for one async worker job."""
 
     job_id: str
-    request: RunRequest
+    request: RunRequest | None
+    client_job_id: str
+    asset_group: str
+    created_monotonic: float = field(default_factory=time.monotonic)
+    finished_monotonic: float | None = None
     status: str = "queued"
     result: RunResponse | None = None
     error: str | None = None
@@ -735,6 +761,50 @@ class _JobRecord:
 
 _JOB_LOCK = threading.Lock()
 _JOBS: dict[str, _JobRecord] = {}
+_JOB_REGISTRY_MAX_RECORDS = max(
+    1,
+    get_settings().worker_job_registry_max_records,
+)
+_JOB_REGISTRY_TTL_SEC = max(
+    1.0,
+    float(get_settings().worker_job_registry_ttl_sec),
+)
+_TERMINAL_JOB_STATES = {"completed", "failed"}
+
+
+def _prune_job_registry_locked(*, reserve: int = 0) -> bool:
+    """Evict expired/old terminal jobs and report whether reserve entries fit."""
+
+    now = time.monotonic()
+    expired = [
+        job_id
+        for job_id, record in _JOBS.items()
+        if record.status in _TERMINAL_JOB_STATES
+        and record.finished_monotonic is not None
+        and now - record.finished_monotonic >= _JOB_REGISTRY_TTL_SEC
+    ]
+    for job_id in expired:
+        _JOBS.pop(job_id, None)
+
+    while len(_JOBS) + reserve > _JOB_REGISTRY_MAX_RECORDS:
+        terminal = [
+            record
+            for record in _JOBS.values()
+            if record.status in _TERMINAL_JOB_STATES
+        ]
+        if not terminal:
+            break
+        oldest = min(
+            terminal,
+            key=lambda record: (
+                record.finished_monotonic
+                if record.finished_monotonic is not None
+                else record.created_monotonic
+            ),
+        )
+        _JOBS.pop(oldest.job_id, None)
+
+    return len(_JOBS) + reserve <= _JOB_REGISTRY_MAX_RECORDS
 
 
 def _detect_resolution_bucket(comfy_payload: dict) -> Literal["low", "medium", "high"]:
@@ -995,8 +1065,8 @@ def _active_jobs_detail() -> list[ActiveJobSummary]:
     for r in running:
         p = r.progress
         out.append(ActiveJobSummary(
-            job_id=r.request.job_id,
-            asset_group=r.request.asset_group,
+            job_id=r.client_job_id,
+            asset_group=r.asset_group,
             stage=p.stage,
             message=p.message,
             elapsed_sec=round(p.elapsed_sec, 1),
@@ -1015,16 +1085,18 @@ def health() -> HealthResponse:
         active_jobs = _ACTIVE_JOBS
 
     capabilities, infinitetalk_readiness = _advertised_capabilities()
+    auth_ready = _worker_api_auth_ready()
 
     return HealthResponse(
-        ok=True,
-        worker_ok=True,
+        ok=auth_ready,
+        worker_ok=auth_ready,
         comfy_reachable=is_comfy_healthy(),
         comfy_base_url=settings.comfy_base_url,
         known_asset_groups=sorted(ASSET_REGISTRY),
         worker_name=settings.resolved_worker_name(),
         provider=settings.worker_provider,
         public_url=settings.resolved_worker_public_url(),
+        code_release_id=os.getenv("WORKER_CODE_RELEASE_ID") or None,
         gpu_name=settings.worker_gpu_name,
         vram_gb=settings.worker_vram_gb,
         capabilities=capabilities,
@@ -1072,13 +1144,13 @@ def _maybe_upload_primary_output(
     primary = output_files[0]
     try:
         upload_via_signed_put(output_upload.signed_put_url, primary.path, output_upload.content_type)
-    except Exception as exc:  # noqa: BLE001 — degrade to backend download
+    except Exception:  # noqa: BLE001 — degrade to backend download
         LOGGER.warning(
-            "[output_upload] job=%s failed for %s: %s — backend will download via /files",
-            job_id, primary.filename, exc,
+            "[output_upload] job=%s failed — backend will download via /files",
+            job_id,
         )
         return output_files
-    LOGGER.info("[output_upload] job=%s uploaded %s -> %s", job_id, primary.filename, output_upload.public_url)
+    LOGGER.info("[output_upload] job=%s uploaded primary output", job_id)
     updated = list(output_files)
     updated[0] = primary.model_copy(update={"storage_url": output_upload.public_url})
     return updated
@@ -1140,7 +1212,7 @@ def _run_tts_dialogue(request: RunRequest, total_started: float) -> RunResponse:
 
 
 @app.post("/tts")
-def tts_direct(payload: dict):
+def tts_direct(payload: dict, _: None = Depends(_require_worker_api_token)):
     """Low-latency dialogue TTS for Maya's interactive voice (the rail's /speak).
 
     Proxies straight to the resident parler_server (:9101), bypassing the broker
@@ -1305,6 +1377,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
     restart_performed = False
     prompt_id: str | None = None
     history_found = False
+    staged_input_receipts: list[dict[str, str]] = []
     prompt_stage = _stage_for_asset_group(request.asset_group)
     resolution_bucket = _detect_resolution_bucket(request.comfy_payload)
     stage_started = total_started
@@ -1418,6 +1491,10 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         for attempt in range(2):
             try:
                 comfy_started = time.monotonic()
+                staged_input_receipts = observe_staged_input_receipts(
+                    prepared_payload,
+                    request.comfy_input_files,
+                )
                 prompt_id = submit_prompt(prepared_payload)
                 history = poll_for_completion(
                     prompt_id=prompt_id,
@@ -1565,6 +1642,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             comfy_prompt_id=prompt_id,
             outputs=outputs,
             output_files=output_files,
+            staged_input_receipts=staged_input_receipts,
             keyframes=keyframes,
             timings=timings,
             debug=RunDebug(
@@ -1597,10 +1675,13 @@ def _run_job_async(worker_job_id: str) -> None:
 
     with _JOB_LOCK:
         job = _JOBS.get(worker_job_id)
-        if job is None:
+        if job is None or job.request is None:
             return
         job.status = "running"
         request = job.request
+        # The executing thread now owns the request. Do not retain a second
+        # potentially large inline-body graph in the poll registry.
+        job.request = None
         progress = job.progress
 
     result = _execute_run(request, progress=progress)
@@ -1612,6 +1693,7 @@ def _run_job_async(worker_job_id: str) -> None:
         job.result = result
         job.error = result.error
         job.status = "completed" if result.ok else "failed"
+        job.finished_monotonic = time.monotonic()
         if job.progress is not None:
             stage = "done" if result.ok else "failed"
             message = "Completed" if result.ok else (result.error or "Failed")
@@ -1655,8 +1737,12 @@ def stitch_job(request: StitchRequest, _: None = Depends(_require_worker_api_tok
         upload_via_signed_put(request.signed_put_url, out_path, request.content_type)
         return StitchResponse(ok=True, job_id=request.job_id, public_url=request.public_url, metadata=meta)
     except Exception as exc:  # noqa: BLE001 — return ok=False so the backend can fall back
-        LOGGER.exception("[stitch] failed job=%s", request.job_id)
-        return StitchResponse(ok=False, job_id=request.job_id, error=f"{type(exc).__name__}: {exc}")
+        LOGGER.error(
+            "[stitch] failed job=%s exception_class=%s",
+            request.job_id,
+            type(exc).__name__,
+        )
+        return StitchResponse(ok=False, job_id=request.job_id, error="stitch_failed")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -1669,9 +1755,25 @@ def submit_job(request: RunRequest, _: None = Depends(_require_worker_api_token)
     record = _JobRecord(
         job_id=worker_job_id,
         request=request,
+        client_job_id=request.job_id,
+        asset_group=request.asset_group,
         progress=_build_initial_progress(worker_job_id, request),
     )
     with _JOB_LOCK:
+        in_flight = sum(
+            record.status not in _TERMINAL_JOB_STATES
+            for record in _JOBS.values()
+        )
+        if in_flight >= _MAX_EXECUTION_SLOTS:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Async worker execution capacity is full",
+            )
+        if not _prune_job_registry_locked(reserve=1):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Async job registry is at capacity",
+            )
         _JOBS[worker_job_id] = record
 
     thread = threading.Thread(
@@ -1685,10 +1787,14 @@ def submit_job(request: RunRequest, _: None = Depends(_require_worker_api_token)
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
-def get_job(job_id: str) -> JobStatusResponse:
+def get_job(
+    job_id: str,
+    _: None = Depends(_require_worker_api_token),
+) -> JobStatusResponse:
     """Return async job state and final result when available."""
 
     with _JOB_LOCK:
+        _prune_job_registry_locked()
         record = _JOBS.get(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
@@ -1702,10 +1808,14 @@ def get_job(job_id: str) -> JobStatusResponse:
 
 
 @app.get("/jobs/{job_id}/progress", response_model=JobProgressResponse)
-def get_job_progress(job_id: str) -> JobProgressResponse:
+def get_job_progress(
+    job_id: str,
+    _: None = Depends(_require_worker_api_token),
+) -> JobProgressResponse:
     """Return structured execution progress and ETA for one async worker job."""
 
     with _JOB_LOCK:
+        _prune_job_registry_locked()
         record = _JOBS.get(job_id)
         if record is None:
             raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
@@ -1715,7 +1825,11 @@ def get_job_progress(job_id: str) -> JobProgressResponse:
 
 
 @app.get("/files/{root_name}/{relative_path:path}")
-def download_file(root_name: str, relative_path: str) -> FileResponse:
+def download_file(
+    root_name: str,
+    relative_path: str,
+    _: None = Depends(_require_worker_api_token),
+) -> FileResponse:
     """Serve a generated file from an explicitly allowed Comfy directory."""
 
     try:

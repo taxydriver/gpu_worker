@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Direct TLS edge for Vercel (or any external authoritative) DNS.  The config
+# and Caddy binary are copied into the immutable secure-profile release; this
+# launcher only receives protected EnvironmentFile values.
+: "${FILMFORGE_CADDY_CONFIG_FILE:?required}"
+: "${FILMFORGE_CADDY_LOCAL_URL:?required}"
+: "${FILMFORGE_CADDY_PUBLIC_URL:?required}"
+: "${FILMFORGE_EDGE_WORKER_SECRET_FILE:?required}"
+: "${FILMFORGE_EDGE_CUTOVER_AUTHORIZATION_FILE:?required}"
+: "${FILMFORGE_EDGE_WORKER_CODE_RELEASE_ID:?required}"
+: "${CADDY_BIN:?required}"
+
+case "$FILMFORGE_CADDY_LOCAL_URL" in http://127.0.0.1:*) ;; *) echo 'Caddy local URL must be IPv4 loopback' >&2; exit 1;; esac
+case "$FILMFORGE_CADDY_PUBLIC_URL" in https://*) ;; *) echo 'Caddy public URL must use HTTPS' >&2; exit 1;; esac
+test -f "$FILMFORGE_CADDY_CONFIG_FILE" && test ! -L "$FILMFORGE_CADDY_CONFIG_FILE" && test "$(stat -c '%a' "$FILMFORGE_CADDY_CONFIG_FILE")" = 600 || { echo 'Caddy config must be regular mode 0600' >&2; exit 1; }
+test -f "$FILMFORGE_EDGE_WORKER_SECRET_FILE" && test ! -L "$FILMFORGE_EDGE_WORKER_SECRET_FILE" && test "$(stat -c '%a' "$FILMFORGE_EDGE_WORKER_SECRET_FILE")" = 600 || { echo 'worker secret must be regular mode 0600' >&2; exit 1; }
+test -x "$CADDY_BIN" || { echo 'Caddy binary unavailable' >&2; exit 1; }
+
+"$CADDY_BIN" validate --config "$FILMFORGE_CADDY_CONFIG_FILE" --adapter caddyfile
+WATCHDOG_CONFIG="$(mktemp "${TMPDIR:-/tmp}/filmforge-caddy-watchdog.XXXXXX")"; chmod 0600 "$WATCHDOG_CONFIG"
+WATCHDOG_BODY="$(mktemp "${TMPDIR:-/tmp}/filmforge-caddy-health.XXXXXX")"; chmod 0600 "$WATCHDOG_BODY"
+cleanup() { rm -f "$WATCHDOG_CONFIG" "$WATCHDOG_BODY"; }
+trap cleanup EXIT
+python3 - "$FILMFORGE_EDGE_WORKER_SECRET_FILE" "$FILMFORGE_CADDY_PUBLIC_URL" "$WATCHDOG_CONFIG" <<'PY'
+from pathlib import Path
+import os, sys
+values = {}
+for raw in Path(sys.argv[1]).read_text().splitlines():
+    line = raw.strip()
+    if line and not line.startswith('#'):
+        key, sep, value = line.partition('=')
+        if not sep or key in values: raise SystemExit('worker secret env is invalid')
+        values[key] = value
+token = values.get('GPU_WORKER_API_TOKEN') or values.get('WORKER_API_TOKEN')
+if not token or any(c.isspace() or c in "'\\\"" for c in token): raise SystemExit('worker bearer is missing or unsafe')
+p = Path(sys.argv[3]); p.write_text(f'url = "{sys.argv[2].rstrip("/")}/health"\nheader = "Authorization: Bearer {token}"\nsilent\nshow-error\nmax-time = 10\nmax-redirs = 0\nmax-filesize = 65536\n'); os.chmod(p, 0o600)
+PY
+"$CADDY_BIN" run --config "$FILMFORGE_CADDY_CONFIG_FILE" --adapter caddyfile &
+CADDY_PID=$!
+trap 'kill "$CADDY_PID" 2>/dev/null || true; wait "$CADDY_PID" 2>/dev/null || true; exit 0' INT TERM
+sleep 3; FAILURES=0
+while kill -0 "$CADDY_PID" 2>/dev/null; do
+  if test ! -f "$FILMFORGE_EDGE_CUTOVER_AUTHORIZATION_FILE"; then sleep 15; continue; fi
+  STATUS="$(curl --config "$WATCHDOG_CONFIG" --output "$WATCHDOG_BODY" --write-out '%{http_code}' 2>/dev/null || true)"
+  if test "$STATUS" = 200 && python3 - "$WATCHDOG_BODY" "$FILMFORGE_CADDY_PUBLIC_URL" "$FILMFORGE_EDGE_WORKER_CODE_RELEASE_ID" <<'PY'
+import json, pathlib, sys
+v=json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+if not isinstance(v,dict) or v.get('ok') is not True or v.get('worker_ok') is not True or str(v.get('public_url') or '').rstrip('/') != sys.argv[2].rstrip('/') or v.get('code_release_id') != sys.argv[3]: raise SystemExit(1)
+PY
+  then FAILURES=0; else FAILURES=$((FAILURES+1)); if test "$FAILURES" -ge 3; then kill "$CADDY_PID"; wait "$CADDY_PID" || true; exit 1; fi; fi
+  sleep 15
+done
+wait "$CADDY_PID"

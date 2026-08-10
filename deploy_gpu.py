@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -14,15 +15,34 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
+
+try:
+    from gpu_worker.worker_release import (
+        WorkerReleaseBundle,
+        WorkerReleaseError,
+        build_worker_release_bundle,
+        worker_release_activate_script,
+        worker_release_install_script,
+        worker_release_rollback_script,
+    )
+except ModuleNotFoundError:  # direct ``python deploy_gpu.py`` execution
+    from worker_release import (  # type: ignore[no-redef]
+        WorkerReleaseBundle,
+        WorkerReleaseError,
+        build_worker_release_bundle,
+        worker_release_activate_script,
+        worker_release_install_script,
+        worker_release_rollback_script,
+    )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_REMOTE_ROOT = "/workspace/filmforge_gpu_worker"
 DEFAULT_BACKEND_ENV = SCRIPT_DIR.parent / "backend" / "app" / ".env"
 DEFAULT_BACKEND_ROOT = SCRIPT_DIR.parent / "backend"
-WORKER_URL_PATTERN = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
 DEFAULT_SSH_IDENTITY = Path.home() / ".ssh" / "vast_deploy"
 DEFAULT_SSH_IDENTITY_RUNPOD = Path.home() / ".ssh" / "runpod_deploy"
 DEFAULT_VAST_IMAGE = "vastai/comfy:v0.15.1-cuda-12.9-py312"
@@ -31,6 +51,7 @@ DEFAULT_VAST_MAX_PRICE = 0.75
 DEFAULT_VAST_MIN_VRAM_GB = 24
 DEFAULT_VAST_LIMIT = 25
 DEFAULT_VAST_BOOT_TIMEOUT = 900
+_MAX_WORKER_WARMUP_RESPONSE_BYTES = 1024 * 1024
 # Reliable-region allow-list for Vast offers. Chinese (CN) and other unlisted
 # hosts are excluded because some hang forever on "loading" and never accept SSH
 # (observed 2026-07-10: a CN box stuck loading past the boot timeout). Regions:
@@ -51,6 +72,288 @@ DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
 DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
 DEFAULT_VERDA_HOSTNAME = "filmforge-verda-worker"
 DEFAULT_VERDA_FRESH_OS_VOLUME_SIZE = 100
+DEFAULT_WORKER_RELEASES_ROOT = "/opt/filmforge-worker-releases"
+DEFAULT_WORKER_RUNTIME_ROOT = "/opt/filmforge_gpu_worker"
+
+
+def _validate_worker_public_url_env(env_vars: list[str]) -> None:
+    """Fail deployment before advertising a credential-bearing cleartext URL."""
+
+    rendered = {
+        item.split("=", 1)[0]: item.split("=", 1)[1]
+        for item in env_vars
+        if "=" in item
+    }
+    mode = str(
+        rendered.get("WORKER_API_AUTH_MODE")
+        or os.getenv("WORKER_API_AUTH_MODE")
+        or "required"
+    ).strip().lower()
+    urls: list[str] = []
+    if rendered.get("WORKER_PUBLIC_URL"):
+        urls.append(rendered["WORKER_PUBLIC_URL"])
+    if rendered.get("WORKER_PUBLIC_URLS"):
+        urls.extend(rendered["WORKER_PUBLIC_URLS"].split(","))
+    for raw_url in urls:
+        raw_url = raw_url.strip()
+        if not raw_url:
+            continue
+        try:
+            parsed = urlsplit(raw_url)
+            port = parsed.port
+        except (TypeError, ValueError):
+            raise RuntimeError("Worker public URL is invalid") from None
+        hostname = str(parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or port is not None and not 1 <= port <= 65535
+        ):
+            raise RuntimeError("Worker public URL is invalid")
+        loopback = hostname == "localhost"
+        try:
+            loopback = loopback or ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            pass
+        if (
+            parsed.scheme.lower() != "https"
+            and not loopback
+            and mode not in {"development", "test"}
+        ):
+            raise RuntimeError("Worker public URL requires HTTPS")
+
+
+def _worker_env_map(env_vars: list[str]) -> dict[str, str]:
+    """Parse deployment KEY=VALUE inputs without ever logging their values."""
+
+    rendered: dict[str, str] = {}
+    for item in env_vars:
+        key, separator, value = str(item).partition("=")
+        key = key.strip()
+        if not separator or not key:
+            continue
+        if key in rendered and rendered[key] != value:
+            raise RuntimeError(f"Conflicting deployment value for {key}")
+        rendered[key] = value
+    return rendered
+
+
+_CREDENTIAL_ENV_KEY = re.compile(
+    r"(?:^|_)(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY)(?:_|$)"
+)
+
+
+def _load_worker_deploy_env_file(path: Path) -> list[str]:
+    """Load deployment values from a protected file, never process argv."""
+
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("--env-file must be a regular file")
+    if path.stat().st_mode & 0o777 != 0o600:
+        raise RuntimeError("--env-file must have mode 0600")
+    values: list[str] = []
+    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or not re.fullmatch(r"[A-Z_][A-Z0-9_]*", key)
+            or not value
+            or any(character in value for character in "\r\n\x00")
+        ):
+            raise RuntimeError(f"invalid --env-file assignment at line {line_number}")
+        values.append(f"{key}={value}")
+    return values
+
+
+def _preflight_complete_worker_contract(
+    env_vars: list[str],
+    *,
+    worker_port: int,
+    expected_worker_count: int | None = None,
+) -> dict[str, list[str] | str]:
+    """Refuse a worker deploy before GPU/provider mutation if any half is absent.
+
+    This is a configuration preflight, not a readiness claim.  The subsequent
+    secure-profile cutover still requires the independent, fresh receipt defined
+    in ``worker_release.py``.
+    """
+
+    rendered = _worker_env_map(env_vars)
+    missing: list[str] = []
+    if not (rendered.get("GPU_WORKER_API_TOKEN") or rendered.get("WORKER_API_TOKEN")):
+        missing.append("GPU_WORKER_API_TOKEN")
+    for key in (
+        "WORKER_REGISTRATION_TOKEN",
+        "FILMFORGE_BACKEND_URL",
+        "WORKER_API_AUTH_MODE",
+        "WORKER_PUBLIC_URLS",
+        "WORKER_TUNNEL_LOCAL_URLS",
+        "WORKER_TUNNEL_UNITS",
+        "WORKER_SECURITY_STAGE_RECEIPTS",
+        "WORKER_DEPLOY_PHASE",
+        "FILMFORGE_BACKEND_CLIENT_AUTH_MODE",
+    ):
+        if not rendered.get(key):
+            missing.append(key)
+    if missing:
+        raise RuntimeError(
+            "Worker security contract is incomplete before GPU setup: "
+            + ", ".join(sorted(missing))
+        )
+    if rendered.get("WORKER_API_AUTH_MODE", "required").strip().lower() != "required":
+        raise RuntimeError("Worker security contract requires WORKER_API_AUTH_MODE=required")
+    if rendered["FILMFORGE_BACKEND_CLIENT_AUTH_MODE"].strip().lower() != "bearer":
+        raise RuntimeError(
+            "Worker security contract requires the backend bearer-sending client"
+        )
+    if rendered["WORKER_DEPLOY_PHASE"] not in {
+        "stage-code",
+        "provision-only",
+        "activate",
+    }:
+        raise RuntimeError(
+            "WORKER_DEPLOY_PHASE must be stage-code, provision-only, or activate"
+        )
+    if rendered.get("WORKER_EDGE_PROVIDER", "cloudflared") not in {"cloudflared", "caddy"}:
+        raise RuntimeError("WORKER_EDGE_PROVIDER must be cloudflared or caddy")
+    try:
+        backend_url = urlsplit(rendered["FILMFORGE_BACKEND_URL"])
+        backend_port = backend_url.port
+    except (TypeError, ValueError):
+        raise RuntimeError("FILMFORGE_BACKEND_URL is invalid") from None
+    if (
+        backend_url.scheme.lower() != "https"
+        or not backend_url.hostname
+        or backend_url.username is not None
+        or backend_url.password is not None
+        or backend_url.query
+        or backend_url.fragment
+        or backend_url.path not in {"", "/"}
+        or backend_port is not None and not 1 <= backend_port <= 65535
+    ):
+        raise RuntimeError(
+            "FILMFORGE_BACKEND_URL must be an origin-only HTTPS URL"
+        )
+
+    public_urls = [
+        value.strip()
+        for value in rendered["WORKER_PUBLIC_URLS"].split(",")
+        if value.strip()
+    ]
+    local_urls = [
+        value.strip()
+        for value in rendered["WORKER_TUNNEL_LOCAL_URLS"].split(",")
+        if value.strip()
+    ]
+    tunnel_units = [
+        value.strip()
+        for value in rendered["WORKER_TUNNEL_UNITS"].split(",")
+        if value.strip()
+    ]
+    stage_receipts = [
+        value.strip()
+        for value in rendered["WORKER_SECURITY_STAGE_RECEIPTS"].split(",")
+        if value.strip()
+    ]
+    if (
+        not public_urls
+        or len(public_urls) != len(local_urls)
+        or len(public_urls) != len(tunnel_units)
+        or len(public_urls) != len(stage_receipts)
+    ):
+        raise RuntimeError(
+            "Worker public URLs, tunnel local URLs, tunnel units, and stage receipts must have equal cardinality"
+        )
+    if len(set(public_urls)) != len(public_urls):
+        raise RuntimeError("Worker public URLs must be unique per worker")
+    if len(set(tunnel_units)) != len(tunnel_units):
+        raise RuntimeError("Worker tunnel units must be unique per worker")
+    if len(set(stage_receipts)) != len(stage_receipts):
+        raise RuntimeError("Worker security stage receipts must be unique per worker")
+    if expected_worker_count and len(public_urls) != expected_worker_count:
+        raise RuntimeError(
+            "Worker security contract URL count does not match the requested worker count"
+        )
+
+    _validate_worker_public_url_env(
+        [
+            "WORKER_API_AUTH_MODE=required",
+            f"WORKER_PUBLIC_URLS={','.join(public_urls)}",
+        ]
+    )
+    unit_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*\.service$")
+    for index, (local_url, tunnel_unit) in enumerate(zip(local_urls, tunnel_units)):
+        try:
+            parsed = urlsplit(local_url)
+            parsed_port = parsed.port
+        except (TypeError, ValueError):
+            raise RuntimeError("Worker tunnel local URL is invalid") from None
+        if (
+            parsed.scheme.lower() != "http"
+            or parsed.hostname != "127.0.0.1"
+            or parsed_port != worker_port + index
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError(
+                "Worker tunnel local URLs must map exactly to loopback worker ports"
+            )
+        if not unit_pattern.fullmatch(tunnel_unit):
+            raise RuntimeError("Worker tunnel unit name is invalid")
+        receipt_path = stage_receipts[index]
+        if (
+            not receipt_path.startswith("/")
+            or any(character.isspace() or ord(character) < 32 for character in receipt_path)
+        ):
+            raise RuntimeError("Worker security stage receipt path is invalid")
+    return {
+        "public_urls": public_urls,
+        "local_urls": local_urls,
+        "tunnel_units": tunnel_units,
+        "stage_receipts": stage_receipts,
+        "backend_auth_mode": "bearer",
+        "deploy_phase": rendered["WORKER_DEPLOY_PHASE"],
+        "edge_provider": rendered.get("WORKER_EDGE_PROVIDER", "cloudflared"),
+    }
+
+
+def _resolve_worker_security_env(args: argparse.Namespace) -> list[str]:
+    """Resolve security-contract values without contacting or mutating a provider."""
+
+    env_vars = list(getattr(args, "env_vars", []) or [])
+    existing_keys = {item.split("=", 1)[0] for item in env_vars if "=" in item}
+    for key in (
+        "GPU_WORKER_API_TOKEN",
+        "WORKER_API_TOKEN",
+        "WORKER_REGISTRATION_TOKEN",
+        "FILMFORGE_BACKEND_URL",
+        "WORKER_API_AUTH_MODE",
+        "WORKER_PUBLIC_URLS",
+        "WORKER_TUNNEL_LOCAL_URLS",
+        "WORKER_TUNNEL_UNITS",
+        "WORKER_SECURITY_STAGE_RECEIPTS",
+        "WORKER_DEPLOY_PHASE",
+        "FILMFORGE_BACKEND_CLIENT_AUTH_MODE",
+    ):
+        if key in existing_keys:
+            continue
+        value = _read_env_value(args.backend_env, key) or os.getenv(key)
+        if value:
+            env_vars.append(f"{key}={value}")
+            existing_keys.add(key)
+            log(f"Resolved {key} for worker security preflight")
+    args.env_vars = env_vars
+    return env_vars
 # Models on the data volume: default warm set (flux 71 + wan 38 + ltx 70)
 # ≈ 180 GB; +juggernaut 10 ≈ 190 GB. 300 GB leaves ~100 GB for ComfyUI outputs/temp/.part
 # download slack (LTX checkpoint alone is 46 GB) and the next model. See
@@ -433,6 +736,447 @@ def stage_worker_tree(source_dir: Path) -> tempfile.TemporaryDirectory[str]:
     return temp_dir
 
 
+def _stage_worker_release_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    scp_cmd: list[str],
+    destination: str,
+    releases_root: str,
+    venv_path: str,
+    bundle: WorkerReleaseBundle | None = None,
+) -> tuple[str, str]:
+    """Upload and atomically activate a content-addressed worker package.
+
+    The remote archive is installed beside any historical checkout.  No file in
+    that checkout is copied over, edited, reset, or pulled, so a dirty H100 box
+    cannot turn a failed update into a partial service deployment.
+    """
+
+    if bundle is None:
+        try:
+            bundle_context = build_worker_release_bundle(
+                SCRIPT_DIR,
+                require_committed_source=True,
+            )
+        except WorkerReleaseError as exc:
+            raise RuntimeError(str(exc)) from exc
+        with bundle_context as local_bundle:
+            return _stage_worker_release_over_ssh(
+                ssh_cmd=ssh_cmd,
+                scp_cmd=scp_cmd,
+                destination=destination,
+                releases_root=releases_root,
+                venv_path=venv_path,
+                bundle=local_bundle,
+            )
+    else:
+        remote_archive = f"/tmp/filmforge-worker-{bundle.release_id}.tar.gz"
+        run(
+            [
+                *scp_cmd,
+                str(bundle.archive_path),
+                f"{destination}:{remote_archive}",
+            ]
+        )
+        install_script = worker_release_install_script(
+            archive_path=remote_archive,
+            archive_sha256=bundle.archive_sha256,
+            source_sha256=bundle.source_sha256,
+            release_id=bundle.release_id,
+            releases_root=releases_root,
+            venv_path=venv_path,
+            git_commit=bundle.git_commit,
+            tracked_manifest_sha256=bundle.tracked_manifest_sha256,
+        )
+        run(
+            [*ssh_cmd, "bash", "-s"],
+            input_text=install_script,
+            capture_output=True,
+        )
+        return (
+            bundle.release_id,
+            f"{releases_root}/releases/{bundle.release_id}/gpu_worker",
+        )
+
+
+def _prepare_worker_release_bundle(args: argparse.Namespace) -> WorkerReleaseBundle:
+    """Build once before provider mutation and retain those exact bytes for SSH."""
+
+    existing = getattr(args, "_prepared_worker_release_bundle", None)
+    if isinstance(existing, WorkerReleaseBundle):
+        return existing
+    try:
+        bundle = build_worker_release_bundle(
+            SCRIPT_DIR,
+            require_committed_source=True,
+        )
+    except WorkerReleaseError as exc:
+        raise RuntimeError(str(exc)) from exc
+    setattr(args, "_prepared_worker_release_bundle", bundle)
+    return bundle
+
+
+def _activate_worker_release_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    releases_root: str,
+    release_id: str,
+    worker_source_root: str,
+    stage_receipt_paths: list[str],
+) -> None:
+    """Reverify profile CAS and promote code while holding the profile lock."""
+
+    activation = worker_release_activate_script(
+        releases_root=releases_root,
+        release_id=release_id,
+    )
+    validator = f"""\
+import json
+import pathlib
+import stat
+import subprocess
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+failed_release_id = {release_id!r}
+candidate_source = pathlib.Path({worker_source_root!r})
+receipt_paths = {[str(path) for path in stage_receipt_paths]!r}
+candidate_root = candidate_source.parent
+if candidate_source.name != "gpu_worker" or candidate_root.name != failed_release_id:
+    raise SystemExit("worker candidate path does not match finalization release")
+if not receipt_paths:
+    raise SystemExit("worker finalization requires secure-profile receipts")
+for raw_path in receipt_paths:
+    receipt_path = pathlib.Path(raw_path)
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SystemExit("secure-profile receipt is not a regular file")
+    if stat.S_IMODE(receipt_path.stat().st_mode) != 0o600:
+        raise SystemExit("secure-profile receipt must have mode 0600")
+    receipt = json.loads(receipt_path.read_text())
+    if receipt.get("schema") != "filmforge.worker-secure-stage.v1":
+        raise SystemExit("secure-profile receipt schema is invalid")
+    if receipt.get("cutover_performed") is not True:
+        raise SystemExit("secure-profile cutover is not complete")
+    if receipt.get("rollback_state") == "in_progress":
+        raise SystemExit("secure-profile rollback is in progress")
+    if receipt.get("worker_code_release_id") != failed_release_id:
+        raise SystemExit("secure-profile receipt is bound to different worker code")
+    if pathlib.Path(str(receipt.get("worker_module_dir"))) != candidate_root:
+        raise SystemExit("secure-profile module directory is not the candidate")
+    if pathlib.Path(str(receipt.get("worker_exec"))) != candidate_root / ".venv/bin/python":
+        raise SystemExit("secure-profile executable is not the candidate")
+    profile_release_id = receipt.get("release_id")
+    worker_unit = receipt.get("worker_unit")
+    tunnel_unit = receipt.get("tunnel_unit")
+    if not all(isinstance(value, str) and value for value in (
+        profile_release_id, worker_unit, tunnel_unit
+    )):
+        raise SystemExit("secure-profile identity is invalid")
+    profile_dir = receipt_path.parent
+    active = pathlib.Path("/etc/filmforge/worker-security/active") / worker_unit
+    worker_dropin_dir = pathlib.Path("/etc/systemd/system") / f"{{worker_unit}}.d"
+    tunnel_dropin_dir = pathlib.Path("/etc/systemd/system") / f"{{tunnel_unit}}.d"
+    expected_links = {{
+        active: profile_dir,
+        worker_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "worker-secure-profile.conf",
+        tunnel_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "tunnel-secure-profile.conf",
+        pathlib.Path("/etc/systemd/system") / tunnel_unit: profile_dir / "filmforge-worker-tunnel.service",
+    }}
+    for managed, expected in expected_links.items():
+        if not managed.is_symlink() or managed.resolve() != expected.resolve():
+            raise SystemExit("secure-profile managed link changed before code finalization")
+    authorization = profile_dir / "cutover-authorized"
+    if (
+        authorization.is_symlink()
+        or not authorization.is_file()
+        or stat.S_IMODE(authorization.stat().st_mode) != 0o600
+        or authorization.read_text() != profile_release_id + "\\n"
+    ):
+        raise SystemExit("secure-profile cutover authorization drifted")
+    if receipt.get("profile_mode") == "first-install":
+        boot_authorization = profile_dir / "boot-authorized"
+        if (
+            boot_authorization.is_symlink()
+            or not boot_authorization.is_file()
+            or stat.S_IMODE(boot_authorization.stat().st_mode) != 0o600
+            or boot_authorization.read_text() != profile_release_id + "\\n"
+        ):
+            raise SystemExit("first-install boot authorization drifted")
+    for unit in (worker_unit, tunnel_unit):
+        active_result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", unit],
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        if active_result.returncode != 0:
+            raise SystemExit("worker or tunnel became inactive before code finalization")
+    worker_secret = profile_dir / "worker-secrets.env"
+    if (
+        worker_secret.is_symlink()
+        or not worker_secret.is_file()
+        or stat.S_IMODE(worker_secret.stat().st_mode) != 0o600
+    ):
+        raise SystemExit("worker secret drifted before code finalization")
+    secret_values = {{}}
+    for raw_line in worker_secret.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or key in secret_values:
+            raise SystemExit("worker secret is invalid before code finalization")
+        secret_values[key] = value
+    worker_token = secret_values.get("GPU_WORKER_API_TOKEN") or secret_values.get(
+        "WORKER_API_TOKEN"
+    )
+    if not worker_token:
+        raise SystemExit("worker bearer is absent before code finalization")
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    local_health_url = str(receipt.get("tunnel_local_url") or "").rstrip("/") + "/health"
+    health_request = Request(
+        local_health_url,
+        headers={{"Authorization": f"Bearer {{worker_token}}"}},
+        method="GET",
+    )
+    try:
+        with build_opener(ProxyHandler({{}}), NoRedirect()).open(
+            health_request,
+            timeout=10,
+        ) as health_response:
+            if health_response.status != 200:
+                raise SystemExit("worker health status changed before code finalization")
+            health_body = health_response.read(65537)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise SystemExit("worker health failed before code finalization") from exc
+    if len(health_body) > 65536:
+        raise SystemExit("worker health response is too large before code finalization")
+    try:
+        health = json.loads(health_body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise SystemExit("worker health is not JSON before code finalization") from None
+    if (
+        not isinstance(health, dict)
+        or health.get("ok") is not True
+        or health.get("worker_ok") is not True
+        or health.get("code_release_id") != failed_release_id
+        or str(health.get("public_url") or "").rstrip("/")
+        != str(receipt.get("worker_public_url") or "").rstrip("/")
+    ):
+        raise SystemExit("worker health identity changed before code finalization")
+    if (worker_dropin_dir / "99-public-url-override.conf").exists():
+        raise SystemExit("public override reappeared before code finalization")
+"""
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+install -d -m 0700 /etc/filmforge/worker-security
+exec 9>/etc/filmforge/worker-security/.profile.lock
+flock 9
+python3 - <<'PY'
+{validator}PY
+{activation}
+"""
+    run(
+        [*ssh_cmd, "bash", "-s"],
+        input_text=script,
+        capture_output=True,
+    )
+
+
+def _activate_or_rollback_worker_release_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    releases_root: str,
+    release_id: str,
+    worker_source_root: str,
+    stage_receipt_paths: list[str],
+) -> None:
+    try:
+        _activate_worker_release_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=releases_root,
+            release_id=release_id,
+            worker_source_root=worker_source_root,
+            stage_receipt_paths=stage_receipt_paths,
+        )
+    except Exception:
+        try:
+            _rollback_secure_profiles_over_ssh(
+                ssh_cmd=ssh_cmd,
+                worker_source_root=worker_source_root,
+                failed_release_id=release_id,
+                stage_receipt_paths=stage_receipt_paths,
+            )
+        except Exception:
+            log(
+                "Worker metadata activation failed and the active secure profile "
+                "could not be rolled back; leaving the code pointer unchanged"
+            )
+            raise
+        try:
+            _rollback_worker_release_over_ssh(
+                ssh_cmd=ssh_cmd,
+                releases_root=releases_root,
+                failed_release_id=release_id,
+            )
+        except Exception:
+            log(
+                "Secure profile rollback succeeded, but the code pointer rollback "
+                "was unavailable"
+            )
+        raise
+
+
+def _rollback_worker_release_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    releases_root: str,
+    failed_release_id: str,
+) -> None:
+    """Best-effort CAS rollback after a post-package bootstrap failure."""
+
+    rollback_script = worker_release_rollback_script(
+        releases_root=releases_root,
+        failed_release_id=failed_release_id,
+    )
+    run(
+        [*ssh_cmd, "bash", "-s"],
+        input_text=rollback_script,
+        capture_output=True,
+    )
+
+
+def _rollback_secure_profiles_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    worker_source_root: str,
+    failed_release_id: str,
+    stage_receipt_paths: list[str],
+) -> None:
+    """Roll back receipt-pinned secure profiles before changing the code CAS.
+
+    A secure drop-in pins the immutable candidate directly, so changing only
+    ``current`` cannot restore service.  The remote helper imports the exact
+    candidate's repo-managed rollback implementation and accepts only protected
+    receipts bound to that candidate.  No credential is placed in argv.
+    """
+
+    if not stage_receipt_paths:
+        raise RuntimeError("secure-profile rollback requires stage receipts")
+    remote_helper = f"""\
+import json
+import pathlib
+import stat
+import sys
+
+worker_source_root = pathlib.Path({worker_source_root!r})
+failed_release_id = {failed_release_id!r}
+receipt_paths = {[str(path) for path in stage_receipt_paths]!r}
+candidate_root = worker_source_root.parent
+if worker_source_root.name != "gpu_worker" or candidate_root.name != failed_release_id:
+    raise SystemExit("worker candidate path does not match failed release")
+if not (candidate_root / ".ready").is_file():
+    raise SystemExit("worker candidate readiness marker is missing")
+sys.path.insert(0, str(candidate_root))
+from gpu_worker.worker_release import rollback_secure_profiles
+
+# Validate the entire fleet before the first profile mutation.  A later
+# per-profile failure is aggregated after every remaining profile gets its own
+# rollback attempt; each profile journal makes retry safe after SSH loss.
+profiles = []
+already_rolled_back = []
+for raw_path in receipt_paths:
+    receipt_path = pathlib.Path(raw_path)
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise SystemExit("secure-profile receipt is not a regular file")
+    if stat.S_IMODE(receipt_path.stat().st_mode) != 0o600:
+        raise SystemExit("secure-profile receipt must have mode 0600")
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit("secure-profile receipt could not be read") from exc
+    if receipt.get("worker_code_release_id") != failed_release_id:
+        raise SystemExit("secure-profile receipt is bound to different worker code")
+    rollback_state = receipt.get("rollback_state")
+    if receipt.get("cutover_performed") is False and rollback_state == "complete":
+        already_rolled_back.append(str(receipt.get("release_id")))
+        continue
+    if receipt.get("cutover_performed") is not True or rollback_state not in {{None, "in_progress"}}:
+        raise SystemExit("secure-profile receipt is not cut over or retryable")
+    profile_release_id = receipt.get("release_id")
+    if not isinstance(profile_release_id, str) or not profile_release_id:
+        raise SystemExit("secure-profile receipt release id is invalid")
+    profiles.append(profile_release_id)
+
+rolled_back = []
+if profiles:
+    try:
+        rollback_secure_profiles(release_ids=profiles)
+        rolled_back.extend(reversed(profiles))
+    except Exception as exc:
+        print(
+            "WORKER_SECURITY_PROFILE_ROLLBACK_FAILED="
+            + f"{{type(exc).__name__}}: {{exc}}",
+            file=sys.stderr,
+        )
+        raise SystemExit("one or more secure profiles require rollback retry") from exc
+completed = rolled_back + already_rolled_back
+if not completed:
+    raise SystemExit("no cut-over secure profile was available to roll back")
+print("WORKER_SECURITY_PROFILES_ROLLED_BACK=" + ",".join(completed))
+"""
+    run(
+        [*ssh_cmd, "python3", "-"],
+        input_text=remote_helper,
+        capture_output=True,
+    )
+
+
+def _rollback_failed_worker_transaction_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    releases_root: str,
+    worker_source_root: str,
+    failed_release_id: str,
+    stage_receipt_paths: list[str],
+    deploy_phase: str,
+) -> bool:
+    """Restore profile first, then code CAS; never claim a pointer-only fix."""
+
+    if deploy_phase == "activate":
+        try:
+            _rollback_secure_profiles_over_ssh(
+                ssh_cmd=ssh_cmd,
+                worker_source_root=worker_source_root,
+                failed_release_id=failed_release_id,
+                stage_receipt_paths=stage_receipt_paths,
+            )
+            log("Restored the receipt-pinned worker security profiles")
+        except Exception:
+            log(
+                "Active secure-profile rollback failed; the code pointer is left "
+                "unchanged and no recovery claim is made"
+            )
+            return False
+    try:
+        _rollback_worker_release_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=releases_root,
+            failed_release_id=failed_release_id,
+        )
+        log("Rolled worker code pointer back after bootstrap failure")
+    except Exception:
+        # A first-ever install has no previous pointer. The immutable candidate
+        # remains for inspection; profile rollback, when required, already ran.
+        log("Worker code rollback was unavailable; no code recovery is claimed")
+        return False
+    return True
+
+
 def build_env_exports(env_items: list[str]) -> str:
     exports: list[str] = []
     for item in env_items:
@@ -444,11 +1188,358 @@ def build_env_exports(env_items: list[str]) -> str:
     return "\n".join(exports)
 
 
-def remote_script(remote_root: str, worker_port: int) -> str:
+_WORKER_BOOTSTRAP_SECRET_KEYS = {
+    "GPU_WORKER_API_TOKEN",
+    "WORKER_API_TOKEN",
+    "WORKER_REGISTRATION_TOKEN",
+    "RENDER_BROKER_WORKER_TOKEN",
+    "FILMFORGE_BACKEND_CUTOVER_PROBE_TOKEN",
+}
+
+
+def build_bootstrap_env_exports(env_items: list[str]) -> str:
+    """Export non-worker configuration without leaking bearers to installers.
+
+    Worker and registration credentials already live in the verified staged
+    profile's mode-0600 EnvironmentFile. They must never be inherited by apt,
+    pip, git, custom-node installers, or other third-party bootstrap children.
+    """
+
+    safe_items = []
+    for item in env_items:
+        key, separator, _value = str(item).partition("=")
+        if separator and key.strip() not in _WORKER_BOOTSTRAP_SECRET_KEYS:
+            safe_items.append(item)
+    return build_env_exports(safe_items)
+
+
+def worker_security_stage_gate_script() -> str:
+    """Return a remote, read-only gate for the prepared profile receipts."""
+
+    return r'''command -v flock >/dev/null 2>&1 || {
+  echo "flock is required for coordinated worker/profile deployment" >&2
+  exit 1
+}
+mkdir -p /etc/filmforge/worker-security
+chmod 0700 /etc/filmforge/worker-security
+exec 9>/etc/filmforge/worker-security/.profile.lock
+chmod 0600 /etc/filmforge/worker-security/.profile.lock
+flock -x 9
+
+: "${WORKER_SECURITY_STAGE_RECEIPTS:?WORKER_SECURITY_STAGE_RECEIPTS is required}"
+: "${WORKER_PUBLIC_URLS:?WORKER_PUBLIC_URLS is required}"
+: "${WORKER_TUNNEL_LOCAL_URLS:?WORKER_TUNNEL_LOCAL_URLS is required}"
+: "${WORKER_TUNNEL_UNITS:?WORKER_TUNNEL_UNITS is required}"
+: "${WORKER_DEPLOY_PHASE:?WORKER_DEPLOY_PHASE is required}"
+: "${WORKER_CODE_RELEASE_ID:?WORKER_CODE_RELEASE_ID is required}"
+: "${WORKER_EDGE_PROVIDER:=cloudflared}"
+WORKER_SECURITY_GATE_RESULT="$(python3 - \
+  "$WORKER_SECURITY_STAGE_RECEIPTS" \
+  "$WORKER_PUBLIC_URLS" \
+  "$WORKER_TUNNEL_LOCAL_URLS" \
+  "$WORKER_TUNNEL_UNITS" \
+  "$WORKER_DEPLOY_PHASE" \
+  "$WORKER_CODE_RELEASE_ID" \
+  "$WORKER_EDGE_PROVIDER" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import socket
+import stat
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+receipt_paths, public_urls, local_urls, tunnel_units = [
+    [item.strip() for item in value.split(",") if item.strip()]
+    for value in sys.argv[1:5]
+]
+deploy_phase = sys.argv[5]
+code_release_id = sys.argv[6]
+edge_provider = sys.argv[7]
+if edge_provider not in {"cloudflared", "caddy"}:
+    raise SystemExit("invalid worker edge provider")
+if not receipt_paths or not (
+    len(receipt_paths) == len(public_urls) == len(local_urls) == len(tunnel_units)
+):
+    raise SystemExit("prepared secure-profile receipt cardinality mismatch")
+if deploy_phase == "stage-code":
+    print("stage-code")
+    raise SystemExit(0)
+if deploy_phase not in {"activate", "provision-only"}:
+    raise SystemExit("invalid worker deploy phase")
+artifacts = {
+    "worker_secret_sha256": ("worker-secrets.env", 0o600),
+    "tunnel_secret_sha256": ("tunnel-secrets.env", 0o600),
+    "backend_probe_secret_sha256": ("backend-cutover-probe.env", 0o600),
+    "tunnel_config_sha256": ("cloudflared.yml", 0o600),
+    "tunnel_credential_sha256": ("cloudflared-credential.json", 0o600),
+    "tunnel_exec_sha256": ("filmforge-worker-tunnel", 0o755),
+    "tunnel_binary_sha256": ("cloudflared", 0o755),
+    "worker_dropin_sha256": ("worker-secure-profile.conf", 0o644),
+    "tunnel_dropin_sha256": ("tunnel-secure-profile.conf", 0o644),
+    "tunnel_unit_sha256": ("filmforge-worker-tunnel.service", 0o644),
+    "worker_guard_sha256": ("worker-staged-guard.conf", 0o644),
+}
+all_cutover = True
+all_first_install = True
+any_cutover = False
+for index, raw_path in enumerate(receipt_paths):
+    path = pathlib.Path(raw_path)
+    if path.is_symlink() or not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise SystemExit("secure-profile stage receipt is missing or not mode 0600")
+    data = json.loads(path.read_text())
+    if data.get("schema") != "filmforge.worker-secure-stage.v1":
+        raise SystemExit("secure-profile stage receipt schema mismatch")
+    if data.get("edge_provider", "cloudflared") != edge_provider:
+        raise SystemExit("secure-profile edge provider does not match deploy contract")
+    if edge_provider == "caddy":
+        for field in ("tunnel_secret_sha256", "tunnel_config_sha256", "tunnel_credential_sha256", "tunnel_exec_sha256", "tunnel_binary_sha256"):
+            artifacts.pop(field, None)
+        artifacts.update({
+            "caddy_secret_sha256": ("caddy-secrets.env", 0o600),
+            "caddy_config_sha256": ("Caddyfile", 0o600),
+            "caddy_exec_sha256": ("filmforge-worker-caddy", 0o755),
+            "caddy_binary_sha256": ("caddy", 0o755),
+        })
+    if data.get("tunnel_prepared") is not True:
+        raise SystemExit("secure-profile tunnel has not completed prepare")
+    if data.get("worker_code_release_id") != code_release_id:
+        raise SystemExit("secure-profile receipt pins a different worker code release")
+    code_root = pathlib.Path(str(data.get("worker_module_dir") or ""))
+    code_exec = pathlib.Path(str(data.get("worker_exec") or ""))
+    source_marker = code_root / ".source-sha256"
+    ready_marker = code_root / ".ready"
+    dependency_freeze = code_root / ".dependency-freeze.txt"
+    dependency_marker = code_root / ".dependency-freeze.sha256"
+    if (
+        code_root.name != code_release_id
+        or code_root.parent.name != "releases"
+        or code_exec != code_root / ".venv/bin/python"
+        or code_root.is_symlink()
+        or not code_root.is_dir()
+        or code_exec.is_symlink()
+        or not code_exec.is_file()
+        or not os.access(code_exec, os.X_OK)
+        or ready_marker.is_symlink()
+        or not ready_marker.is_file()
+        or stat.S_IMODE(ready_marker.stat().st_mode) != 0o444
+        or source_marker.is_symlink()
+        or not source_marker.is_file()
+        or dependency_freeze.is_symlink()
+        or not dependency_freeze.is_file()
+        or dependency_marker.is_symlink()
+        or not dependency_marker.is_file()
+    ):
+        raise SystemExit("secure-profile code candidate path or markers drifted")
+    source_digest = source_marker.read_text().strip()
+    dependency_digest = dependency_marker.read_text().strip()
+    if (
+        ready_marker.read_text().strip() != source_digest
+        or code_release_id != f"sha256-{source_digest[:24]}"
+        or hashlib.sha256(dependency_freeze.read_bytes()).hexdigest()
+        != dependency_digest
+        or data.get("worker_dependency_freeze_sha256") != dependency_digest
+    ):
+        raise SystemExit("secure-profile code candidate digest drifted")
+    expected = (
+        ("worker_public_url", public_urls[index].rstrip("/")),
+        ("tunnel_local_url", local_urls[index].rstrip("/")),
+        ("tunnel_unit", tunnel_units[index]),
+    )
+    if any(data.get(key) != value for key, value in expected):
+        raise SystemExit("secure-profile stage receipt does not match deploy contract")
+    release = path.parent
+    for field, (relative, expected_mode) in artifacts.items():
+        artifact = release / relative
+        if artifact.is_symlink() or not artifact.is_file():
+            raise SystemExit("secure-profile staged artifact is missing")
+        if stat.S_IMODE(artifact.stat().st_mode) != expected_mode:
+            raise SystemExit("secure-profile staged artifact mode drifted")
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != data.get(field):
+            raise SystemExit("secure-profile staged artifact drifted")
+    worker_unit = data["worker_unit"]
+    managed = {
+        pathlib.Path("/etc/systemd/system") / tunnel_units[index]: release / "filmforge-worker-tunnel.service",
+        pathlib.Path("/etc/systemd/system") / f"{tunnel_units[index]}.d/20-filmforge-secure-profile.conf": release / "tunnel-secure-profile.conf",
+    }
+    worker_profile = pathlib.Path("/etc/systemd/system") / f"{worker_unit}.d/20-filmforge-secure-profile.conf"
+    if data.get("cutover_performed") is True:
+        managed[worker_profile] = release / "worker-secure-profile.conf"
+        active_profile = (
+            pathlib.Path("/etc/filmforge/worker-security/active") / worker_unit
+        )
+        if (
+            not active_profile.is_symlink()
+            or active_profile.resolve() != release.resolve()
+        ):
+            raise SystemExit("cutover secure-profile active pointer is incomplete")
+    elif worker_profile.exists() or worker_profile.is_symlink():
+        raise SystemExit("worker secure profile activated before cutover")
+    if data.get("profile_mode") == "first-install":
+        managed[
+            pathlib.Path("/etc/systemd/system")
+            / f"{worker_unit}.d/00-filmforge-staged-guard.conf"
+        ] = release / "worker-staged-guard.conf"
+    if any(
+        not link.is_symlink() or link.resolve() != target.resolve()
+        for link, target in managed.items()
+    ):
+        raise SystemExit("secure-profile managed systemd links are incomplete")
+    override = pathlib.Path("/etc/systemd/system") / f"{worker_unit}.d/99-public-url-override.conf"
+    mode = data.get("profile_mode")
+    all_first_install = all_first_install and mode == "first-install"
+    all_cutover = all_cutover and data.get("cutover_performed") is True
+    any_cutover = any_cutover or data.get("cutover_performed") is True
+    if mode == "migration" and data.get("cutover_performed") is not True:
+        if override.is_symlink() or not override.is_file():
+            raise SystemExit("migration public override disappeared before cutover")
+        if hashlib.sha256(override.read_bytes()).hexdigest() != data.get("public_override_sha256"):
+            raise SystemExit("migration public override drifted")
+    elif override.exists() or override.is_symlink():
+        raise SystemExit("unexpected public override in active/first-install profile")
+    if data.get("cutover_performed") is True:
+        authorization = release / "cutover-authorized"
+        if (
+            authorization.is_symlink()
+            or not authorization.is_file()
+            or stat.S_IMODE(authorization.stat().st_mode) != 0o600
+            or authorization.read_text() != f"{data['release_id']}\n"
+        ):
+            raise SystemExit("cutover authorization drifted")
+        if mode == "first-install":
+            boot_authorization = release / "boot-authorized"
+            if (
+                boot_authorization.is_symlink()
+                or not boot_authorization.is_file()
+                or stat.S_IMODE(boot_authorization.stat().st_mode) != 0o600
+                or boot_authorization.read_text() != f"{data['release_id']}\n"
+            ):
+                raise SystemExit("first-install boot authorization drifted")
+    elif (release / "cutover-authorized").exists() or (
+        release / "cutover-authorized"
+    ).is_symlink():
+        raise SystemExit("cutover authorization appeared before receipt commit")
+if any_cutover and not all_cutover:
+    raise SystemExit("mixed secure-profile cutover state is not atomic")
+if deploy_phase == "provision-only":
+    if not all_first_install:
+        raise SystemExit("provision-only requires prepared first-install profiles")
+    if any_cutover:
+        raise SystemExit("provision-only refuses an already cut-over profile")
+    active_units = subprocess.run(
+        [
+            "systemctl",
+            "list-units",
+            "--type=service",
+            "--state=active",
+            "--no-legend",
+            "--no-pager",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    ).stdout
+    if any(
+        "filmforge-worker-gpu" in line.lower() or "gpu_worker" in line.lower()
+        for line in active_units.splitlines()
+    ):
+        raise SystemExit("provision-only refuses a live worker service")
+    for process in pathlib.Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            command = process.read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            )
+        except (OSError, PermissionError):
+            continue
+        if "gpu_worker.app:app" in command or "gpu_worker/app.py" in command:
+            raise SystemExit("provision-only refuses a live legacy worker process")
+    for local_url in local_urls:
+        port = urlsplit(local_url).port
+        if port is None:
+            raise SystemExit("planned worker loopback URL has no port")
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+        except OSError:
+            continue
+        connection.close()
+        raise SystemExit("provision-only refuses an occupied planned worker port")
+    print("provision-only")
+    raise SystemExit(0)
+print("cutover" if all_cutover else "prepared")
+PY
+ )"
+case "$WORKER_SECURITY_GATE_RESULT" in
+  cutover) export WORKER_SECURITY_CUTOVER_COMPLETE=1 ;;
+  prepared|provision-only|stage-code) export WORKER_SECURITY_CUTOVER_COMPLETE=0 ;;
+  *) echo "unexpected worker security gate result" >&2; exit 1 ;;
+esac
+printf 'WORKER_SECURITY_GATE=%s\n' "$WORKER_SECURITY_GATE_RESULT"
+if test "$WORKER_SECURITY_GATE_RESULT" = "prepared"; then
+  echo "WORKER_RELEASE_STAGED_ONLY=${WORKER_CODE_RELEASE_ID}"
+  echo "Prepared migration remains on its current worker until explicit cutover." >&2
+  exit 0
+fi
+if test "$WORKER_SECURITY_GATE_RESULT" = "stage-code"; then
+  echo "WORKER_RELEASE_STAGED_ONLY=$WORKER_CODE_RELEASE_ID"
+  echo "Immutable worker candidate staged without GPU or service mutation." >&2
+  exit 0
+fi
+if test "$WORKER_SECURITY_GATE_RESULT" = "cutover"; then
+  python3 - "$WORKER_TUNNEL_LOCAL_URLS" "$WORKER_CODE_RELEASE_ID" <<'PY'
+import json
+import sys
+from urllib.request import ProxyHandler, build_opener
+
+urls = [item.strip().rstrip("/") for item in sys.argv[1].split(",") if item.strip()]
+release_id = sys.argv[2]
+opener = build_opener(ProxyHandler({}))
+for url in urls:
+    with opener.open(f"{url}/health", timeout=15) as response:
+        health = json.load(response)
+    if health.get("code_release_id") != release_id:
+        raise SystemExit("cutover worker health came from a different code release")
+PY
+  echo "WORKER_RELEASE_VERIFIED=$WORKER_CODE_RELEASE_ID"
+  echo "Receipt-gated cutover remains the final worker restart; no service files changed." >&2
+  exit 0
+fi
+'''
+
+
+def remote_script(
+    remote_root: str,
+    worker_port: int,
+    worker_source_root: str | None = None,
+) -> str:
+    worker_source_root = worker_source_root or f"{remote_root.rstrip('/')}/gpu_worker"
+    security_gate = worker_security_stage_gate_script()
+    # Secure deployments use the systemd multi-worker path even for one GPU.
+    # Keep this compatibility entry point fail-closed instead of embedding the
+    # former nohup/env launcher, which exposed bearer values in process argv.
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
+{security_gate}
+
+# GPU_WORKER_API_TOKEN, WORKER_API_AUTH_MODE, and
+# WORKER_INPUT_URL_ALLOWED_HOSTS are supported only by the protected systemd
+# EnvironmentFile path emitted by vast_multi_gpu_script.
+echo "legacy single-worker bootstrap is disabled; use the atomic systemd deploy path" >&2
+exit 1
+"""
+
+    # Historical implementation retained below temporarily for source-level
+    # archaeology; it is unreachable and is not emitted by this function.
+    return f"""#!/usr/bin/env bash
+set -euo pipefail
+
+{security_gate}
+
 REMOTE_ROOT={shlex.quote(remote_root)}
+WORKER_SOURCE_ROOT={shlex.quote(worker_source_root)}
+WORKER_MODULE_DIR="$(dirname "$WORKER_SOURCE_ROOT")"
 WORKER_PORT={worker_port}
 DEFAULT_COMFY_BASE_URL="${{COMFYUI_API_BASE:-http://127.0.0.1:18188}}"
 
@@ -543,8 +1634,10 @@ fi
 
 mkdir -p "$REMOTE_ROOT"
 cd "$REMOTE_ROOT"
-python3 -m venv .venv
-.venv/bin/pip install -r gpu_worker/requirements.txt
+test -x "$WORKER_SOURCE_ROOT/.venv/bin/python" || {{
+  echo "immutable worker candidate venv is missing" >&2
+  exit 1
+}}
 
 # Install aria2c for fast parallel model downloads (16-connection vs single-stream)
 if ! command -v aria2c >/dev/null 2>&1; then
@@ -584,6 +1677,7 @@ pkill -f "uvicorn gpu_worker.app:app" || true
 
 # Build env vars, only including non-empty ones (to avoid Pydantic validation errors on empty floats)
 declare -a ENV_VARS
+ENV_VARS+=(PYTHONPATH="$WORKER_MODULE_DIR")
 ENV_VARS+=(COMFY_BASE_URL="$COMFY_BASE_URL")
 ENV_VARS+=(COMFY_OUTPUT_DIR="$COMFY_OUTPUT_DIR")
 ENV_VARS+=(COMFY_TEMP_DIR="$COMFY_TEMP_DIR")
@@ -609,9 +1703,12 @@ test -n "${{WORKER_VRAM_GB:-}}" && ENV_VARS+=(WORKER_VRAM_GB="${{WORKER_VRAM_GB}
 ENV_VARS+=(WORKER_CAPABILITIES="${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}")
 test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && ENV_VARS+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
 test -n "${{WORKER_API_TOKEN:-}}" && ENV_VARS+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
+test -n "${{GPU_WORKER_API_TOKEN:-}}" && ENV_VARS+=(GPU_WORKER_API_TOKEN="${{GPU_WORKER_API_TOKEN}}")
+test -n "${{WORKER_API_AUTH_MODE:-}}" && ENV_VARS+=(WORKER_API_AUTH_MODE="${{WORKER_API_AUTH_MODE}}")
+test -n "${{WORKER_INPUT_URL_ALLOWED_HOSTS:-}}" && ENV_VARS+=(WORKER_INPUT_URL_ALLOWED_HOSTS="${{WORKER_INPUT_URL_ALLOWED_HOSTS}}")
 
 nohup env "${{ENV_VARS[@]}}" \\
-  .venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT" \\
+  "$WORKER_SOURCE_ROOT/.venv/bin/python" -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT" \\
   >/tmp/gpu_worker.log 2>&1 </dev/null &
 
 for _ in $(seq 1 30); do
@@ -676,7 +1773,7 @@ if test -n "$WORKER_URL" && test -z "$PRESET_PUBLIC_URL"; then
   sleep 2
   ENV_VARS+=(WORKER_PUBLIC_URL="$WORKER_URL")
   nohup env "${{ENV_VARS[@]}}" \\
-    .venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT" \\
+    "$WORKER_SOURCE_ROOT/.venv/bin/python" -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$WORKER_PORT" \\
     >/tmp/gpu_worker.log 2>&1 </dev/null &
   for _ in $(seq 1 20); do
     if curl -fsS "http://127.0.0.1:$WORKER_PORT/health" >/tmp/gpu_worker_health.json 2>/dev/null; then
@@ -758,11 +1855,18 @@ def vast_multi_gpu_script(
     worker_port: int,
     comfy_port: int,
     worker_count: int,
+    worker_source_root: str | None = None,
 ) -> str:
+    worker_source_root = worker_source_root or f"{remote_root.rstrip('/')}/gpu_worker"
+    security_gate = worker_security_stage_gate_script()
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
+{security_gate}
+
 REMOTE_ROOT={shlex.quote(remote_root)}
+WORKER_SOURCE_ROOT={shlex.quote(worker_source_root)}
+WORKER_MODULE_DIR="$(dirname "$WORKER_SOURCE_ROOT")"
 WORKER_PORT_BASE={worker_port}
 COMFY_PORT_BASE={comfy_port}
 WORKER_COUNT_REQUESTED={worker_count}
@@ -776,6 +1880,10 @@ fi
 HAS_SYSTEMD=0
 if test -d /run/systemd/system && systemctl list-units >/dev/null 2>&1; then
   HAS_SYSTEMD=1
+fi
+if test "$HAS_SYSTEMD" != "1"; then
+  echo "atomic secure worker deployment requires systemd; refusing credential-bearing nohup fallback" >&2
+  exit 1
 fi
 
 PHYSICAL_GPU_COUNT="$(nvidia-smi -L | wc -l | tr -d ' ')"
@@ -798,27 +1906,14 @@ fi
 
 mkdir -p "$REMOTE_ROOT"
 cd "$REMOTE_ROOT"
-python3 -m venv .venv
-.venv/bin/pip install -r gpu_worker/requirements.txt
+test -x "$WORKER_SOURCE_ROOT/.venv/bin/python" || {{
+  echo "immutable worker candidate venv is missing" >&2
+  exit 1
+}}
 
 if ! command -v aria2c >/dev/null 2>&1; then
   echo "Installing aria2c..." >&2
   apt-get install -y -q aria2 2>/dev/null || true
-fi
-
-if test "$HAS_SYSTEMD" = "1"; then
-  # Remove ALL filmforge/comfyui GPU unit files (not just stop them) so a box
-  # that previously deployed with more GPUs doesn't leave orphaned gpuN units
-  # behind. Stale units stay visible as phantom worker URLs in the deploy UI
-  # even when inactive. The loop below recreates exactly GPU_COUNT units.
-  for unit_file in /etc/systemd/system/filmforge-worker-gpu*.service /etc/systemd/system/comfyui-gpu*.service; do
-    test -e "$unit_file" || continue
-    unit="$(basename "$unit_file")"
-    systemctl stop "$unit" 2>/dev/null || true
-    systemctl disable "$unit" 2>/dev/null || true
-    rm -f "$unit_file"
-  done
-  systemctl daemon-reload 2>/dev/null || true
 fi
 
 # Stop the template's single ComfyUI process; multi-GPU mode owns one ComfyUI
@@ -870,6 +1965,27 @@ print(urls[idx] if idx < len(urls) else "")
 PY
 }}
 
+write_worker_secret_env() {{
+  idx="$1"
+  secret_dir="/etc/filmforge"
+  secret_path="$secret_dir/worker-gpu${{idx}}.env"
+  mkdir -p "$secret_dir"
+  chmod 0700 "$secret_dir"
+  secret_tmp="$(mktemp "$secret_dir/.worker-gpu${{idx}}.XXXXXX")"
+  chmod 0600 "$secret_tmp"
+  for key in WORKER_REGISTRATION_TOKEN RENDER_BROKER_WORKER_TOKEN WORKER_API_TOKEN GPU_WORKER_API_TOKEN; do
+    value="$(printenv "$key" 2>/dev/null || true)"
+    test -n "$value" || continue
+    case "$value" in
+      *[[:space:]]*) echo "worker credential contains unsupported whitespace" >&2; rm -f "$secret_tmp"; exit 1 ;;
+    esac
+    printf '%s=%s\n' "$key" "$value" >> "$secret_tmp"
+  done
+  install -m 0600 "$secret_tmp" "$secret_path"
+  rm -f "$secret_tmp"
+  printf '%s\n' "$secret_path"
+}}
+
 start_worker_no_systemd() {{
   idx="$1"
   worker_public_url="$2"
@@ -877,6 +1993,7 @@ start_worker_no_systemd() {{
   worker_port=$((WORKER_PORT_BASE + idx))
   pkill -f "uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}" || true
   declare -a worker_env
+  worker_env+=(PYTHONPATH="$WORKER_MODULE_DIR")
   worker_env+=(CUDA_VISIBLE_DEVICES="$idx")
   worker_env+=(COMFY_BASE_URL="http://127.0.0.1:${{comfy_port}}")
   worker_env+=(COMFY_OUTPUT_DIR="$COMFY_ROOT/output")
@@ -903,14 +2020,18 @@ start_worker_no_systemd() {{
   test -n "${{WORKER_REGISTRATION_TOKEN:-}}" && worker_env+=(WORKER_REGISTRATION_TOKEN="${{WORKER_REGISTRATION_TOKEN}}")
   test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}" && worker_env+=(RENDER_BROKER_WORKER_TOKEN="${{RENDER_BROKER_WORKER_TOKEN}}")
   test -n "${{WORKER_API_TOKEN:-}}" && worker_env+=(WORKER_API_TOKEN="${{WORKER_API_TOKEN}}")
-  nohup env "${{worker_env[@]}}" "$REMOTE_ROOT/.venv/bin/python" -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port "$worker_port" \\
-    >/tmp/gpu_worker_gpu${{idx}}.log 2>&1 </dev/null &
+  test -n "${{GPU_WORKER_API_TOKEN:-}}" && worker_env+=(GPU_WORKER_API_TOKEN="${{GPU_WORKER_API_TOKEN}}")
+  test -n "${{WORKER_API_AUTH_MODE:-}}" && worker_env+=(WORKER_API_AUTH_MODE="${{WORKER_API_AUTH_MODE}}")
+  test -n "${{WORKER_INPUT_URL_ALLOWED_HOSTS:-}}" && worker_env+=(WORKER_INPUT_URL_ALLOWED_HOSTS="${{WORKER_INPUT_URL_ALLOWED_HOSTS}}")
+  echo "non-systemd worker startup is disabled for atomic secure deploys" >&2
+  return 1
 }}
 
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   comfy_port=$((COMFY_PORT_BASE + idx))
   worker_port=$((WORKER_PORT_BASE + idx))
   comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+  worker_public_url="$(public_url_for_idx "$idx")"
   comfy_temp_dir="$COMFY_ROOT/temp/gpu${{idx}}"
   mkdir -p "$comfy_user_dir" "$comfy_temp_dir"
 
@@ -936,6 +2057,7 @@ UNIT
   if test -z "$worker_public_url" && test -n "${{WORKER_PUBLIC_URL:-}}" && test "$idx" = "0"; then
     worker_public_url="$WORKER_PUBLIC_URL"
   fi
+  worker_secret_env="$(write_worker_secret_env "$idx")"
 
   cat > "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
 [Unit]
@@ -945,16 +2067,20 @@ Wants=network-online.target comfyui-gpu${{idx}}.service
 
 [Service]
 Type=simple
-WorkingDirectory=$REMOTE_ROOT
+WorkingDirectory=$WORKER_MODULE_DIR
+Environment=PYTHONPATH=$WORKER_MODULE_DIR
+EnvironmentFile=$worker_secret_env
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
 Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
 Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
 Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
 Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
-Environment=WORKER_HOST=0.0.0.0
+Environment=WORKER_HOST=127.0.0.1
 Environment=WORKER_PORT=${{worker_port}}
 Environment=WORKER_NAME=filmforge-vast-${{HOSTNAME:-instance}}-gpu${{idx}}
 Environment=WORKER_PROVIDER=vast
+Environment=WORKER_CODE_RELEASE_ID=${{WORKER_CODE_RELEASE_ID}}
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
 Environment="WORKER_CAPABILITIES=${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}"
@@ -977,18 +2103,15 @@ UNIT
   if test -n "${{WORKER_INSTANCE_ID:-}}"; then
     echo "Environment=WORKER_INSTANCE_ID=${{WORKER_INSTANCE_ID}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
-  if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
-    echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  if test -n "${{WORKER_API_AUTH_MODE:-}}"; then
+    echo "Environment=WORKER_API_AUTH_MODE=${{WORKER_API_AUTH_MODE}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
-  if test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}"; then
-    echo "Environment=RENDER_BROKER_WORKER_TOKEN=${{RENDER_BROKER_WORKER_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
-  fi
-  if test -n "${{WORKER_API_TOKEN:-}}"; then
-    echo "Environment=WORKER_API_TOKEN=${{WORKER_API_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  if test -n "${{WORKER_INPUT_URL_ALLOWED_HOSTS:-}}"; then
+    echo "Environment=WORKER_INPUT_URL_ALLOWED_HOSTS=${{WORKER_INPUT_URL_ALLOWED_HOSTS}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
 
   cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
-ExecStart=$REMOTE_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}
+ExecStart=$WORKER_SOURCE_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 127.0.0.1 --port ${{worker_port}}
 Restart=always
 RestartSec=5
 
@@ -1024,6 +2147,12 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   done
 done
 
+if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
+  echo "WORKER_RELEASE_STAGED_ONLY=${{WORKER_CODE_RELEASE_ID}}"
+  echo "Worker code/GPU stack staged; worker start waits for receipt-gated cutover." >&2
+  exit 0
+fi
+
 if test "$HAS_SYSTEMD" = "1"; then
   for idx in $(seq 0 $((GPU_COUNT - 1))); do
     systemctl enable --now "filmforge-worker-gpu${{idx}}.service"
@@ -1048,6 +2177,15 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
     journalctl -u "filmforge-worker-gpu${{idx}}.service" -n 100 --no-pager >&2 || true
     exit 1
   fi
+
+  python3 - "/tmp/filmforge_worker_gpu${{idx}}_health.json" "$WORKER_CODE_RELEASE_ID" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as stream:
+    health = json.load(stream)
+if health.get("code_release_id") != sys.argv[2]:
+    raise SystemExit("worker health came from a different code release")
+PY
 
   worker_url="$(public_url_for_idx "$idx")"
   if test -z "$worker_url" && test -x /opt/instance-tools/bin/cloudflared; then
@@ -1079,6 +2217,8 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   fi
   echo "WORKER_HEALTH_GPU${{idx}}=$(cat /tmp/filmforge_worker_gpu${{idx}}_health.json)"
 done
+
+echo "WORKER_RELEASE_VERIFIED=${{WORKER_CODE_RELEASE_ID}}"
 
 if test "${{#WORKER_URLS[@]}}" -gt 0; then
   (IFS=,; echo "WORKER_URLS=${{WORKER_URLS[*]}}")
@@ -1149,14 +2289,6 @@ def restart_backend(backend_root: Path) -> None:
         )
 
     wait_for_url("http://127.0.0.1:8000/docs")
-
-
-def extract_worker_url(remote_output: str) -> str:
-    for line in remote_output.splitlines():
-        if line.startswith("WORKER_URL="):
-            return line.split("=", 1)[1].strip()
-    match = WORKER_URL_PATTERN.search(remote_output)
-    return match.group(0) if match else ""
 
 
 def extract_qwen_url(remote_output: str) -> str:
@@ -1383,26 +2515,13 @@ def _vast_direct_worker_url(
     *,
     timeout_sec: int = 180,
 ) -> str | None:
-    """Poll Vast for the public host:port mapping of a container port.
+    """Never advertise Vast's cleartext public port as a worker API URL.
 
-    With `--env '-p N:N'`, Vast publishes container port N on the host's public IP
-    at a Vast-assigned host port. Returns http://<public_ipaddr>:<HostPort>, or None
-    if the mapping doesn't appear before the deadline.
+    The port may remain published for provider diagnostics, but render traffic
+    carries a replayable bearer plus prompts/reference bytes and must use the
+    TLS tunnel created by the remote bootstrap.
     """
-    deadline = time.time() + timeout_sec
-    target_key = f"{container_port}/tcp"
-    while time.time() < deadline:
-        data = _vastai("show", "instance", instance_id, timeout=30)
-        if isinstance(data, dict) and "error" not in data:
-            public_ip = data.get("public_ipaddr")
-            ports = data.get("ports") or {}
-            if isinstance(public_ip, str) and public_ip and isinstance(ports, dict):
-                bindings = ports.get(target_key)
-                if isinstance(bindings, list) and bindings:
-                    host_port = bindings[0].get("HostPort")
-                    if host_port:
-                        return f"http://{public_ip}:{host_port}"
-        time.sleep(5)
+    del instance_id, container_port, timeout_sec
     return None
 
 
@@ -1448,7 +2567,7 @@ def _vast_offer_gpu_count(offer: dict) -> int:
             if match:
                 return max(1, int(match.group(1)))
 
-    return 1
+    return 0
 
 
 def _vast_remote_gpu_count(args: argparse.Namespace) -> int | None:
@@ -1510,6 +2629,32 @@ def _wait_for_vast_ssh_command(
     raise RuntimeError(f"Timed out waiting for Vast SSH access on instance {instance_id}")
 
 
+class _RejectWorkerRedirectHandler(HTTPRedirectHandler):
+    """Keep a deploy-time worker bearer on its validated origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _validated_worker_warmup_base_url(worker_url: str) -> str:
+    raw_url = str(worker_url or "")
+    if (
+        not raw_url
+        or raw_url != raw_url.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw_url)
+    ):
+        raise RuntimeError("Worker warmup URL is invalid")
+    # Warmup carries the worker bearer, so its transport policy is always the
+    # production policy even if the caller's ambient shell says test/dev.
+    _validate_worker_public_url_env(
+        [
+            "WORKER_API_AUTH_MODE=required",
+            f"WORKER_PUBLIC_URL={raw_url}",
+        ]
+    )
+    return raw_url.rstrip("/")
+
+
 def warm_remote_worker(
     worker_url: str,
     asset_groups: list[str],
@@ -1517,22 +2662,44 @@ def warm_remote_worker(
     api_token: str | None = None,
     timeout_sec: int = 3600,
 ) -> dict:
+    base_url = _validated_worker_warmup_base_url(worker_url)
     payload = json.dumps({"asset_groups": asset_groups}).encode()
     headers = {"Content-Type": "application/json"}
     if api_token:
         headers["Authorization"] = f"Bearer {api_token}"
     request = Request(
-        f"{worker_url.rstrip('/')}/assets/ensure",
+        f"{base_url}/assets/ensure",
         data=payload,
         headers=headers,
         method="POST",
     )
-    with urlopen(request, timeout=timeout_sec) as response:
-        body = response.read().decode()
+    # Disable both environment proxies and redirects before attaching the
+    # bearer. A hostile rented worker must not induce a second credentialed
+    # request to another origin.
+    opener = build_opener(ProxyHandler({}), _RejectWorkerRedirectHandler())
     try:
-        return json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Worker warmup returned invalid JSON: {exc}") from exc
+        with opener.open(request, timeout=timeout_sec) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            body = response.read(_MAX_WORKER_WARMUP_RESPONSE_BYTES + 1)
+    except HTTPError as exc:
+        if 300 <= int(exc.code) < 400:
+            raise RuntimeError("Worker warmup redirect rejected") from None
+        raise RuntimeError(f"Worker warmup request failed HTTP {exc.code}") from None
+    except Exception:
+        raise RuntimeError("Worker warmup request failed") from None
+    if 300 <= status < 400:
+        raise RuntimeError("Worker warmup redirect rejected")
+    if not 200 <= status < 300:
+        raise RuntimeError(f"Worker warmup request failed HTTP {status}")
+    if len(body) > _MAX_WORKER_WARMUP_RESPONSE_BYTES:
+        raise RuntimeError("Worker warmup response exceeded byte limit")
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("Worker warmup returned invalid JSON") from None
+    if not isinstance(result, dict):
+        raise RuntimeError("Worker warmup returned invalid JSON")
+    return result
 
 
 def register_worker_with_backend(backend_url: str, worker_name: str, worker_public_url: str) -> bool:
@@ -1765,7 +2932,10 @@ def verda_rehydrate_script(
     semantic_port: int = 8082,
     worker_plan: list[str] | None = None,
     vllm_port: int = 8100,
+    worker_source_root: str | None = None,
 ) -> str:
+    worker_source_root = worker_source_root or f"{DEFAULT_WORKER_RELEASES_ROOT}/current/gpu_worker"
+    security_gate = worker_security_stage_gate_script()
     if patch_content:
         _rehydrate_patch_block = (
             "mkdir -p \"$COMFY_ROOT/custom_nodes/filmforge_cuda_patch\"\n"
@@ -1782,6 +2952,8 @@ def verda_rehydrate_script(
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
+{security_gate}
+
 PUBLIC_IP={shlex.quote(public_ip)}
 WORKER_PORT_BASE={worker_port}
 COMFY_PORT_BASE={comfy_port}
@@ -1790,7 +2962,7 @@ WORKER_PLAN_SPEC={shlex.quote(",".join(worker_plan or []))}
 VLLM_PORT={vllm_port}
 REMOTE_ROOT={shlex.quote(remote_root)}
 COMFY_ROOT="/workspace/ComfyUI"
-WORKER_ROOT="/opt/filmforge_gpu_worker"
+WORKER_ROOT={shlex.quote(worker_source_root)}
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "nvidia-smi not found; GPU drivers are not ready" >&2
@@ -1969,19 +3141,6 @@ if ! mountpoint -q /mnt/data; then
   mount /dev/vdb /mnt/data
 fi
 VDB_UUID="$(blkid -s UUID -o value /dev/vdb 2>/dev/null || true)"
-
-# Remove ALL filmforge/comfyui GPU unit files (not just stop them) so a box
-# that previously deployed with more GPUs doesn't leave orphaned gpuN units
-# behind. Stale units stay visible as phantom worker URLs in the deploy UI
-# even when inactive. The loop below recreates exactly GPU_COUNT units.
-for unit_file in /etc/systemd/system/filmforge-worker-gpu*.service /etc/systemd/system/comfyui-gpu*.service; do
-  test -e "$unit_file" || continue
-  unit="$(basename "$unit_file")"
-  systemctl stop "$unit" 2>/dev/null || true
-  systemctl disable "$unit" 2>/dev/null || true
-  rm -f "$unit_file"
-done
-systemctl daemon-reload 2>/dev/null || true
 
 mkdir -p /mnt/data/ComfyUI/models /mnt/data/ComfyUI/input /mnt/data/ComfyUI/output /mnt/data/ComfyUI/temp
 mkdir -p "$COMFY_ROOT"
@@ -2217,33 +3376,9 @@ then
   exit 1
 fi
 
-# Pull latest worker code from git so rehydrate always runs the newest version.
-for _wr in /opt/filmforge_gpu_worker /workspace/filmforge_gpu_worker; do
-  if test -d "$_wr/.git"; then
-    echo "[verda] git pull in $_wr..." >&2
-    # </dev/null + GIT_PAGER=cat: this whole script is piped into `ssh ... bash -s`,
-    # so git MUST NOT inherit stdin — its ssh child / pager would consume the rest of
-    # the script, truncating worker-service creation and SIGPIPE-killing the deploy (141).
-    GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat git -C "$_wr" pull --ff-only </dev/null 2>&1 || true
-    break
-  fi
-done
-
 WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
-if test -f "$WORKER_ROOT/app.py"; then
-  mkdir -p "$WORKER_MODULE_DIR"
-  ln -sfn "$WORKER_ROOT" "$WORKER_MODULE_DIR/gpu_worker"
-elif test -f "$WORKER_ROOT/gpu_worker/app.py"; then
-  WORKER_MODULE_DIR="$WORKER_ROOT"
-elif test -f "$REMOTE_ROOT/app.py"; then
-  WORKER_ROOT="$REMOTE_ROOT"
-  WORKER_MODULE_DIR="$(dirname "$WORKER_ROOT")"
-  ln -sfn "$WORKER_ROOT" "$WORKER_MODULE_DIR/gpu_worker"
-elif test -f "$REMOTE_ROOT/gpu_worker/app.py"; then
-    WORKER_ROOT="$REMOTE_ROOT"
-    WORKER_MODULE_DIR="$WORKER_ROOT"
-else
-  echo "gpu_worker code not found at /opt/filmforge_gpu_worker or $REMOTE_ROOT" >&2
+if ! test -f "$WORKER_ROOT/app.py"; then
+  echo "immutable gpu_worker release is missing at $WORKER_ROOT" >&2
   exit 1
 fi
 if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
@@ -2257,6 +3392,38 @@ fi
 # This is why the deploy worked on 1-2 GPU boxes but failed on 8.
 GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | xargs)"
 VRAM_GB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0 | awk '{{printf "%.0f", $1 / 1024}}')"
+PUBLIC_URLS="${{WORKER_PUBLIC_URLS:-${{WORKER_PUBLIC_URL:-}}}}"
+
+public_url_for_idx() {{
+  idx="$1"
+  python3 - "$PUBLIC_URLS" "$idx" <<'PY'
+import sys
+urls = [u.strip() for u in (sys.argv[1] or "").split(",")]
+idx = int(sys.argv[2])
+print(urls[idx] if idx < len(urls) else "")
+PY
+}}
+
+write_worker_secret_env() {{
+  idx="$1"
+  secret_dir="/etc/filmforge"
+  secret_path="$secret_dir/worker-gpu${{idx}}.env"
+  mkdir -p "$secret_dir"
+  chmod 0700 "$secret_dir"
+  secret_tmp="$(mktemp "$secret_dir/.worker-gpu${{idx}}.XXXXXX")"
+  chmod 0600 "$secret_tmp"
+  for key in WORKER_REGISTRATION_TOKEN RENDER_BROKER_WORKER_TOKEN WORKER_API_TOKEN GPU_WORKER_API_TOKEN; do
+    value="$(printenv "$key" 2>/dev/null || true)"
+    test -n "$value" || continue
+    case "$value" in
+      *[[:space:]]*) echo "worker credential contains unsupported whitespace" >&2; rm -f "$secret_tmp"; exit 1 ;;
+    esac
+    printf '%s=%s\n' "$key" "$value" >> "$secret_tmp"
+  done
+  install -m 0600 "$secret_tmp" "$secret_path"
+  rm -f "$secret_tmp"
+  printf '%s\n' "$secret_path"
+}}
 
 # Choose ComfyUI VRAM flag based on detected VRAM.
 # Total model footprint (Flux dev ~24 GB + WAN21 ~14 GB + encoders ~7 GB) is ~45 GB.
@@ -2280,11 +3447,25 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   comfy_port=$((COMFY_PORT_BASE + idx))
   worker_port=$((WORKER_PORT_BASE + idx))
   comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+  worker_public_url="$(public_url_for_idx "$idx")"
 
   if test "$dept" = "none"; then
     echo "[verda] gpu${{idx}}: department=none — no worker started"
     continue
   fi
+  if test -z "$worker_public_url"; then
+    echo "[verda] gpu${{idx}}: TLS WORKER_PUBLIC_URLS entry is required" >&2
+    exit 1
+  fi
+  case "$worker_public_url" in
+    https://*) ;;
+    *)
+      case "${{WORKER_API_AUTH_MODE:-required}}" in
+        development|test) ;;
+        *) echo "[verda] gpu${{idx}}: public worker URL must use HTTPS" >&2; exit 1 ;;
+      esac
+      ;;
+  esac
 
   # ComfyUI is the generation runtime only. A vision/audio GPU runs a resident
   # server instead (vLLM / Parler+SA3), and a second ComfyUI process on that card
@@ -2313,6 +3494,7 @@ UNIT
   else
     unit_after="network-online.target"
   fi
+  worker_secret_env="$(write_worker_secret_env "$idx")"
 
   cat > "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
 [Unit]
@@ -2323,15 +3505,18 @@ Wants=${{unit_after}}
 [Service]
 Type=simple
 WorkingDirectory=$WORKER_MODULE_DIR
+EnvironmentFile=$worker_secret_env
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-Environment=WORKER_HOST=0.0.0.0
+Environment=WORKER_HOST=127.0.0.1
 Environment=WORKER_PORT=${{worker_port}}
 Environment=WORKER_NAME=filmforge-verda-${{PUBLIC_IP}}-gpu${{idx}}-${{dept}}
 Environment=WORKER_PROVIDER=verda
+Environment=WORKER_CODE_RELEASE_ID=${{WORKER_CODE_RELEASE_ID}}
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment="WORKER_GPU_NAME=${{GPU_NAME}}"
 Environment=WORKER_VRAM_GB=${{VRAM_GB}}
 Environment="WORKER_CAPABILITIES=$(caps_for_dept "$dept")"
-Environment=WORKER_PUBLIC_URL=http://${{PUBLIC_IP}}:${{worker_port}}
+Environment="WORKER_PUBLIC_URL=${{worker_public_url}}"
 Environment=WORKER_ID_FILE=/workspace/.filmforge_worker_gpu${{idx}}.id
 Environment=MODEL_DOWNLOAD_TIMEOUT_SEC=7200
 Environment=WORKER_MAX_CONCURRENT_JOBS=${{WORKER_MAX_CONCURRENT_JOBS:-10}}
@@ -2375,18 +3560,15 @@ UNIT
   if test -n "${{WORKER_INSTANCE_ID:-}}"; then
     echo "Environment=WORKER_INSTANCE_ID=${{WORKER_INSTANCE_ID}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
-  if test -n "${{WORKER_REGISTRATION_TOKEN:-}}"; then
-    echo "Environment=WORKER_REGISTRATION_TOKEN=${{WORKER_REGISTRATION_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  if test -n "${{WORKER_API_AUTH_MODE:-}}"; then
+    echo "Environment=WORKER_API_AUTH_MODE=${{WORKER_API_AUTH_MODE}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
-  if test -n "${{RENDER_BROKER_WORKER_TOKEN:-}}"; then
-    echo "Environment=RENDER_BROKER_WORKER_TOKEN=${{RENDER_BROKER_WORKER_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
-  fi
-  if test -n "${{WORKER_API_TOKEN:-}}"; then
-    echo "Environment=WORKER_API_TOKEN=${{WORKER_API_TOKEN}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
+  if test -n "${{WORKER_INPUT_URL_ALLOWED_HOSTS:-}}"; then
+    echo "Environment=WORKER_INPUT_URL_ALLOWED_HOSTS=${{WORKER_INPUT_URL_ALLOWED_HOSTS}}" >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
 
   cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
-ExecStart=$WORKER_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 0.0.0.0 --port ${{worker_port}}
+ExecStart=$WORKER_ROOT/.venv/bin/python -m uvicorn gpu_worker.app:app --host 127.0.0.1 --port ${{worker_port}}
 Restart=always
 RestartSec=5
 
@@ -2419,6 +3601,12 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   fi
 done
 
+if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
+  echo "WORKER_RELEASE_STAGED_ONLY=${{WORKER_CODE_RELEASE_ID}}"
+  echo "Worker code/GPU stack staged; worker start waits for receipt-gated cutover." >&2
+  exit 0
+fi
+
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   test "$(dept_for_idx "$idx")" != "none" || continue
   systemctl enable --now "filmforge-worker-gpu${{idx}}.service"
@@ -2438,9 +3626,19 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
     journalctl -u "filmforge-worker-gpu${{idx}}.service" -n 100 --no-pager >&2 || true
     exit 1
   fi
-  echo "WORKER_URL=http://${{PUBLIC_IP}}:${{port}}"
+  python3 - "/tmp/filmforge_worker_gpu${{idx}}_health.json" "$WORKER_CODE_RELEASE_ID" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as stream:
+    health = json.load(stream)
+if health.get("code_release_id") != sys.argv[2]:
+    raise SystemExit("worker health came from a different code release")
+PY
+  echo "WORKER_URL=$(public_url_for_idx "$idx")"
   echo "WORKER_HEALTH_GPU${{idx}}=$(cat /tmp/filmforge_worker_gpu${{idx}}_health.json)"
 done
+
+echo "WORKER_RELEASE_VERIFIED=${{WORKER_CODE_RELEASE_ID}}"
 
 echo "GPU_COUNT=${{GPU_COUNT}}"
 df -h /mnt/data
@@ -2792,8 +3990,14 @@ def verda_fresh_install_script(
     pytorch_index_url: str,
     remote_root: str,
     patch_content: str = "",
+    worker_source_root: str | None = None,
 ) -> str:
     """Install ComfyUI and gpu_worker onto a fresh Verda base image."""
+
+    # Retained as an API/CLI compatibility argument. Worker code now arrives as
+    # a verified immutable package; this installer never clones or pulls it.
+    del worker_repo_url
+    worker_source_root = worker_source_root or f"{DEFAULT_WORKER_RELEASES_ROOT}/current/gpu_worker"
 
     if patch_content:
         _cuda_patch_block = (
@@ -2808,14 +4012,16 @@ def verda_fresh_install_script(
             "echo \"[verda] WARNING: cuDNN patch not embedded — Blackwell SDP errors may occur\" >&2"
         )
 
+    security_gate = worker_security_stage_gate_script()
     return f"""#!/usr/bin/env bash
 set -euo pipefail
 
+{security_gate}
+
 export DEBIAN_FRONTEND=noninteractive
 REMOTE_ROOT={shlex.quote(remote_root)}
-WORKER_ROOT="/opt/filmforge_gpu_worker"
+WORKER_ROOT={shlex.quote(worker_source_root)}
 COMFY_ROOT="/workspace/ComfyUI"
-WORKER_REPO_URL={shlex.quote(worker_repo_url)}
 COMFY_REPO_URL={shlex.quote(comfy_repo_url)}
 PYTORCH_INDEX_URL={shlex.quote(pytorch_index_url)}
 
@@ -2896,7 +4102,7 @@ if ! apt-get install --simulate --no-install-recommends "${{BOOTSTRAP_PACKAGES[@
 fi
 apt_retry install -y --no-install-recommends "${{BOOTSTRAP_PACKAGES[@]}}"
 
-mkdir -p /opt /workspace "$REMOTE_ROOT"
+mkdir -p /opt /workspace "$REMOTE_ROOT" "$WORKER_RUNTIME_ROOT"
 
 # Mount the persistent data volume at /mnt/data early so it's available — but do
 # NOT bind-mount onto /workspace/ComfyUI/* yet. Cloning ComfyUI needs to
@@ -2948,22 +4154,21 @@ if test -b /dev/vdb; then
   done
 fi
 
-if test -d "$WORKER_ROOT/.git"; then
-  GIT_PAGER=cat git -C "$WORKER_ROOT" pull --ff-only </dev/null || true
-else
-  rm -rf "$WORKER_ROOT"
-  GIT_TERMINAL_PROMPT=0 git clone "$WORKER_REPO_URL" "$WORKER_ROOT" </dev/null
-fi
+test -f "$WORKER_ROOT/app.py" || {{
+  echo "immutable gpu_worker release is missing at $WORKER_ROOT" >&2
+  exit 1
+}}
 ln -sfn "$WORKER_ROOT" /opt/gpu_worker
 
-if ! test -x "$WORKER_ROOT/.venv/bin/python"; then
-  python3 -m venv "$WORKER_ROOT/.venv"
-fi
-"$WORKER_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools
-"$WORKER_ROOT/.venv/bin/python" -m pip install -r "$WORKER_ROOT/requirements.txt"
+test -x "$WORKER_ROOT/.venv/bin/python" || {{
+  echo "immutable worker candidate venv is missing" >&2
+  exit 1
+}}
 
 if test -d "$COMFY_ROOT/.git"; then
-  GIT_PAGER=cat git -C "$COMFY_ROOT" pull --ff-only </dev/null || true
+  # A dirty or divergent runtime checkout is an operator-visible conflict, not
+  # permission to continue into service rewrites with unknown code.
+  GIT_TERMINAL_PROMPT=0 GIT_PAGER=cat git -C "$COMFY_ROOT" pull --ff-only </dev/null
 else
   rm -rf "$COMFY_ROOT"
   GIT_TERMINAL_PROMPT=0 git clone "$COMFY_REPO_URL" "$COMFY_ROOT"
@@ -3064,10 +4269,50 @@ def extract_worker_urls(remote_output: str) -> list[str]:
     return urls
 
 
-def _verda_env_vars(args: argparse.Namespace) -> list[str]:
+def _remote_verified_worker_release(remote_output: str, release_id: str) -> bool:
+    return any(
+        line.strip() == f"WORKER_RELEASE_VERIFIED={release_id}"
+        for line in (remote_output or "").splitlines()
+    )
+
+
+def _verified_receipt_worker_urls(
+    remote_output: str,
+    *,
+    release_id: str,
+    public_urls: list[str],
+) -> list[str]:
+    """Return only contract-pinned URLs after the receipt gate proves cutover."""
+
+    if not _remote_verified_worker_release(remote_output, release_id):
+        return []
+    return list(public_urls)
+
+
+def _verda_env_vars(
+    args: argparse.Namespace,
+    *,
+    instance_id: str | None = None,
+) -> list[str]:
     env_vars = list(getattr(args, "env_vars", []) or [])
     existing_keys = {item.split("=", 1)[0] for item in env_vars if "=" in item}
-    for key in ("WORKER_REGISTRATION_TOKEN", "RENDER_BROKER_WORKER_TOKEN", "WORKER_API_TOKEN"):
+    if instance_id and "WORKER_INSTANCE_ID" not in existing_keys:
+        env_vars.append(f"WORKER_INSTANCE_ID={instance_id}")
+        existing_keys.add("WORKER_INSTANCE_ID")
+    for key in (
+        "WORKER_REGISTRATION_TOKEN",
+        "RENDER_BROKER_WORKER_TOKEN",
+        "WORKER_API_TOKEN",
+        "GPU_WORKER_API_TOKEN",
+        "WORKER_API_AUTH_MODE",
+        "WORKER_INPUT_URL_ALLOWED_HOSTS",
+        "WORKER_PUBLIC_URLS",
+        "WORKER_TUNNEL_LOCAL_URLS",
+        "WORKER_TUNNEL_UNITS",
+        "WORKER_SECURITY_STAGE_RECEIPTS",
+        "WORKER_DEPLOY_PHASE",
+        "FILMFORGE_BACKEND_CLIENT_AUTH_MODE",
+    ):
         if key not in existing_keys:
             value = _read_env_value(args.backend_env, key) or os.getenv(key)
             if value:
@@ -3101,6 +4346,7 @@ def _verda_env_vars(args: argparse.Namespace) -> list[str]:
         if value:
             env_vars.append(f"HF_TOKEN={value}")
             log("Auto-injected HF_TOKEN for audio provisioning")
+    _validate_worker_public_url_env(env_vars)
     return env_vars
 
 
@@ -3194,6 +4440,23 @@ def verda_deploy_with_spot_retries(args: argparse.Namespace) -> int:
 
 
 def verda_deploy(args: argparse.Namespace) -> int:
+    preflight_env_vars = _verda_env_vars(args)
+    worker_plan = parse_worker_plan(getattr(args, "verda_worker_plan", ""))
+    requested_worker_count = len(worker_plan) or int(args.verda_worker_count or 0)
+    if requested_worker_count < 1:
+        raise RuntimeError(
+            "Secure Verda deploy requires an explicit --verda-worker-count or worker plan"
+        )
+    security_contract = _preflight_complete_worker_contract(
+        preflight_env_vars,
+        worker_port=args.worker_port,
+        expected_worker_count=requested_worker_count or None,
+    )
+    contract_stage_receipts = list(security_contract["stage_receipts"])
+    contract_public_urls = list(security_contract["public_urls"])
+    deploy_phase = str(security_contract["deploy_phase"])
+    _prepare_worker_release_bundle(args)
+
     identity = (args.ssh_identity or Path.home() / ".ssh" / "id_ed25519").expanduser()
     if not identity.exists():
         raise RuntimeError(f"SSH private key not found at {identity}")
@@ -3238,8 +4501,9 @@ def verda_deploy(args: argparse.Namespace) -> int:
 
     _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
     ssh_command = f"ssh -i {identity} root@{ip}"
-    ssh_cmd, _, _ = parse_ssh_command(ssh_command)
+    ssh_cmd, scp_cmd, destination = parse_ssh_command(ssh_command)
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
+    scp_cmd = add_default_host_key_policy(scp_cmd)
     ssh_cmd = add_default_ssh_liveness_policy(ssh_cmd)
 
     pair_state = _probe_verda_rehydrate_state(ssh_cmd)
@@ -3250,6 +4514,21 @@ def verda_deploy(args: argparse.Namespace) -> int:
         f"comfy_ready={pair_state['COMFY_READY']} "
         f"bootstrap_ready={pair_state['BOOTSTRAP_READY']}"
     )
+    release_id, worker_source_root = _stage_worker_release_over_ssh(
+        ssh_cmd=ssh_cmd,
+        scp_cmd=scp_cmd,
+        destination=destination,
+        releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+        venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
+        bundle=getattr(args, "_prepared_worker_release_bundle", None),
+    )
+    preflight_env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
+    if deploy_phase == "stage-code":
+        log(
+            "Verda worker code candidate staged; skipping volume bootstrap, GPU, "
+            "unit, process, dataset, and backend work"
+        )
+        return 0
     if _verda_pair_needs_bootstrap(pair_state):
         log(
             "Incomplete reusable Verda volume pair detected; "
@@ -3262,7 +4541,11 @@ def verda_deploy(args: argparse.Namespace) -> int:
             pytorch_index_url=args.verda_pytorch_index_url,
             remote_root=args.remote_root,
             patch_content=_patch_path.read_text() if _patch_path.exists() else "",
+            worker_source_root=worker_source_root,
         )
+        install_exports = build_bootstrap_env_exports(preflight_env_vars)
+        if install_exports:
+            install_script = f"{install_exports}\n\n{install_script}"
         _run_verda_ssh_script(
             ssh_cmd,
             install_script,
@@ -3277,7 +4560,8 @@ def verda_deploy(args: argparse.Namespace) -> int:
             )
         log("Verda volume pair bootstrap completed; continuing with worker startup.")
 
-    env_vars = _verda_env_vars(args)
+    env_vars = _verda_env_vars(args, instance_id=instance_id)
+    env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
 
     _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     script = verda_rehydrate_script(
@@ -3287,10 +4571,11 @@ def verda_deploy(args: argparse.Namespace) -> int:
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
         patch_content=_patch_path.read_text() if _patch_path.exists() else "",
-        worker_plan=parse_worker_plan(getattr(args, "verda_worker_plan", "")),
+        worker_plan=worker_plan,
         vllm_port=getattr(args, "verda_vllm_port", 8100),
+        worker_source_root=worker_source_root,
     )
-    env_exports = build_env_exports(env_vars)
+    env_exports = build_bootstrap_env_exports(env_vars)
     if env_exports:
         script = f"{env_exports}\n\n{script}"
 
@@ -3315,19 +4600,52 @@ def verda_deploy(args: argparse.Namespace) -> int:
             capture_output=True,
             operation="starting workers on the rehydrated Verda VM",
         )
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
+    except Exception as exc:
+        if getattr(exc, "stdout", None):
             print(exc.stdout, end="")
-        if exc.stderr:
+        if getattr(exc, "stderr", None):
             print(exc.stderr, file=sys.stderr, end="")
+        _rollback_failed_worker_transaction_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+            worker_source_root=worker_source_root,
+            failed_release_id=release_id,
+            stage_receipt_paths=contract_stage_receipts,
+            deploy_phase=deploy_phase,
+        )
         raise
     if remote_result.stdout:
         print(remote_result.stdout, end="")
     if remote_result.stderr:
         print(remote_result.stderr, file=sys.stderr, end="")
 
-    worker_urls = extract_worker_urls(remote_result.stdout)
+    if _remote_verified_worker_release(remote_result.stdout, release_id):
+        _activate_or_rollback_worker_release_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+            release_id=release_id,
+            worker_source_root=worker_source_root,
+            stage_receipt_paths=contract_stage_receipts,
+        )
+    else:
+        log("Worker code remains an unactivated candidate pending secure cutover")
+
+    worker_urls = _verified_receipt_worker_urls(
+        remote_result.stdout,
+        release_id=release_id,
+        public_urls=contract_public_urls,
+    )
     if worker_urls:
+        _validate_worker_public_url_env(
+            [
+                *[
+                    item
+                    for item in env_vars
+                    if item.startswith("WORKER_API_AUTH_MODE=")
+                ],
+                f"WORKER_PUBLIC_URLS={','.join(worker_urls)}",
+            ]
+        )
         log("Verda worker URLs:")
         for url in worker_urls:
             log(f"  {url}")
@@ -3347,20 +4665,33 @@ def verda_deploy(args: argparse.Namespace) -> int:
 
     (SCRIPT_DIR / ".last_ssh_dest").write_text(f"-i {identity} root@{ip}\n")
 
-    if worker_urls and args.backend_env and args.backend_env.exists():
-        update_env_file(args.backend_env, worker_urls[0], semantic_url)
-        log(f"Updated {args.backend_env} with worker + semantic URLs")
-        if backend_is_running(args.backend_root):
-            restart_backend(args.backend_root)
-
-    if worker_urls and args.warm_asset_groups and not args.skip_warmup:
-        for url in worker_urls:
-            _run_worker_warmup(args, url)
+    if worker_urls:
+        log(
+            "Worker URLs are candidates only; backend routing remains unchanged "
+            "until prepare + receipt + authenticated cutover succeed"
+        )
 
     return 0
 
 
 def verda_fresh_deploy(args: argparse.Namespace) -> int:
+    preflight_env_vars = _verda_env_vars(args)
+    worker_plan = parse_worker_plan(getattr(args, "verda_worker_plan", ""))
+    requested_worker_count = len(worker_plan) or int(args.verda_worker_count or 0)
+    if requested_worker_count < 1:
+        raise RuntimeError(
+            "Secure Verda deploy requires an explicit --verda-worker-count or worker plan"
+        )
+    security_contract = _preflight_complete_worker_contract(
+        preflight_env_vars,
+        worker_port=args.worker_port,
+        expected_worker_count=requested_worker_count or None,
+    )
+    contract_stage_receipts = list(security_contract["stage_receipts"])
+    contract_public_urls = list(security_contract["public_urls"])
+    deploy_phase = str(security_contract["deploy_phase"])
+    _prepare_worker_release_bundle(args)
+
     identity = (args.ssh_identity or Path.home() / ".ssh" / "id_ed25519").expanduser()
     if not identity.exists():
         raise RuntimeError(f"SSH private key not found at {identity}")
@@ -3416,9 +4747,26 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
 
     _wait_for_verda_ssh(ip, identity, args.verda_ssh_timeout)
     ssh_command = f"ssh -i {identity} root@{ip}"
-    ssh_cmd, _, _ = parse_ssh_command(ssh_command)
+    ssh_cmd, scp_cmd, destination = parse_ssh_command(ssh_command)
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
+    scp_cmd = add_default_host_key_policy(scp_cmd)
     ssh_cmd = add_default_ssh_liveness_policy(ssh_cmd)
+
+    release_id, worker_source_root = _stage_worker_release_over_ssh(
+        ssh_cmd=ssh_cmd,
+        scp_cmd=scp_cmd,
+        destination=destination,
+        releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+        venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
+        bundle=getattr(args, "_prepared_worker_release_bundle", None),
+    )
+    preflight_env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
+    if deploy_phase == "stage-code":
+        log(
+            "Fresh Verda worker code candidate staged; skipping GPU stack, unit, "
+            "process, dataset, and backend work"
+        )
+        return 0
 
     _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     install_script = verda_fresh_install_script(
@@ -3427,7 +4775,11 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         pytorch_index_url=args.verda_pytorch_index_url,
         remote_root=args.remote_root,
         patch_content=_patch_path.read_text() if _patch_path.exists() else "",
+        worker_source_root=worker_source_root,
     )
+    preflight_exports = build_bootstrap_env_exports(preflight_env_vars)
+    if preflight_exports:
+        install_script = f"{preflight_exports}\n\n{install_script}"
     log("Installing worker stack on fresh Verda OS volume...")
     try:
         # Stream the long install directly into the deploy log. Besides making
@@ -3440,18 +4792,27 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
             capture_output=False,
             operation="installing the worker stack on the fresh Verda VM",
         )
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
+    except Exception as exc:
+        if getattr(exc, "stdout", None):
             print(exc.stdout, end="")
-        if exc.stderr:
+        if getattr(exc, "stderr", None):
             print(exc.stderr, file=sys.stderr, end="")
+        _rollback_failed_worker_transaction_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+            worker_source_root=worker_source_root,
+            failed_release_id=release_id,
+            stage_receipt_paths=contract_stage_receipts,
+            deploy_phase=deploy_phase,
+        )
         raise
     if install_result.stdout:
         print(install_result.stdout, end="")
     if install_result.stderr:
         print(install_result.stderr, file=sys.stderr, end="")
 
-    env_vars = _verda_env_vars(args)
+    env_vars = _verda_env_vars(args, instance_id=instance_id)
+    env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
     _patch_path = Path(__file__).parent / "comfy_torch_patch.py"
     script = verda_rehydrate_script(
         public_ip=ip,
@@ -3460,10 +4821,11 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         worker_count=args.verda_worker_count,
         remote_root=args.remote_root,
         patch_content=_patch_path.read_text() if _patch_path.exists() else "",
-        worker_plan=parse_worker_plan(getattr(args, "verda_worker_plan", "")),
+        worker_plan=worker_plan,
         vllm_port=getattr(args, "verda_vllm_port", 8100),
+        worker_source_root=worker_source_root,
     )
-    env_exports = build_env_exports(env_vars)
+    env_exports = build_bootstrap_env_exports(env_vars)
     if env_exports:
         script = f"{env_exports}\n\n{script}"
 
@@ -3476,19 +4838,52 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
             capture_output=True,
             operation="starting workers on the fresh Verda VM",
         )
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
+    except Exception as exc:
+        if getattr(exc, "stdout", None):
             print(exc.stdout, end="")
-        if exc.stderr:
+        if getattr(exc, "stderr", None):
             print(exc.stderr, file=sys.stderr, end="")
+        _rollback_failed_worker_transaction_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+            worker_source_root=worker_source_root,
+            failed_release_id=release_id,
+            stage_receipt_paths=contract_stage_receipts,
+            deploy_phase=deploy_phase,
+        )
         raise
     if remote_result.stdout:
         print(remote_result.stdout, end="")
     if remote_result.stderr:
         print(remote_result.stderr, file=sys.stderr, end="")
 
-    worker_urls = extract_worker_urls(remote_result.stdout)
+    if _remote_verified_worker_release(remote_result.stdout, release_id):
+        _activate_or_rollback_worker_release_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=DEFAULT_WORKER_RELEASES_ROOT,
+            release_id=release_id,
+            worker_source_root=worker_source_root,
+            stage_receipt_paths=contract_stage_receipts,
+        )
+    else:
+        log("Worker code remains an unactivated candidate pending secure cutover")
+
+    worker_urls = _verified_receipt_worker_urls(
+        remote_result.stdout,
+        release_id=release_id,
+        public_urls=contract_public_urls,
+    )
     if worker_urls:
+        _validate_worker_public_url_env(
+            [
+                *[
+                    item
+                    for item in env_vars
+                    if item.startswith("WORKER_API_AUTH_MODE=")
+                ],
+                f"WORKER_PUBLIC_URLS={','.join(worker_urls)}",
+            ]
+        )
         log("Fresh Verda worker URLs:")
         for url in worker_urls:
             log(f"  {url}")
@@ -3559,10 +4954,6 @@ def _runpod_get_ssh_port(pod: dict) -> tuple[str, int] | None:
     return None
 
 
-def _runpod_proxy_url(pod_id: str, worker_port: int) -> str:
-    return f"https://{pod_id}-{worker_port}.proxy.runpod.net"
-
-
 def _wait_for_ssh(ip: str, port: int, identity: Path, timeout: int) -> bool:
     """Poll until SSH accepts connections. Returns True on success."""
     deadline = time.time() + timeout
@@ -3593,6 +4984,13 @@ def _wait_for_ssh(ip: str, port: int, identity: Path, timeout: int) -> bool:
 
 def runpod_deploy(args: argparse.Namespace) -> int:
     """Fully automated RunPod deploy: find/create pod → wait → deploy worker → update env."""
+    _preflight_complete_worker_contract(
+        _resolve_worker_security_env(args),
+        worker_port=args.worker_port,
+        expected_worker_count=1,
+    )
+    _prepare_worker_release_bundle(args)
+
     try:
         import runpod as rp  # type: ignore[import]
     except ImportError:
@@ -3704,8 +5102,10 @@ def runpod_deploy(args: argparse.Namespace) -> int:
 
 def _run_worker_warmup(args: argparse.Namespace, worker_url: str) -> None:
     token = (
-        _read_env_value(args.backend_env, "WORKER_API_TOKEN")
+        _read_env_value(args.backend_env, "GPU_WORKER_API_TOKEN")
+        or _read_env_value(args.backend_env, "WORKER_API_TOKEN")
         or _read_env_value(args.backend_env, "RENDER_BROKER_WORKER_TOKEN")
+        or os.getenv("GPU_WORKER_API_TOKEN")
         or os.getenv("WORKER_API_TOKEN")
         or os.getenv("RENDER_BROKER_WORKER_TOKEN")
     )
@@ -3725,9 +5125,19 @@ def vast_deploy(args: argparse.Namespace) -> int:
 
     offer = _select_vast_offer(args)
     offer_gpu_count = _vast_offer_gpu_count(offer)
+    if offer_gpu_count < 1:
+        raise RuntimeError(
+            "Selected Vast offer has no authoritative GPU count; refusing secure deploy"
+        )
     requested_worker_count = int(getattr(args, "vast_worker_count", 0) or 0)
     effective_worker_count = requested_worker_count if requested_worker_count > 0 else offer_gpu_count
     effective_worker_count = max(1, effective_worker_count)
+    _preflight_complete_worker_contract(
+        _resolve_worker_security_env(args),
+        worker_port=args.worker_port,
+        expected_worker_count=effective_worker_count,
+    )
+    _prepare_worker_release_bundle(args)
     # When Vast's offer payload omits the GPU count, still expose the first two
     # worker ports so a 2-GPU host can use direct URLs after SSH confirms it.
     port_publish_count = effective_worker_count
@@ -3857,10 +5267,8 @@ def vast_deploy(args: argparse.Namespace) -> int:
             args.env_vars = env_vars
     else:
         log(
-            f"Could not resolve Vast direct port mapping for worker port(s) "
-            f"{args.worker_port}..{args.worker_port + effective_worker_count - 1} "
-            f"within {args.vast_boot_timeout}s; "
-            f"falling back to cloudflared."
+            "Vast cleartext public worker URLs are disabled; using the "
+            "TLS cloudflared worker endpoint."
         )
 
     exit_code, worker_url = _do_deploy(args)
@@ -3879,57 +5287,81 @@ def _do_deploy(args: argparse.Namespace, pod_id: str | None = None) -> tuple[int
     ssh_cmd = add_default_host_key_policy(ssh_cmd)
     scp_cmd = add_default_host_key_policy(scp_cmd)
 
-    run([*ssh_cmd, "mkdir", "-p", args.remote_root])
-    # Clone or update gpu_worker from GitHub
-    clone_script = f"""set -euo pipefail
-REMOTE_ROOT={shlex.quote(args.remote_root)}
-# Ensure git is available on the remote
-if ! command -v git >/dev/null 2>&1; then
-  echo "Installing git..." >&2
-  apt-get update -qq 2>/dev/null || true
-  apt-get install -y -qq git 2>/dev/null || true
-fi
-cd "$REMOTE_ROOT"
-if test -d gpu_worker/.git; then
-  echo "gpu_worker already exists, updating..." >&2
-  cd gpu_worker
-  git pull origin main 2>/dev/null || echo "git pull failed" >&2
-  cd ..
-else
-  rm -rf gpu_worker
-  echo "Cloning gpu_worker from GitHub..." >&2
-  GIT_TERMINAL_PROMPT=0 git clone https://github.com/taxydriver/gpu_worker.git gpu_worker
-fi
-"""
-    run([*ssh_cmd, "bash", "-s"], input_text=clone_script)
+    # Resolve and validate the *whole* worker/tunnel/backend contract before the
+    # first remote mkdir, package upload, dependency install, GPU probe, restart,
+    # or provider-side setup. This is the H100 regression gate: a missing TLS
+    # URL can no longer surface only after a tolerated git-pull conflict.
+    env_vars = _resolve_worker_security_env(args)
+    existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
+    requested_vast_workers = int(getattr(args, "vast_worker_count", 0) or 0)
+    effective_vast_workers = int(
+        getattr(args, "_vast_effective_worker_count", 0) or requested_vast_workers or 1
+    )
+    is_vast_multi = effective_vast_workers > 1
+    worker_count_requested = int(getattr(args, "worker_count", -1))
+    # Secure deployment always uses the systemd path, even for one GPU. The
+    # legacy nohup path exposed credentials in argv and has no atomic profile
+    # or process rollback contract.
+    is_ssh_multi = True
+    is_multi = is_vast_multi or is_ssh_multi
+    if not pod_id and not getattr(args, "vast", False) and worker_count_requested < 1:
+        raise RuntimeError(
+            "Secure SSH deploy requires an explicit --worker-count before remote mutation"
+        )
+    auto_env_keys = [
+        "FILMFORGE_BACKEND_URL",
+        "WORKER_REGISTRATION_TOKEN",
+        "WORKER_API_TOKEN",
+        "GPU_WORKER_API_TOKEN",
+        "WORKER_API_AUTH_MODE",
+        "WORKER_INPUT_URL_ALLOWED_HOSTS",
+        "WORKER_PUBLIC_URLS",
+        "WORKER_TUNNEL_LOCAL_URLS",
+        "WORKER_TUNNEL_UNITS",
+        "WORKER_SECURITY_STAGE_RECEIPTS",
+        "WORKER_DEPLOY_PHASE",
+        "FILMFORGE_BACKEND_CLIENT_AUTH_MODE",
+        "WORKER_CAPABILITIES",
+    ]
+    if not is_multi:
+        auto_env_keys.append("RENDER_BROKER_WORKER_ID")
+    for key in auto_env_keys:
+        if key not in existing_keys:
+            value = _read_env_value(args.backend_env, key)
+            if value:
+                env_vars.append(f"{key}={value}")
+                log(f"Auto-injected {key} from backend .env")
+    existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
+    expected_worker_count = (
+        effective_vast_workers
+        if getattr(args, "vast", False)
+        else 1
+        if pod_id
+        else worker_count_requested
+        if worker_count_requested > 0
+        else None
+    )
+    security_contract = _preflight_complete_worker_contract(
+        env_vars,
+        worker_port=args.worker_port,
+        expected_worker_count=expected_worker_count,
+    )
+    contract_public_urls = list(security_contract["public_urls"])
+    contract_stage_receipts = list(security_contract["stage_receipts"])
+    deploy_phase = str(security_contract["deploy_phase"])
+
+    releases_root = f"{args.remote_root.rstrip('/')}/worker_releases"
+    release_id, worker_source_root = _stage_worker_release_over_ssh(
+        ssh_cmd=ssh_cmd,
+        scp_cmd=scp_cmd,
+        destination=destination,
+        releases_root=releases_root,
+        venv_path=f"{args.remote_root.rstrip('/')}/.venv",
+        bundle=getattr(args, "_prepared_worker_release_bundle", None),
+    )
+    env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
 
     try:
-        # Auto-inject critical env vars from backend .env if not already provided
-        env_vars = list(getattr(args, "env_vars", []) or [])
-        existing_keys = {v.split("=", 1)[0] for v in env_vars if "=" in v}
-        requested_vast_workers = int(getattr(args, "vast_worker_count", 0) or 0)
-        effective_vast_workers = int(
-            getattr(args, "_vast_effective_worker_count", 0) or requested_vast_workers or 1
-        )
-        is_vast_multi = effective_vast_workers > 1
-        # Plain-SSH deploys (no --vast/--verda) previously always fell back to the
-        # legacy single-worker remote_script, which never starts ComfyUI and pins
-        # one worker to port 9000 — wrong for any multi-GPU box. --worker-count
-        # routes the SSH path through the GPU-agnostic systemd script instead.
-        # -1 (default) auto-detects the box's physical GPUs remotely (worker_count=0
-        # tells the script to use PHYSICAL_GPU_COUNT); 1 keeps the legacy flow.
-        worker_count_requested = int(getattr(args, "worker_count", -1))
-        is_ssh_multi = worker_count_requested != 1
-        is_multi = is_vast_multi or is_ssh_multi
-        auto_env_keys = ["FILMFORGE_BACKEND_URL", "WORKER_REGISTRATION_TOKEN", "WORKER_CAPABILITIES"]
-        if not is_multi:
-            auto_env_keys.append("RENDER_BROKER_WORKER_ID")
-        for key in auto_env_keys:
-            if key not in existing_keys:
-                value = _read_env_value(args.backend_env, key)
-                if value:
-                    env_vars.append(f"{key}={value}")
-                    log(f"Auto-injected {key} from backend .env")
 
         if is_vast_multi:
             script = vast_multi_gpu_script(
@@ -3937,33 +5369,17 @@ fi
                 worker_port=args.worker_port,
                 comfy_port=args.vast_comfy_port,
                 worker_count=effective_vast_workers,
+                worker_source_root=worker_source_root,
             )
         elif is_ssh_multi:
             # worker_count_requested == -1 means auto-detect: pass 0 to the script
             # so it uses the box's PHYSICAL_GPU_COUNT.
             script_worker_count = max(worker_count_requested, 0)
-            # The multi-GPU script only stamps WORKER_PUBLIC_URL on gpu0 unless we
-            # supply WORKER_PUBLIC_URLS. On an SSH box with a public IP, every
-            # gpuN needs its own http://<ip>:<port> so the backend can route to it.
-            gpu_count = script_worker_count
-            if gpu_count == 0:
-                try:
-                    probe = run(
-                        [*ssh_cmd, "nvidia-smi", "-L"],
-                        capture_output=True,
-                    )
-                    gpu_count = len([
-                        line for line in probe.stdout.splitlines() if line.startswith("GPU ")
-                    ])
-                except subprocess.CalledProcessError:
-                    gpu_count = 0
-            host = destination.split("@")[-1] if destination else ""
-            if host and gpu_count > 0 and "WORKER_PUBLIC_URLS" not in existing_keys:
-                urls = ",".join(
-                    f"http://{host}:{args.worker_port + i}" for i in range(gpu_count)
+            if "WORKER_PUBLIC_URLS" not in existing_keys:
+                log(
+                    "SSH multi-GPU: no preset TLS worker URLs; remote bootstrap "
+                    "will create cloudflared endpoints."
                 )
-                env_vars.append(f"WORKER_PUBLIC_URLS={urls}")
-                log(f"SSH multi-GPU: set WORKER_PUBLIC_URLS for {gpu_count} GPU(s)")
             log(
                 "SSH multi-GPU deploy: using systemd multi-GPU script "
                 f"(worker_count={'auto' if script_worker_count == 0 else script_worker_count})"
@@ -3973,9 +5389,14 @@ fi
                 worker_port=args.worker_port,
                 comfy_port=args.vast_comfy_port,
                 worker_count=script_worker_count,
+                worker_source_root=worker_source_root,
             )
         else:
-            script = remote_script(args.remote_root, args.worker_port)
+            script = remote_script(
+                args.remote_root,
+                args.worker_port,
+                worker_source_root=worker_source_root,
+            )
         if getattr(args, "qwen_sidecar", False):
             # One GPU = one department: the Qwen vision sidecar pins ~25% of VRAM
             # and starved the render models (an OOM cause), so it must not share a
@@ -3996,7 +5417,8 @@ fi
             env_vars.append(f"QWEN_MODEL={args.qwen_model}")
             env_vars.append(f"QWEN_GPU_FRACTION={args.qwen_gpu_fraction}")
             log("Qwen3-VL vision sidecar enabled for this deploy")
-        env_exports = build_env_exports(env_vars)
+        _validate_worker_public_url_env(env_vars)
+        env_exports = build_bootstrap_env_exports(env_vars)
         if env_exports:
             script = f"{env_exports}\n\n{script}"
         remote_result = run(
@@ -4004,69 +5426,81 @@ fi
             input_text=script,
             capture_output=True,
         )
-    except subprocess.CalledProcessError as exc:
-        if exc.stdout:
+    except Exception as exc:
+        if getattr(exc, "stdout", None):
             print(exc.stdout, end="")
-        if exc.stderr:
+        if getattr(exc, "stderr", None):
             print(exc.stderr, file=sys.stderr, end="")
-        log(f"Remote bootstrap failed with exit code {exc.returncode}")
-        return exc.returncode or 1, None
+        _rollback_failed_worker_transaction_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=releases_root,
+            worker_source_root=worker_source_root,
+            failed_release_id=release_id,
+            stage_receipt_paths=contract_stage_receipts,
+            deploy_phase=deploy_phase,
+        )
+        return_code = int(getattr(exc, "returncode", 1) or 1)
+        log(f"Remote bootstrap failed with exit code {return_code}")
+        return return_code, None
 
     if remote_result.stdout:
         print(remote_result.stdout, end="")
     if remote_result.stderr:
         print(remote_result.stderr, file=sys.stderr, end="")
 
-    worker_urls = extract_worker_urls(remote_result.stdout)
+    if _remote_verified_worker_release(remote_result.stdout, release_id):
+        _activate_or_rollback_worker_release_over_ssh(
+            ssh_cmd=ssh_cmd,
+            releases_root=releases_root,
+            release_id=release_id,
+            worker_source_root=worker_source_root,
+            stage_receipt_paths=contract_stage_receipts,
+        )
+    else:
+        log("Worker code remains an unactivated candidate pending secure cutover")
+
+    worker_urls = _verified_receipt_worker_urls(
+        remote_result.stdout,
+        release_id=release_id,
+        public_urls=contract_public_urls,
+    )
     if worker_urls:
+        _validate_worker_public_url_env(
+            [
+                *[
+                    item
+                    for item in env_vars
+                    if item.startswith("WORKER_API_AUTH_MODE=")
+                ],
+                f"WORKER_PUBLIC_URLS={','.join(worker_urls)}",
+            ]
+        )
         log("Worker URLs:")
         for url in worker_urls:
             log(f"  {url}")
         setattr(args, "_last_worker_urls", worker_urls)
-
-    # For RunPod: use proxy URL since cloudflared won't be available
-    worker_url = worker_urls[0] if worker_urls else extract_worker_url(remote_result.stdout)
-    if not worker_url and pod_id:
-        worker_url = _runpod_proxy_url(pod_id, args.worker_port)
-        log(f"Using RunPod proxy URL: {worker_url}")
-        print(f"WORKER_URL={worker_url}")
-    if not worker_url and not pod_id and args.backend_env.exists():
-        # SSH-mode deploy: try to infer pod_id from existing GPU_WORKER_BASE_URL in .env
-        # e.g. https://kafmkv5qfjjdqm-9000.proxy.runpod.net → pod_id=kafmkv5qfjjdqm
-        existing = args.backend_env.read_text()
-        m = re.search(r"GPU_WORKER_BASE_URL=https://([\w]+)-\d+\.proxy\.runpod\.net", existing)
-        if m:
-            pod_id = m.group(1)
-            worker_url = _runpod_proxy_url(pod_id, args.worker_port)
-            log(f"Inferred RunPod proxy URL from existing .env: {worker_url}")
-            print(f"WORKER_URL={worker_url}")
+    worker_url = worker_urls[0] if worker_urls else None
+    if worker_url:
+        _validate_worker_public_url_env(
+            [
+                *[
+                    item
+                    for item in env_vars
+                    if item.startswith("WORKER_API_AUTH_MODE=")
+                ],
+                f"WORKER_PUBLIC_URL={worker_url}",
+            ]
+        )
 
     qwen_url = extract_qwen_url(remote_result.stdout)
     if qwen_url:
         log(f"Qwen vision sidecar URL: {qwen_url}")
 
-    if worker_url and not args.skip_backend_env and args.backend_env.exists():
-        update_env_file(args.backend_env, worker_url, qwen_url=qwen_url or None)
-        log(f"Updated {args.backend_env} with GPU_WORKER_BASE_URL={worker_url}")
-        if qwen_url:
-            log(f"Updated {args.backend_env} with QWEN_BASE_URL={qwen_url}")
-    elif worker_url and not args.skip_backend_env:
-        log(f"Backend env not found at {args.backend_env}; skipped env update.")
-    elif not worker_url:
-        log("No public worker URL found; skipped backend env update.")
-
-    if worker_url and not args.skip_backend_restart:
-        should_restart = backend_is_running(args.backend_root) or args.start_backend
-        if should_restart and args.backend_root.exists():
-            restart_backend(args.backend_root)
-            log("Local backend restarted on http://127.0.0.1:8000")
-        else:
-            log("Local backend is not running; skipped restart.")
-    elif not worker_url and not args.skip_backend_restart:
-        log("No public worker URL found; skipped backend restart.")
-
     if worker_url:
-        log("Worker registration is handled by FILMFORGE_BACKEND_URL / render broker heartbeat.")
+        log(
+            "Worker URL is a candidate only; this deploy does not mutate or restart "
+            "the backend before receipt-gated cutover"
+        )
 
     # Save SSH dest so --logs can reconnect without re-specifying the host
     ssh_dest = args.ssh_command
@@ -4368,7 +5802,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verda-worker-repo-url",
         default=os.getenv("VERDA_WORKER_REPO_URL", DEFAULT_WORKER_REPO_URL),
-        help=f"gpu_worker git URL for --verda-fresh. Default: {DEFAULT_WORKER_REPO_URL}",
+        help=(
+            "Deprecated compatibility option; worker code is deployed from the "
+            "local content-addressed release package and no remote worker checkout is pulled."
+        ),
     )
     parser.add_argument(
         "--verda-comfy-repo-url",
@@ -4483,7 +5920,15 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         metavar="KEY=VALUE",
-        help="Environment variable to export before remote bootstrap. Can be repeated.",
+        help=(
+            "Non-credential environment variable for remote bootstrap. "
+            "Credential-shaped keys are rejected; use --env-file."
+        ),
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        help="Mode-0600 deployment env file; keeps credentials out of process argv.",
     )
     parser.add_argument(
         "--warm-asset-group",
@@ -4499,6 +5944,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+
+    for item in args.env_vars:
+        key = item.partition("=")[0].strip()
+        if _CREDENTIAL_ENV_KEY.search(key):
+            parser.error(
+                f"credential key {key} is forbidden in --env; use --env-file"
+            )
+    if args.env_file:
+        try:
+            args.env_vars.extend(_load_worker_deploy_env_file(args.env_file))
+        except RuntimeError as exc:
+            parser.error(str(exc))
 
     # Manual mutual-exclusion check (Python 3.13 disallows positional in exclusive group)
     flags = [args.runpod, args.vast, args.verda, args.verda_fresh]

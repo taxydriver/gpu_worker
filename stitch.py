@@ -23,18 +23,119 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import subprocess
-import tempfile
-import urllib.request
 from typing import Any, Optional
 
-import httpx
+from gpu_worker.comfy_client import (
+    _RemoteInputRejected,
+    _open_private_staging_file,
+    _open_pinned_http_pool,
+    _validate_remote_input_url,
+)
+from gpu_worker.utils import is_non_empty_file, safe_unlink
 
 LOGGER = logging.getLogger("filmforge.worker.stitch")
+_MAX_STITCH_INPUT_BYTES = 1024 * 1024 * 1024
+_STITCH_CONNECT_TIMEOUT_SEC = 5
+_STITCH_READ_TIMEOUT_SEC = 120
+_STITCH_VIDEO_TYPES = {"video/mp4", "video/quicktime", "video/webm"}
+_STITCH_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4"}
+_MAX_SIGNED_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _download(url: str, dest: str) -> None:
-    urllib.request.urlretrieve(url, dest)
+    """Fetch one allowlisted stitch input with redirects and size bounded."""
+
+    target = _validate_remote_input_url(url)
+    destination = Path(dest)
+    suffix = destination.suffix.lower()
+    allowed_types = (
+        _STITCH_AUDIO_TYPES
+        if suffix in {".mp3", ".wav", ".m4a"}
+        else _STITCH_VIDEO_TYPES
+    )
+    temporary: Path | None = None
+    handle = None
+    response = None
+    pool = None
+    try:
+        pool = _open_pinned_http_pool(
+            target,
+            connect_timeout=_STITCH_CONNECT_TIMEOUT_SEC,
+            read_timeout=_STITCH_READ_TIMEOUT_SEC,
+        )
+        response = pool.request(
+            "GET",
+            target.request_target,
+            headers={"Host": target.host_header},
+            redirect=False,
+            retries=False,
+            preload_content=False,
+        )
+        if 300 <= response.status < 400:
+            raise RuntimeError("stitch input redirect is forbidden")
+        if not 200 <= response.status < 300:
+            raise RuntimeError("stitch input request failed")
+        media_type = str(response.headers.get("Content-Type") or "").split(
+            ";", 1
+        )[0].strip().lower()
+        if media_type not in allowed_types:
+            raise RuntimeError("stitch input content type is not allowed")
+        content_encoding = str(
+            response.headers.get("Content-Encoding") or "identity"
+        ).strip().lower()
+        if content_encoding not in {"", "identity"}:
+            raise RuntimeError("stitch input content encoding is not allowed")
+        content_length = str(response.headers.get("Content-Length") or "").strip()
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                raise RuntimeError("stitch input content length is invalid") from None
+            if declared_length < 0 or declared_length > _MAX_STITCH_INPUT_BYTES:
+                raise RuntimeError("stitch input exceeds byte limit")
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary, handle = _open_private_staging_file(destination)
+        total_bytes = 0
+        for chunk in response.stream(amt=1024 * 1024, decode_content=False):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > _MAX_STITCH_INPUT_BYTES:
+                raise RuntimeError("stitch input exceeds byte limit")
+            handle.write(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
+        if not is_non_empty_file(temporary):
+            raise RuntimeError("stitch input is empty")
+        os.replace(temporary, destination)
+        temporary = None
+    except _RemoteInputRejected:
+        raise
+    except Exception:
+        raise RuntimeError("stitch input fetch failed") from None
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
+        if temporary is not None:
+            safe_unlink(temporary)
 
 
 def _probe_duration_sec(path: str) -> float:
@@ -210,7 +311,51 @@ def upload_via_signed_put(signed_put_url: str, file_path: str, content_type: str
     No storage credentials needed on this box — the backend minted the signed URL
     for a known path. Raises on non-2xx so the backend can fall back / retry.
     """
-    with open(file_path, "rb") as fh:
-        data = fh.read()
-    resp = httpx.put(signed_put_url, content=data, headers={"content-type": content_type}, timeout=600.0)
-    resp.raise_for_status()
+    target = _validate_remote_input_url(signed_put_url)
+    if target.scheme != "https":
+        raise RuntimeError("signed output upload requires HTTPS")
+    normalized_content_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if normalized_content_type not in _STITCH_VIDEO_TYPES:
+        raise RuntimeError("signed output upload content type is not allowed")
+    pool = None
+    response = None
+    try:
+        size = os.path.getsize(file_path)
+        if size <= 0 or size > _MAX_SIGNED_UPLOAD_BYTES:
+            raise RuntimeError("signed output upload file size is not allowed")
+        pool = _open_pinned_http_pool(
+            target,
+            connect_timeout=_STITCH_CONNECT_TIMEOUT_SEC,
+            read_timeout=600.0,
+        )
+        with open(file_path, "rb") as handle:
+            response = pool.request(
+                "PUT",
+                target.request_target,
+                body=handle,
+                headers={
+                    "Host": target.host_header,
+                    "Content-Type": normalized_content_type,
+                    "Content-Length": str(size),
+                },
+                redirect=False,
+                retries=False,
+                preload_content=True,
+            )
+        if not 200 <= response.status < 300:
+            raise RuntimeError("signed upload request failed")
+    except _RemoteInputRejected:
+        raise
+    except Exception:
+        raise RuntimeError("signed output upload failed") from None
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
