@@ -413,3 +413,47 @@ def test_command_runner_failure_quotes_captured_streams() -> None:
         one.CommandRunner().run(
             ["/bin/sh", "-c", "echo progress; echo argparse-said-no >&2; exit 7"]
         )
+
+
+class _RemoteRunner(one.CommandRunner):
+    def __init__(self, readlink_stdout: str, readlink_rc: int) -> None:
+        self.readlink_stdout = readlink_stdout
+        self.readlink_rc = readlink_rc
+        self.commands: list[list[str]] = []
+
+    def run(self, command, **kwargs):
+        del kwargs
+        command = list(command)
+        self.commands.append(command)
+        if "readlink" in command:
+            return subprocess.CompletedProcess(
+                command, self.readlink_rc, self.readlink_stdout, ""
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+def test_rehydrated_fossil_profile_is_retired_before_stage() -> None:
+    runner = _RemoteRunner(
+        "/etc/filmforge/worker-security/releases/auto-1786000000-dead-gpu0\n", 0
+    )
+    one._retire_rehydrated_profile(
+        runner=runner,
+        ssh_cmd=["ssh", "root@example"],
+        python="/opt/rel/.venv/bin/python",
+        manage="/opt/rel/gpu_worker/manage_worker_release.py",
+    )
+    rollback = [c for c in runner.commands if "rollback" in c]
+    assert len(rollback) == 1
+    assert "--release-id" in rollback[0]
+    assert "auto-1786000000-dead-gpu0" in rollback[0]
+
+
+def test_virgin_volume_skips_profile_retirement() -> None:
+    runner = _RemoteRunner("", 1)
+    one._retire_rehydrated_profile(
+        runner=runner,
+        ssh_cmd=["ssh", "root@example"],
+        python="/opt/rel/.venv/bin/python",
+        manage="/opt/rel/gpu_worker/manage_worker_release.py",
+    )
+    assert not [c for c in runner.commands if "rollback" in c]

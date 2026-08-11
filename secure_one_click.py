@@ -637,8 +637,49 @@ def _remote_run(
     *,
     input_text: str | None = None,
     timeout: int = 300,
+    check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    return runner.run([*ssh_cmd, *command], input_text=input_text, timeout=timeout)
+    return runner.run(
+        [*ssh_cmd, *command], input_text=input_text, timeout=timeout, check=check
+    )
+
+
+def _retire_rehydrated_profile(
+    *,
+    runner: CommandRunner,
+    ssh_cmd: Sequence[str],
+    python: str,
+    manage: str,
+    worker_unit: str = "filmforge-worker-gpu0.service",
+) -> None:
+    """Retire a dead deployment's secure profile carried in by a reused volume.
+
+    A rehydrated OS volume boots with its previous life's active secure
+    profile, and ``stage --profile-mode first-install`` correctly refuses
+    secure-to-secure replacement. That profile can only belong to a dead
+    deployment — the capacity manager's one-VM invariant refuses to provision
+    while a managed instance exists — so retire it through its own journaled
+    rollback before staging ours. Any rollback failure aborts the run for
+    operator review rather than forcing the guard.
+    """
+
+    pointer = f"{DEFAULT_PROFILE_ROOT}/active/{worker_unit}"
+    probe = _remote_run(runner, ssh_cmd, ["readlink", pointer], timeout=60, check=False)
+    target = str(probe.stdout or "").strip()
+    if not target:
+        return
+    fossil_id = Path(target).name
+    if not _SAFE_ID.fullmatch(fossil_id):
+        raise OneClickDeploymentError(
+            "Rehydrated volume carries an unidentifiable active secure profile"
+        )
+    print(f"[one-click] Retiring rehydrated secure profile {fossil_id} before first-install")
+    _remote_run(
+        runner,
+        ssh_cmd,
+        [python, manage, "rollback", "--release-id", fossil_id],
+        timeout=360,
+    )
 
 
 def _stage_profile_sources(
@@ -656,6 +697,11 @@ def _stage_profile_sources(
     code_release_id = str(getattr(args, "_verda_worker_release_id"))
     worker_source = str(getattr(args, "_verda_worker_source_root"))
     candidate_root = str(Path(worker_source).parent)
+    manage = f"{worker_source}/manage_worker_release.py"
+    python = f"{candidate_root}/.venv/bin/python"
+    _retire_rehydrated_profile(
+        runner=runner, ssh_cmd=ssh_cmd, python=python, manage=manage
+    )
     remote_staging = f"{DEFAULT_STAGING_ROOT}/{profile_id}"
     stage_receipt = f"{DEFAULT_PROFILE_ROOT}/releases/{profile_id}/stage-receipt.json"
     cutover_receipt = f"{DEFAULT_PROFILE_ROOT}/releases/{profile_id}/cutover-receipt.json"
@@ -732,8 +778,6 @@ def _stage_profile_sources(
             ssh_cmd,
             ["chmod", "0755", "/opt/instance-tools/bin/caddy"],
         )
-        manage = f"{worker_source}/manage_worker_release.py"
-        python = f"{candidate_root}/.venv/bin/python"
         _remote_run(
             runner,
             ssh_cmd,
