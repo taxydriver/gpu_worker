@@ -65,6 +65,27 @@ class DeployApi(Protocol):
     def verda_fresh_deploy(self, args: Any) -> int: ...
 
 
+# The Rent button runs this module from the backend service (a LaunchAgent on
+# macOS), whose PATH is the bare system default. The pinned CLI fallbacks then
+# resolve but cannot run: vercel is a Node script (`#!/usr/bin/env node`) and
+# node lives in one of these dirs, none of which the service PATH contains.
+_TOOL_PATH_DIRS = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    str(Path.home() / ".local" / "bin"),
+)
+
+
+def _augmented_path_env() -> dict[str, str]:
+    env = {**os.environ, "NO_COLOR": "1"}
+    parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    for directory in _TOOL_PATH_DIRS:
+        if directory not in parts:
+            parts.append(directory)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 class CommandRunner:
     """Small injectable subprocess boundary used by provider-free tests."""
 
@@ -83,7 +104,7 @@ class CommandRunner:
             capture_output=True,
             timeout=timeout,
             check=check,
-            env={**os.environ, "NO_COLOR": "1"},
+            env=_augmented_path_env(),
         )
 
 

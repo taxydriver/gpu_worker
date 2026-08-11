@@ -387,3 +387,17 @@ def test_exact_instance_resume_returns_only_matching_running_vm(
         "203.0.113.13",
         instance_id,
     )
+
+
+def test_command_runner_env_covers_service_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The backend LaunchAgent spawns deploys with the bare system PATH; the
+    # vercel CLI is a Node script and must find its interpreter regardless.
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = one._augmented_path_env()
+    parts = env["PATH"].split(os.pathsep)
+    assert parts[:2] == ["/usr/bin", "/bin"]
+    for directory in one._TOOL_PATH_DIRS:
+        assert directory in parts
+    assert env["NO_COLOR"] == "1"
