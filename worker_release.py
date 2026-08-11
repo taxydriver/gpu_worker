@@ -874,6 +874,14 @@ os.chmod(root, 0o555)
 PY
   mv "$STAGING" "$TARGET"
   trap - EXIT
+  # A raw provider image ships python3 without ensurepip; `python3 -m venv`
+  # then creates a pipless venv and aborts asking for the python3-venv
+  # package. Bootstrapped OS volumes already have it, making this a no-op.
+  if ! python3 -m ensurepip --version >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq >&2 || true
+    apt-get install -y -qq python3-venv python3-pip >&2
+  fi
   if test -x "$VENV_SEED/bin/python"; then
     "$VENV_SEED/bin/python" -m venv --copies "$TARGET/.venv"
   else
