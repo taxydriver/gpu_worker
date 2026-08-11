@@ -677,7 +677,7 @@ def _retire_rehydrated_profile(
     _remote_run(
         runner,
         ssh_cmd,
-        [python, manage, "rollback", "--release-id", fossil_id],
+        [python, "-B", manage, "rollback", "--release-id", fossil_id],
         timeout=360,
     )
 
@@ -780,11 +780,15 @@ def _stage_profile_sources(
             ssh_cmd,
             ["chmod", "0755", "/opt/instance-tools/bin/caddy"],
         )
+        # -B on every manage invocation: these run as root with the candidate's
+        # venv, and root can write __pycache__ into the read-only release,
+        # which the provision-phase recheck then rejects as writable paths.
         _remote_run(
             runner,
             ssh_cmd,
             [
                 python,
+                "-B",
                 manage,
                 "stage",
                 "--edge-provider",
@@ -827,6 +831,7 @@ def _stage_profile_sources(
             ssh_cmd,
             [
                 python,
+                "-B",
                 manage,
                 "prepare",
                 "--release-id",
@@ -912,6 +917,7 @@ def _remote_profile_operation(
     candidate_root = str(Path(worker_source).parent)
     command = [
         f"{candidate_root}/.venv/bin/python",
+        "-B",
         f"{worker_source}/manage_worker_release.py",
         operation,
         "--release-id",
