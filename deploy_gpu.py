@@ -788,11 +788,23 @@ def _stage_worker_release_over_ssh(
             git_commit=bundle.git_commit,
             tracked_manifest_sha256=bundle.tracked_manifest_sha256,
         )
-        run(
-            [*ssh_cmd, "bash", "-s"],
-            input_text=install_script,
-            capture_output=True,
-        )
+        try:
+            run(
+                [*ssh_cmd, "bash", "-s"],
+                input_text=install_script,
+                capture_output=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # The installer is fail-closed and says exactly why it stopped —
+            # but with capture_output=True that diagnosis dies in the captured
+            # streams unless it is quoted here (its output is tar/pip/check
+            # messages; secrets never flow through this script).
+            stderr_tail = " ".join(str(exc.stderr or "")[-400:].split())
+            stdout_tail = " ".join(str(exc.stdout or "")[-200:].split())
+            raise RuntimeError(
+                f"worker release install failed on the box (rc={exc.returncode}; "
+                f"stderr ends: {stderr_tail!r}; stdout ends: {stdout_tail!r})"
+            ) from None
         return (
             bundle.release_id,
             f"{releases_root}/releases/{bundle.release_id}/gpu_worker",
