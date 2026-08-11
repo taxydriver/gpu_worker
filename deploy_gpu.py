@@ -1963,7 +1963,7 @@ echo "Installing/updating ComfyUI requirements..." >&2
 # from the closed `tail` read-end (141) propagated out and aborted the whole
 # `ssh ... bash -s` deploy at this step. Tail the file afterwards (no pipe on
 # the long-running command).
-"$COMFY_PYTHON" -m pip install -q -r "$COMFY_ROOT/requirements.txt" > /tmp/comfy_reqs_install.log 2>&1 || true
+"$COMFY_PYTHON" -m pip install -q -r "$COMFY_ROOT/requirements.txt" "transformers<5" > /tmp/comfy_reqs_install.log 2>&1 || true
 tail -5 /tmp/comfy_reqs_install.log >&2 || true
 
 # Query GPU 0 only (-i 0) instead of piping all GPUs to `head -1`: on a multi-GPU
@@ -4254,7 +4254,10 @@ fi
 "$COMFY_ROOT/.venv/bin/python" -m pip install --upgrade pip wheel setuptools
 "$COMFY_ROOT/.venv/bin/python" -m pip install --index-url "$PYTORCH_INDEX_URL" \
   '{_TORCH_PIN}' '{_TORCHVISION_PIN}' '{_TORCHAUDIO_PIN}'
-"$COMFY_ROOT/.venv/bin/python" -m pip install -r "$COMFY_ROOT/requirements.txt"
+# ComfyUI pins only transformers>=4.50.3; v5 changed the MistralConverter API
+# its FLUX.2 tokenizer path calls, so a fresh resolve to 5.x breaks flux
+# stills at text-encoder load (proven live on the first FIN-02 render).
+"$COMFY_ROOT/.venv/bin/python" -m pip install -r "$COMFY_ROOT/requirements.txt" "transformers<5"
 
 mkdir -p "$COMFY_ROOT/custom_nodes"
 if ! test -d "$COMFY_ROOT/custom_nodes/ComfyUI-VideoHelperSuite"; then
