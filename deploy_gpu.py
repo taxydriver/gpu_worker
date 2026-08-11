@@ -4086,6 +4086,7 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 REMOTE_ROOT={shlex.quote(remote_root)}
 WORKER_ROOT={shlex.quote(worker_source_root)}
+WORKER_RUNTIME_ROOT={shlex.quote(DEFAULT_WORKER_RUNTIME_ROOT)}
 COMFY_ROOT="/workspace/ComfyUI"
 COMFY_REPO_URL={shlex.quote(comfy_repo_url)}
 PYTORCH_INDEX_URL={shlex.quote(pytorch_index_url)}
