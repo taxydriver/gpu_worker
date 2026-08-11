@@ -395,6 +395,7 @@ def test_command_runner_env_covers_service_path(
     # The backend LaunchAgent spawns deploys with the bare system PATH; the
     # vercel CLI is a Node script and must find its interpreter regardless.
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
     env = one._service_env()
     parts = env["PATH"].split(os.pathsep)
     assert parts[:2] == ["/usr/bin", "/bin"]
@@ -402,3 +403,5 @@ def test_command_runner_env_covers_service_path(
         assert directory in parts
     assert env["NO_COLOR"] == "1"
     assert env["FLY_NO_UPDATE_CHECK"] == "1"
+    # The backend's own LOG_LEVEL must never reach flyctl's logger.
+    assert "LOG_LEVEL" not in env

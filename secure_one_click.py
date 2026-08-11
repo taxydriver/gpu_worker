@@ -78,6 +78,10 @@ _TOOL_PATH_DIRS = (
 
 def _service_env() -> dict[str, str]:
     env = {**os.environ, "NO_COLOR": "1"}
+    # The backend app sets LOG_LEVEL for its own logging and this process
+    # inherits it; flyctl reads the same variable and at debug level writes
+    # its logger lines onto stdout ahead of --json payloads.
+    env.pop("LOG_LEVEL", None)
     # flyctl's periodic update check writes progress/banner text into the
     # command's own output stream, which corrupts --json parses exactly once
     # per throttle window — the classic "works interactively" failure.
