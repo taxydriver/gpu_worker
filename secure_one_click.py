@@ -316,7 +316,7 @@ class VercelDns:
     def endpoint(self) -> str:
         return f"/v3/domains/{self.domain}/records"
 
-    def _records(self) -> list[DnsRecord]:
+    def _matching_records(self) -> list[DnsRecord]:
         result = self.runner.run(
             [self.executable, "api", f"{self.endpoint}?limit=100", "--raw"],
             timeout=60,
@@ -341,6 +341,10 @@ class VercelDns:
                     value=str(row.get("value") or "").strip(),
                 )
             )
+        return matched
+
+    def _records(self) -> list[DnsRecord]:
+        matched = self._matching_records()
         if len(matched) > 1:
             raise OneClickDeploymentError("Worker DNS hostname has multiple records")
         if matched and (
@@ -388,18 +392,26 @@ class VercelDns:
             timeout=60,
         )
         raw = _json_output(result, label="Vercel DNS create")
-        record = raw.get("record") if isinstance(raw, dict) and isinstance(raw.get("record"), dict) else raw
-        if not isinstance(record, dict):
-            raise OneClickDeploymentError("Vercel DNS create returned an invalid record")
-        created = DnsRecord(
-            record_id=str(record.get("id") or ""),
-            name=str(record.get("name") or self.label),
-            record_type=str(record.get("type") or "").upper(),
-            value=str(record.get("value") or ""),
+        # Vercel's create endpoint acknowledges with {"uid": ...} and does not
+        # echo the record (proven live 2026-08-11: both creates in a failed run
+        # had landed while this parser rejected their acks). Accept any ack
+        # shape, then verify against the record list — the read surface this
+        # class already trusts.
+        acknowledged = isinstance(raw, dict) and bool(
+            raw.get("uid") or raw.get("id") or isinstance(raw.get("record"), dict)
         )
-        if not created.record_id or created.record_type != "A" or created.value != value:
-            raise OneClickDeploymentError("Vercel DNS create did not return the requested A record")
-        return created
+        if not acknowledged:
+            raise OneClickDeploymentError("Vercel DNS create was not acknowledged")
+        landed = [
+            record
+            for record in self._matching_records()
+            if record.record_type == "A" and record.value == value and record.record_id
+        ]
+        if len(landed) != 1:
+            raise OneClickDeploymentError(
+                "Vercel DNS create did not land exactly one A record with the requested value"
+            )
+        return landed[0]
 
     def point_to(self, ip: str, previous: DnsRecord | None) -> DnsMutation:
         try:

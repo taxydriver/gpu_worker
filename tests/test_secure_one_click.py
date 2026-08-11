@@ -267,7 +267,8 @@ class _DnsRunner(one.CommandRunner):
                 "value": value,
             }
             self.records.append(row)
-            payload = row
+            # Live contract: create acknowledges with uid only, no record echo.
+            payload = {"uid": row["id"]}
         return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
 
 
