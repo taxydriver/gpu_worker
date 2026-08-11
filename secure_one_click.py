@@ -749,9 +749,10 @@ def _wait_for_tls_hostname(hostname: str, expected_ip: str, timeout: int = 240) 
                 time.sleep(3)
                 continue
             with socket.create_connection((hostname, 443), timeout=10) as raw:
-                with context.wrap_socket(raw, server_hostname=hostname) as tls:
-                    certificate = tls.getpeercert()
-                    ssl.match_hostname(certificate, hostname)
+                # create_default_context() verifies the chain and hostname during
+                # the handshake (check_hostname=True); ssl.match_hostname() was
+                # removed in Python 3.12 and must not be called here.
+                with context.wrap_socket(raw, server_hostname=hostname):
                     return
         except Exception as exc:
             last_error = type(exc).__name__
