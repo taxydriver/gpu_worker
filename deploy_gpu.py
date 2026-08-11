@@ -633,7 +633,15 @@ fi
 worker_ready=0
 comfy_ready=0
 bootstrap_ready=0
+# Worker code now arrives as an immutable content-addressed release with its
+# own venv; the legacy runtime venv exists only on pre-refactor volumes.
 test -x /opt/filmforge_gpu_worker/.venv/bin/python && worker_ready=1
+for candidate_python in /opt/filmforge-worker-releases/releases/*/.venv/bin/python; do
+  if test -x "$candidate_python"; then
+    worker_ready=1
+    break
+  fi
+done
 test -x /workspace/ComfyUI/.venv/bin/python && comfy_ready=1
 if test "$data_state" = "filesystem:ext4"; then
   if mountpoint -q /mnt/data 2>/dev/null; then
