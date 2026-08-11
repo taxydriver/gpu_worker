@@ -406,3 +406,10 @@ def test_command_runner_env_covers_service_path(
     assert env["FLY_NO_UPDATE_CHECK"] == "1"
     # The backend's own LOG_LEVEL must never reach flyctl's logger.
     assert "LOG_LEVEL" not in env
+
+
+def test_command_runner_failure_quotes_captured_streams() -> None:
+    with pytest.raises(one.OneClickDeploymentError, match=r"rc=7.*argparse-said-no"):
+        one.CommandRunner().run(
+            ["/bin/sh", "-c", "echo progress; echo argparse-said-no >&2; exit 7"]
+        )

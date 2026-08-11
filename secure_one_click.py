@@ -105,15 +105,26 @@ class CommandRunner:
         timeout: int = 120,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            list(command),
-            input=input_text,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=check,
-            env=_service_env(),
-        )
+        try:
+            return subprocess.run(
+                list(command),
+                input=input_text,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=check,
+                env=_service_env(),
+            )
+        except subprocess.CalledProcessError as exc:
+            # The raw exception shows only argv + rc; the diagnosis lives in
+            # the captured streams. These commands never receive secrets via
+            # argv or echo them (secrets travel via stdin and 0600 files).
+            stderr_tail = " ".join(str(exc.stderr or "")[-240:].split())
+            stdout_tail = " ".join(str(exc.stdout or "")[-160:].split())
+            raise OneClickDeploymentError(
+                f"Command failed rc={exc.returncode}: {Path(str(command[0])).name} "
+                f"(stderr ends: {stderr_tail!r}; stdout ends: {stdout_tail!r})"
+            ) from None
 
 
 class _NoRedirect(HTTPRedirectHandler):
