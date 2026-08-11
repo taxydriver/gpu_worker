@@ -76,8 +76,12 @@ _TOOL_PATH_DIRS = (
 )
 
 
-def _augmented_path_env() -> dict[str, str]:
+def _service_env() -> dict[str, str]:
     env = {**os.environ, "NO_COLOR": "1"}
+    # flyctl's periodic update check writes progress/banner text into the
+    # command's own output stream, which corrupts --json parses exactly once
+    # per throttle window — the classic "works interactively" failure.
+    env["FLY_NO_UPDATE_CHECK"] = "1"
     parts = [part for part in env.get("PATH", "").split(os.pathsep) if part]
     for directory in _TOOL_PATH_DIRS:
         if directory not in parts:
@@ -104,7 +108,7 @@ class CommandRunner:
             capture_output=True,
             timeout=timeout,
             check=check,
-            env=_augmented_path_env(),
+            env=_service_env(),
         )
 
 
@@ -278,7 +282,14 @@ def _json_output(result: subprocess.CompletedProcess[str], *, label: str) -> Any
     try:
         return json.loads(result.stdout)
     except (TypeError, json.JSONDecodeError):
-        raise OneClickDeploymentError(f"{label} returned invalid JSON") from None
+        # These parses only ever see non-secret surfaces (DNS inventory, Fly
+        # app status); quoting a snippet turns "invalid JSON" into a diagnosis.
+        stdout_head = " ".join(str(result.stdout or "")[:160].split())
+        stderr_tail = " ".join(str(result.stderr or "")[-160:].split())
+        raise OneClickDeploymentError(
+            f"{label} returned invalid JSON "
+            f"(stdout starts: {stdout_head!r}; stderr ends: {stderr_tail!r})"
+        ) from None
 
 
 class VercelDns:
