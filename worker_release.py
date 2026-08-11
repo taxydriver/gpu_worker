@@ -771,19 +771,23 @@ candidate_incomplete=0
 if test -d "$TARGET"; then
   ready_mode="$(python3 -c 'import os, stat, sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "$TARGET/.ready" 2>/dev/null || true)"
   if ! test -f "$TARGET/.ready" || test "$ready_mode" != "444"; then
+    echo "candidate incomplete: readiness marker missing or mode drifted (mode=$ready_mode)" >&2
     candidate_incomplete=1
   fi
   if candidate_has_writable_paths "$TARGET"; then
+    echo "candidate incomplete: writable paths present" >&2
     candidate_incomplete=1
   fi
   if ! test -f "$TARGET/.dependency-freeze.txt" || \
       ! test -f "$TARGET/.dependency-freeze.sha256" || \
       test "$(cat "$TARGET/.dependency-freeze.sha256" 2>/dev/null || true)" != \
         "$(sha256sum "$TARGET/.dependency-freeze.txt" 2>/dev/null | awk '{{print $1}}')"; then
+    echo "candidate incomplete: dependency snapshot missing or drifted" >&2
     candidate_incomplete=1
   fi
   if ! test -f "$TARGET/.source-sha256" || \
       test "$(cat "$TARGET/.source-sha256" 2>/dev/null || true)" != "$EXPECTED_SOURCE_SHA256"; then
+    echo "candidate incomplete: source digest mismatch" >&2
     candidate_incomplete=1
   fi
   if test -n "$EXPECTED_GIT_COMMIT" && {{
@@ -792,6 +796,7 @@ if test -d "$TARGET"; then
       test "$(cat "$TARGET/.git-commit" 2>/dev/null || true)" != "$EXPECTED_GIT_COMMIT" ||
       test "$(cat "$TARGET/.tracked-manifest-sha256" 2>/dev/null || true)" != "$EXPECTED_TRACKED_MANIFEST_SHA256"
     }}; then
+    echo "candidate incomplete: git provenance mismatch" >&2
     candidate_incomplete=1
   fi
 fi
