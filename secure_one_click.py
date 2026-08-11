@@ -757,9 +757,11 @@ def _stage_profile_sources(
                 [*scp_cmd, str(root / name), f"{destination}:{remote_staging}/{name}"],
                 timeout=120,
             )
+        # The Caddy binary is ~40MB and uploads over the operator's own uplink;
+        # the profile env files are tiny. Only this copy needs a long timeout.
         runner.run(
             [*scp_cmd, str(caddy_binary), f"{destination}:/opt/instance-tools/bin/caddy"],
-            timeout=120,
+            timeout=600,
         )
         _remote_run(
             runner,
