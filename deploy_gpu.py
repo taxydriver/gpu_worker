@@ -5857,6 +5857,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--secure-resume-existing-fly-contract",
+        action="store_true",
+        help=(
+            "Recover an interrupted secure first install without mutating Fly: "
+            "verify the already-deployed secret names and cutover credential, "
+            "and leave production GPU dispatch disabled. Requires --secure-one-click."
+        ),
+    )
+    parser.add_argument(
         "--worker-edge-hostname",
         default=os.getenv("WORKER_EDGE_HOSTNAME", "gpu-worker.anapana.ai"),
         help="Stable DNS hostname for the one-click Caddy worker edge.",
@@ -6105,6 +6114,10 @@ def main() -> int:
     args = parse_args()
 
     try:
+        if args.secure_resume_existing_fly_contract and not args.secure_one_click:
+            raise RuntimeError(
+                "--secure-resume-existing-fly-contract requires --secure-one-click"
+            )
         if args.secure_one_click:
             if not (args.verda or args.verda_fresh):
                 raise RuntimeError("--secure-one-click currently supports Verda only")

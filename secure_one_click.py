@@ -498,6 +498,44 @@ class FlyBackend:
         self._wait_health()
         self._assert_probe_token_gate()
 
+    def verify_existing_fail_closed_contract(self, values: DeploymentSecrets) -> None:
+        """Verify an earlier first-install secret sync without mutating Fly.
+
+        This recovery path is for an interrupted secure install when Fly's
+        secret-update API is unavailable.  It proves that every required name
+        is deployed and that the protected cutover endpoint accepts the exact
+        locally held probe token.  Dispatch is deliberately left unchanged and
+        must remain disabled for this local-only recovery.
+        """
+
+        result = self.runner.run(
+            [self.executable, "secrets", "list", "-a", self.app, "--json"],
+            timeout=60,
+        )
+        value = _json_output(result, label="Fly secret inventory")
+        if not isinstance(value, list):
+            raise OneClickDeploymentError("Fly secret inventory is unavailable")
+        deployed = {
+            str(item.get("name"))
+            for item in value
+            if isinstance(item, dict) and item.get("status") == "Deployed"
+        }
+        required = {
+            "GPU_WORKER_API_TOKEN",
+            "GPU_WORKER_API_AUTH_MODE",
+            "WORKER_REGISTRATION_TOKEN",
+            "FILMFORGE_WORKER_CUTOVER_PROBE_TOKEN",
+            "GPU_WORKER_ENABLED",
+        }
+        missing = sorted(required - deployed)
+        if missing:
+            raise OneClickDeploymentError(
+                "Fly fail-closed secret contract is incomplete: " + ", ".join(missing)
+            )
+        self._wait_health()
+        self._assert_probe_token_gate()
+        self._assert_probe_token_match(values.cutover_probe_token)
+
     def enable_worker_dispatch(self) -> None:
         self.runner.run(
             [self.executable, "secrets", "import", "-a", self.app, "--detach"],
@@ -556,6 +594,38 @@ class FlyBackend:
         except Exception:
             pass
         raise OneClickDeploymentError("Fly worker cutover endpoint is not fail-closed")
+
+    def _assert_probe_token_match(self, token: str) -> None:
+        body = json.dumps(
+            {
+                "schema": "filmforge.worker-cutover-probe.v1",
+                "release_id": "preflight",
+                "worker_code_release_id": "preflight",
+                "worker_dependency_freeze_sha256": "0" * 64,
+                "worker_public_url": "https://gpu-worker.invalid",
+            }
+        ).encode()
+        request = Request(
+            f"{self.backend_url}/api/internal/worker-cutover-probe",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        try:
+            with opener.open(request, timeout=15):
+                return
+        except HTTPError as exc:
+            if exc.code != 401:
+                return
+        except Exception as exc:
+            raise OneClickDeploymentError(
+                "Fly worker cutover credential could not be verified"
+            ) from exc
+        raise OneClickDeploymentError("Fly worker cutover credential does not match")
 
 
 def _download_caddy(runner: CommandRunner) -> tempfile.TemporaryDirectory[str]:
@@ -1068,11 +1138,18 @@ def run_secure_verda_first_install(
     dns_mutation: DnsMutation | None = None
     profile_staged = False
     fly_secrets_synced = False
+    preserve_fly_contract = bool(
+        getattr(args, "secure_resume_existing_fly_contract", False)
+    )
     try:
         # Fly is made bearer-ready and explicitly dispatch-disabled before the
         # paid VM exists.  This is a safe, no-GPU precondition.
-        fly.sync_fail_closed_secrets(secrets_value)
-        fly_secrets_synced = True
+        if preserve_fly_contract:
+            fly.verify_existing_fail_closed_contract(secrets_value)
+            print("[one-click] Reusing verified fail-closed Fly contract; dispatch remains disabled")
+        else:
+            fly.sync_fail_closed_secrets(secrets_value)
+            fly_secrets_synced = True
         print("[one-click] Starting one paid VM only after every preflight passed")
         _deploy_phase(args, deploy_api)
         instance_id = str(getattr(args, "_verda_active_instance_id", ""))
@@ -1122,7 +1199,8 @@ def run_secure_verda_first_install(
         print("[one-click] Authenticated cutover passed; activating immutable code")
         _phase(args, "activate")
         _deploy_phase(args, deploy_api)
-        fly.enable_worker_dispatch()
+        if not preserve_fly_contract:
+            fly.enable_worker_dispatch()
         _finalize_local_backend_env(backend_env, public_url)
         print(f"WORKER_URLS={public_url}")
         print("[one-click] Complete: one secure worker is ready")

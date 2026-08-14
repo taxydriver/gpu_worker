@@ -91,6 +91,10 @@ class _FakeFly:
         assert values.worker_api_token == "w" * 40
         self.events.append("fly-disabled")
 
+    def verify_existing_fail_closed_contract(self, values):
+        assert values.cutover_probe_token == "p" * 40
+        self.events.append("fly-contract-verified")
+
     def enable_worker_dispatch(self):
         self.events.append("fly-enabled")
 
@@ -210,6 +214,28 @@ def test_one_click_runs_exact_secure_phase_order(
     assert "r" * 20 not in output
 
 
+def test_interrupted_resume_verifies_fly_contract_without_secret_mutation(
+    automatic_fakes,
+    tmp_path: Path,
+) -> None:
+    events, _caddy = automatic_fakes
+    api = _FakeDeployApi(events)
+    args = _args(tmp_path)
+    args.secure_resume_existing_fly_contract = True
+
+    result = one.run_secure_verda_first_install(
+        args,
+        deploy_api=api,
+        runner=_UnusedRunner(),
+    )
+
+    assert result == 0
+    assert _FakeFly.instances[-1].events == [
+        "fly-preflight",
+        "fly-contract-verified",
+    ]
+
+
 def test_one_click_rejects_multiple_workers_before_bundle_or_provider(
     tmp_path: Path,
 ) -> None:
@@ -321,6 +347,54 @@ def test_fly_secret_updates_detach_before_explicit_health_poll(
     assert len(health_calls) == 3
     assert all("--detach" in command for command, _kwargs in runner.calls)
     assert all(kwargs["timeout"] == 600 for _command, kwargs in runner.calls)
+
+
+def test_existing_fly_contract_requires_all_deployed_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = [
+        "GPU_WORKER_API_TOKEN",
+        "GPU_WORKER_API_AUTH_MODE",
+        "WORKER_REGISTRATION_TOKEN",
+        "FILMFORGE_WORKER_CUTOVER_PROBE_TOKEN",
+        "GPU_WORKER_ENABLED",
+    ]
+
+    class Runner:
+        def run(self, command, **kwargs):
+            assert command[-1] == "--json"
+            assert kwargs["timeout"] == 60
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                json.dumps([{"name": name, "status": "Deployed"} for name in required]),
+                "",
+            )
+
+    fly = one.FlyBackend(
+        runner=Runner(),
+        app="filmforgepythonbackend",
+        backend_url="https://filmforgepythonbackend.fly.dev",
+        executable="/bin/flyctl",
+    )
+    checks = []
+    monkeypatch.setattr(fly, "_wait_health", lambda: checks.append("health"))
+    monkeypatch.setattr(fly, "_assert_probe_token_gate", lambda: checks.append("gate"))
+    monkeypatch.setattr(
+        fly,
+        "_assert_probe_token_match",
+        lambda token: checks.append(("token", token)),
+    )
+    values = one.DeploymentSecrets(
+        worker_api_token="w" * 40,
+        registration_token="r" * 32,
+        cutover_probe_token="p" * 40,
+        backend_url="https://filmforgepythonbackend.fly.dev",
+    )
+
+    fly.verify_existing_fail_closed_contract(values)
+
+    assert checks == ["health", "gate", ("token", "p" * 40)]
 
 
 class _DnsRunner(one.CommandRunner):
