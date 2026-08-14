@@ -491,7 +491,7 @@ class FlyBackend:
         }
         payload = "".join(f"{key}={value}\n" for key, value in assignments.items())
         self.runner.run(
-            [self.executable, "secrets", "import", "-a", self.app],
+            [self.executable, "secrets", "import", "-a", self.app, "--detach"],
             input_text=payload,
             timeout=600,
         )
@@ -500,7 +500,7 @@ class FlyBackend:
 
     def enable_worker_dispatch(self) -> None:
         self.runner.run(
-            [self.executable, "secrets", "import", "-a", self.app],
+            [self.executable, "secrets", "import", "-a", self.app, "--detach"],
             input_text="GPU_WORKER_ENABLED=true\n",
             timeout=600,
         )
@@ -510,7 +510,7 @@ class FlyBackend:
         """Return Fly to a fail-closed no-dispatch state during rollback."""
 
         self.runner.run(
-            [self.executable, "secrets", "import", "-a", self.app],
+            [self.executable, "secrets", "import", "-a", self.app, "--detach"],
             input_text="GPU_WORKER_ENABLED=false\n",
             timeout=600,
         )

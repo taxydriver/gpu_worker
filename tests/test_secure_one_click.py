@@ -286,6 +286,43 @@ def test_worker_readiness_wait_requires_authenticated_exact_release(
     )
 
 
+def test_fly_secret_updates_detach_before_explicit_health_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Runner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, **kwargs):
+            self.calls.append((list(command), kwargs))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+    runner = Runner()
+    fly = one.FlyBackend(
+        runner=runner,
+        app="filmforgepythonbackend",
+        backend_url="https://filmforgepythonbackend.fly.dev",
+        executable="/bin/flyctl",
+    )
+    health_calls = []
+    monkeypatch.setattr(fly, "_wait_health", lambda: health_calls.append("health"))
+    monkeypatch.setattr(fly, "_assert_probe_token_gate", lambda: None)
+    values = one.DeploymentSecrets(
+        worker_api_token="w" * 40,
+        registration_token="r" * 32,
+        cutover_probe_token="p" * 40,
+        backend_url="https://filmforgepythonbackend.fly.dev",
+    )
+
+    fly.sync_fail_closed_secrets(values)
+    fly.enable_worker_dispatch()
+    fly.disable_worker_dispatch()
+
+    assert len(health_calls) == 3
+    assert all("--detach" in command for command, _kwargs in runner.calls)
+    assert all(kwargs["timeout"] == 600 for _command, kwargs in runner.calls)
+
+
 class _DnsRunner(one.CommandRunner):
     def __init__(self):
         self.records: list[dict[str, str]] = []
