@@ -1101,6 +1101,10 @@ if worker_source_root.name != "gpu_worker" or candidate_root.name != failed_rele
     raise SystemExit("worker candidate path does not match failed release")
 if not (candidate_root / ".ready").is_file():
     raise SystemExit("worker candidate readiness marker is missing")
+# The candidate is immutable, but this verifier runs as root.  Suppress import
+# bytecode explicitly so a rollback cannot leave a writable ``__pycache__`` in
+# the release and make the next idempotent resume fail closed.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(candidate_root))
 from gpu_worker.worker_release import rollback_secure_profiles
 

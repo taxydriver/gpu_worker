@@ -393,6 +393,9 @@ def test_remote_profile_rollback_prevalidates_and_uses_one_batch_lock(
     assert script.index("profiles = []") < script.index(
         "rollback_secure_profiles(release_ids=profiles)"
     )
+    assert script.index("sys.dont_write_bytecode = True") < script.index(
+        "from gpu_worker.worker_release import rollback_secure_profiles"
+    )
     assert "from gpu_worker.worker_release import rollback_secure_profiles" in script
     assert "rollback_state" in script
     compile(script, "<remote-profile-rollback>", "exec")
