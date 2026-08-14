@@ -872,6 +872,63 @@ def _wait_for_tls_hostname(hostname: str, expected_ip: str, timeout: int = 240) 
     )
 
 
+def _wait_for_authenticated_worker_ready(
+    *,
+    public_url: str,
+    worker_api_token: str,
+    expected_release_id: str,
+    timeout: int = 3600,
+) -> None:
+    """Wait for model preflight before immutable-code finalization.
+
+    The secure-profile cutover starts the worker, whose capability preflight may
+    download large model assets in the background.  Finalization deliberately
+    requires ``worker_ok=true``; polling that same authenticated health contract
+    here prevents an otherwise deterministic cutover/rollback race.
+    """
+
+    if not expected_release_id:
+        raise OneClickDeploymentError("Worker release id is unavailable before readiness wait")
+    opener = build_opener(ProxyHandler({}), _NoRedirect())
+    deadline = time.monotonic() + timeout
+    last_error = "not ready"
+    health_url = public_url.rstrip("/") + "/health"
+    while time.monotonic() < deadline:
+        request = Request(
+            health_url,
+            method="GET",
+            headers={"Authorization": f"Bearer {worker_api_token}"},
+        )
+        try:
+            with opener.open(request, timeout=15) as response:
+                if response.status != 200:
+                    last_error = f"status {response.status}"
+                else:
+                    body = response.read(65537)
+                    if len(body) > 65536:
+                        last_error = "health response too large"
+                    else:
+                        value = json.loads(body)
+                        if (
+                            isinstance(value, dict)
+                            and value.get("ok") is True
+                            and value.get("worker_ok") is True
+                            and value.get("code_release_id") == expected_release_id
+                            and str(value.get("public_url") or "").rstrip("/")
+                            == public_url.rstrip("/")
+                        ):
+                            return
+                        last_error = "worker or release not ready"
+        except HTTPError as exc:
+            last_error = f"status {exc.code}"
+        except Exception as exc:
+            last_error = type(exc).__name__
+        time.sleep(5)
+    raise OneClickDeploymentError(
+        f"Worker did not become ready before immutable-code finalization ({last_error})"
+    )
+
+
 def _authorize_cutover_receipt(
     *,
     args: Any,
@@ -1054,6 +1111,12 @@ def run_secure_verda_first_install(
             profile_id=profile_id,
             operation="cutover",
             receipt_path=cutover_receipt,
+        )
+        _wait_for_authenticated_worker_ready(
+            public_url=public_url,
+            worker_api_token=secrets_value.worker_api_token,
+            expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
+            timeout=int(getattr(args, "verda_install_timeout", 3600)),
         )
 
         print("[one-click] Authenticated cutover passed; activating immutable code")

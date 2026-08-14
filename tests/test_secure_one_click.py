@@ -157,6 +157,11 @@ def automatic_fakes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         ),
     )
     monkeypatch.setattr(one, "_wait_for_tls_hostname", lambda *a, **k: events.append("tls"))
+    monkeypatch.setattr(
+        one,
+        "_wait_for_authenticated_worker_ready",
+        lambda **k: events.append("worker-ready"),
+    )
     monkeypatch.setattr(one, "_authorize_cutover_receipt", lambda **k: events.append("receipt"))
     monkeypatch.setattr(
         one,
@@ -190,6 +195,7 @@ def test_one_click_runs_exact_secure_phase_order(
         "tls",
         "receipt",
         "cutover",
+        "worker-ready",
         "activate",
         "local-env",
     ]
@@ -239,6 +245,45 @@ def test_one_click_rolls_back_profile_and_dns_on_paid_phase_failure(
     assert _FakeDns.instances[-1].rolled_back is True
     assert "activate" not in events
     assert _FakeFly.instances[-1].events[-1] == "fly-disabled-rollback"
+
+
+def test_worker_readiness_wait_requires_authenticated_exact_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_id = "sha256-" + "a" * 24
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps(
+                {
+                    "ok": True,
+                    "worker_ok": True,
+                    "code_release_id": release_id,
+                    "public_url": "https://gpu-worker.example",
+                }
+            ).encode()
+
+    class Opener:
+        def open(self, request, timeout):
+            assert timeout == 15
+            assert request.get_header("Authorization") == "Bearer worker-secret"
+            return Response()
+
+    monkeypatch.setattr(one, "build_opener", lambda *_args: Opener())
+    one._wait_for_authenticated_worker_ready(
+        public_url="https://gpu-worker.example",
+        worker_api_token="worker-secret",
+        expected_release_id=release_id,
+        timeout=1,
+    )
 
 
 class _DnsRunner(one.CommandRunner):
