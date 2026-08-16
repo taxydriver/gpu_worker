@@ -560,6 +560,11 @@ def _broker_worker_payload() -> dict[str, object]:
         "max_concurrent_jobs": max_concurrent_jobs,
         "warmed_asset_groups": warmed,
         "infinitetalk_readiness": infinitetalk_readiness,
+        # Non-secret readiness fact: the backend withholds paid dispatch unless
+        # the worker proves it can fetch this deployment's public storage host.
+        "input_url_allowed_hosts": sorted(
+            settings.resolved_input_url_allowed_hosts()
+        ),
     }
     if settings.worker_vision_base_url:
         # Vision boxes: the vLLM tunnel URL the backend's LLM gateway should call
