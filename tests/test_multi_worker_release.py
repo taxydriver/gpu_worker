@@ -70,3 +70,22 @@ def test_worker_count_bounds_and_unit_shape():
 def test_local_url_requires_explicit_port():
     with pytest.raises(WorkerReleaseError, match="explicit port"):
         _indexed_local_url("http://127.0.0.1", 1)
+
+
+def test_render_validator_accepts_multi_form_only_with_count(tmp_path: Path):
+    # Regression for the first live proof failure (2026-08-17): the contract-
+    # validation re-render defaulted worker_count while the stage writer
+    # threaded it, so a correct 2-worker Caddyfile was refused. Every caller
+    # of _render_caddy_config must pass the contract's count.
+    from gpu_worker.worker_release import _render_caddy_config
+
+    config = tmp_path / "Caddyfile"
+    config.write_text(
+        expected_caddy_config(public_url=EDGE, local_url=LOCAL, worker_count=2)
+    )
+    rendered = _render_caddy_config(
+        config, public_url=EDGE, local_url=LOCAL, worker_count=2
+    )
+    assert "handle_path /gpu1/*" in rendered
+    with pytest.raises(WorkerReleaseError, match="exactly terminate"):
+        _render_caddy_config(config, public_url=EDGE, local_url=LOCAL)

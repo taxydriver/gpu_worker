@@ -1608,7 +1608,7 @@ def validate_secure_worker_contract(
     if contract.edge_provider == "cloudflared":
         _render_tunnel_config(Path(tunnel_env[config_key]), public_url=public_url, local_url=local_url, source_credential=Path(tunnel_env["FILMFORGE_TUNNEL_CREDENTIAL_FILE"]), staged_credential=Path("/validated/staged-tunnel-credential.json"))
     else:
-        _render_caddy_config(Path(tunnel_env[config_key]), public_url=public_url, local_url=local_url)
+        _render_caddy_config(Path(tunnel_env[config_key]), public_url=public_url, local_url=local_url, worker_count=contract.worker_count)
     return worker_env, tunnel_env, probe_env
 
 
