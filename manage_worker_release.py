@@ -82,6 +82,7 @@ def _stage(args: argparse.Namespace) -> int:
         tunnel_binary_source=args.tunnel_binary_source,
         edge_provider=args.edge_provider,
         profile_mode=args.profile_mode,
+        worker_count=args.worker_count,
     )
     staged = stage_secure_profile(contract, _layout(args))
     print(
@@ -223,6 +224,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="cloudflared named tunnel (default) or direct Caddy TLS edge",
     )
     stage.add_argument("--worker-port", required=True, type=int)
+    # ADR-0009: workers behind the single edge; 1 (default) is the byte-
+    # identical single-worker profile every existing caller stages.
+    stage.add_argument("--worker-count", type=int, default=1)
     stage.add_argument("--worker-public-url", required=True)
     stage.add_argument("--tunnel-local-url", required=True)
     stage.add_argument("--worker-exec", required=True, type=Path)

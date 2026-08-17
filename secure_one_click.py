@@ -35,6 +35,14 @@ from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+# The Caddyfile this flow authors must be byte-identical to the one the
+# remote release validator recomputes (ADR-0009): import the single source of
+# truth rather than duplicating the template on both sides of the SSH boundary.
+try:
+    from gpu_worker.worker_release import expected_caddy_config
+except ModuleNotFoundError:  # direct execution beside the module
+    from worker_release import expected_caddy_config
+
 
 CADDY_VERSION = "2.11.4"
 CADDY_ARCHIVE_SHA256 = "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9"
@@ -760,6 +768,7 @@ def _stage_profile_sources(
     public_url: str,
     profile_id: str,
     caddy_binary: Path,
+    worker_count: int = 1,
 ) -> tuple[str, str]:
     ssh_cmd = list(getattr(args, "_verda_ssh_cmd"))
     scp_cmd = list(getattr(args, "_verda_scp_cmd"))
@@ -804,10 +813,10 @@ def _stage_profile_sources(
                 f"FILMFORGE_BACKEND_CUTOVER_PROBE_URL={probe_url}\n"
                 f"FILMFORGE_BACKEND_CUTOVER_PROBE_TOKEN={secrets_value.cutover_probe_token}\n"
             ),
-            "Caddyfile": (
-                f"{urlsplit(public_url).hostname} {{\n"
-                f"    reverse_proxy {local_url}\n"
-                "}\n"
+            "Caddyfile": expected_caddy_config(
+                public_url=public_url,
+                local_url=local_url,
+                worker_count=worker_count,
             ),
         }
         for name, content in files.items():
@@ -875,6 +884,8 @@ def _stage_profile_sources(
                 edge_unit,
                 "--worker-port",
                 "9000",
+                "--worker-count",
+                str(worker_count),
                 "--worker-public-url",
                 public_url,
                 "--tunnel-local-url",
@@ -1071,13 +1082,18 @@ def _finalize_local_backend_env(path: Path, public_url: str) -> None:
     )
 
 
-def _validate_one_worker(args: Any) -> None:
+_MAX_SECURE_WORKERS = 8
+
+
+def _validated_worker_count(args: Any) -> int:
+    """Workers behind the single secure edge (ADR-0009). 1..8; default 1."""
     plan = [item for item in str(getattr(args, "verda_worker_plan", "") or "").split(",") if item.strip()]
-    count = len(plan) or int(getattr(args, "verda_worker_count", 0) or 0)
-    if count != 1:
+    count = len(plan) or int(getattr(args, "verda_worker_count", 0) or 0) or 1
+    if not 1 <= count <= _MAX_SECURE_WORKERS:
         raise OneClickDeploymentError(
-            "Automatic secure deployment currently supports exactly one GPU worker per VM"
+            f"Automatic secure deployment supports 1..{_MAX_SECURE_WORKERS} GPU workers per VM, got {count}"
         )
+    return count
 
 
 def run_secure_verda_first_install(
@@ -1094,12 +1110,21 @@ def run_secure_verda_first_install(
     """
 
     command_runner = runner or CommandRunner()
-    _validate_one_worker(args)
+    worker_count = _validated_worker_count(args)
     hostname, domain = _validated_hostname(
         getattr(args, "worker_edge_hostname", ""),
         getattr(args, "worker_edge_domain", ""),
     )
     public_url = f"https://{hostname}"
+    # ADR-0009: worker 0 owns the bare hostname; 1..N-1 ride path prefixes the
+    # edge strips, with loopback ports ascending from 9000. These two lists
+    # feed public_url_for_idx in the deploy layer, index for index.
+    indexed_public_urls = [public_url] + [
+        f"{public_url}/gpu{i}" for i in range(1, worker_count)
+    ]
+    indexed_local_urls = [
+        f"http://127.0.0.1:{9000 + i}" for i in range(worker_count)
+    ]
     backend_env = Path(getattr(args, "backend_env")).expanduser()
     print("[one-click] Preflight: immutable code, protected secrets, Fly, DNS, and Caddy")
     # Build and retain the exact committed package before any external mutation.
@@ -1125,8 +1150,8 @@ def run_secure_verda_first_install(
     for key, value in (
         ("WORKER_API_AUTH_MODE", "required"),
         ("FILMFORGE_BACKEND_CLIENT_AUTH_MODE", "bearer"),
-        ("WORKER_PUBLIC_URLS", public_url),
-        ("WORKER_TUNNEL_LOCAL_URLS", local_url),
+        ("WORKER_PUBLIC_URLS", ",".join(indexed_public_urls)),
+        ("WORKER_TUNNEL_LOCAL_URLS", ",".join(indexed_local_urls)),
         ("WORKER_TUNNEL_UNITS", edge_unit),
         ("WORKER_SECURITY_STAGE_RECEIPTS", stage_receipt),
         ("WORKER_EDGE_PROVIDER", "caddy"),
@@ -1167,6 +1192,7 @@ def run_secure_verda_first_install(
             public_url=public_url,
             profile_id=profile_id,
             caddy_binary=Path(caddy_directory.name) / "caddy",
+            worker_count=worker_count,
         )
         if returned_stage_receipt != stage_receipt:
             raise OneClickDeploymentError("Secure profile receipt path drifted")
@@ -1189,12 +1215,16 @@ def run_secure_verda_first_install(
             operation="cutover",
             receipt_path=cutover_receipt,
         )
-        _wait_for_authenticated_worker_ready(
-            public_url=public_url,
-            worker_api_token=secrets_value.worker_api_token,
-            expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
-            timeout=int(getattr(args, "verda_install_timeout", 3600)),
-        )
+        # Every worker behind the edge must prove the authenticated health
+        # contract before finalization — a 4-GPU box with one dead sibling is
+        # not a completed deployment (ADR-0009).
+        for _worker_url in indexed_public_urls:
+            _wait_for_authenticated_worker_ready(
+                public_url=_worker_url,
+                worker_api_token=secrets_value.worker_api_token,
+                expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
+                timeout=int(getattr(args, "verda_install_timeout", 3600)),
+            )
 
         print("[one-click] Authenticated cutover passed; activating immutable code")
         _phase(args, "activate")
@@ -1202,7 +1232,7 @@ def run_secure_verda_first_install(
         if not preserve_fly_contract:
             fly.enable_worker_dispatch()
         _finalize_local_backend_env(backend_env, public_url)
-        print(f"WORKER_URLS={public_url}")
+        print(f"WORKER_URLS={','.join(indexed_public_urls)}")
         print("[one-click] Complete: one secure worker is ready")
         return 0
     except Exception:

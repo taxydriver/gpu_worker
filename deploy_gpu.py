@@ -111,7 +111,9 @@ def _validate_worker_public_url_env(env_vars: list[str]) -> None:
             or parsed.password is not None
             or parsed.query
             or parsed.fragment
-            or parsed.path not in {"", "/"}
+            # Bare host for worker 0; /gpu{idx} path prefixes for indexed
+            # workers behind the shared secure edge (ADR-0009). Nothing else.
+            or not (parsed.path in {"", "/"} or re.fullmatch(r"/gpu\d+", parsed.path))
             or port is not None and not 1 <= port <= 65535
         ):
             raise RuntimeError("Worker public URL is invalid")

@@ -236,15 +236,17 @@ def test_interrupted_resume_verifies_fly_contract_without_secret_mutation(
     ]
 
 
-def test_one_click_rejects_multiple_workers_before_bundle_or_provider(
+def test_one_click_rejects_out_of_range_worker_count_before_bundle_or_provider(
     tmp_path: Path,
 ) -> None:
+    # ADR-0009: 1..8 workers ride behind one secure edge; anything outside that
+    # range still fails before the bundle is built or any provider is touched.
     events: list[str] = []
     api = _FakeDeployApi(events)
 
-    with pytest.raises(one.OneClickDeploymentError, match="exactly one"):
+    with pytest.raises(one.OneClickDeploymentError, match="1..8"):
         one.run_secure_verda_first_install(
-            _args(tmp_path, workers=2),
+            _args(tmp_path, workers=9),
             deploy_api=api,
             runner=_UnusedRunner(),
         )

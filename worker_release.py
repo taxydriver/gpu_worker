@@ -134,6 +134,13 @@ class SecureWorkerContract:
     # compatible callers; the on-disk receipt records the provider explicitly.
     edge_provider: str = "cloudflared"
     profile_mode: str = "migration"
+    # ADR-0009 (one edge, N workers): number of per-GPU worker services behind
+    # the single secure edge. The contract stays singular — one hostname, one
+    # tunnel unit, one cutover proof — and workers 1..N-1 ride as additional
+    # staged drop-ins (worker-secure-profile-gpu{i}.conf) that differ from
+    # worker 0's only by loopback port and a path-suffixed WORKER_PUBLIC_URL.
+    # Default 1 keeps every existing receipt and caller byte-identical.
+    worker_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -1324,18 +1331,78 @@ def _render_tunnel_config(
     return "".join(rewritten)
 
 
-def _render_caddy_config(source: Path, *, public_url: str, local_url: str) -> str:
+_MAX_WORKERS_PER_EDGE = 8
+
+
+def _validated_worker_count(worker_count: int, worker_unit: str) -> int:
+    count = int(worker_count)
+    if not 1 <= count <= _MAX_WORKERS_PER_EDGE:
+        raise WorkerReleaseError(
+            f"worker_count must be 1..{_MAX_WORKERS_PER_EDGE}, got {count}"
+        )
+    if count > 1 and "gpu0" not in worker_unit:
+        raise WorkerReleaseError(
+            "multi-worker contracts require a gpu0-indexed worker unit name"
+        )
+    return count
+
+
+def _indexed_worker_units(worker_unit: str, worker_count: int) -> list[str]:
+    """Sibling systemd units for workers 1..N-1, derived from the gpu0 unit."""
+    count = _validated_worker_count(worker_count, worker_unit)
+    return [worker_unit.replace("gpu0", f"gpu{i}") for i in range(1, count)]
+
+
+def _indexed_public_url(public_url: str, idx: int) -> str:
+    return f"{public_url.rstrip('/')}/gpu{idx}"
+
+
+def _indexed_local_url(local_url: str, idx: int) -> str:
+    parsed = urlsplit(local_url.rstrip("/"))
+    if parsed.port is None:
+        raise WorkerReleaseError("tunnel local URL must carry an explicit port")
+    return f"{parsed.scheme}://{parsed.hostname}:{parsed.port + idx}"
+
+
+def expected_caddy_config(*, public_url: str, local_url: str, worker_count: int = 1) -> str:
+    """The one exact Caddyfile this profile accepts, for N workers behind one edge.
+
+    Worker 0 stays the bare-hostname reverse proxy — a single-worker box
+    produces the byte-identical config this validator has always required.
+    Workers 1..N-1 are ``handle_path /gpu{i}/*`` blocks (ADR-0009): the prefix
+    is stripped by Caddy, so every worker serves its API at ``/`` and never
+    learns its own path. Ports ascend from worker 0's.
+    """
+    hostname = urlsplit(public_url).hostname
+    local = local_url.rstrip("/")
+    blocks = "".join(
+        (
+            f"    handle_path /gpu{i}/* {{\n"
+            f"        reverse_proxy {_indexed_local_url(local, i)}\n"
+            "    }\n"
+        )
+        for i in range(1, int(worker_count))
+    )
+    return (
+        f"{hostname} {{\n"
+        f"{blocks}"
+        f"    reverse_proxy {local}\n"
+        "}\n"
+    )
+
+
+def _render_caddy_config(
+    source: Path, *, public_url: str, local_url: str, worker_count: int = 1
+) -> str:
     """Accept only the small, deterministic Caddyfile used by this profile.
 
     This deliberately does not accept arbitrary snippets.  The immutable
     release must prove that the hostname terminates TLS and proxies only to the
-    loopback worker; optional Caddy directives would make that claim ambiguous.
+    loopback worker(s); optional Caddy directives would make that claim
+    ambiguous.
     """
-    hostname = urlsplit(public_url).hostname
-    expected = (
-        f"{hostname} {{\n"
-        f"    reverse_proxy {local_url}\n"
-        "}\n"
+    expected = expected_caddy_config(
+        public_url=public_url, local_url=local_url, worker_count=worker_count
     )
     if source.read_text() != expected:
         raise WorkerReleaseError(
@@ -1366,6 +1433,14 @@ def validate_secure_worker_contract(
         raise WorkerReleaseError("worker and tunnel systemd units must be different")
     if not 1 <= contract.worker_port <= 65535:
         raise WorkerReleaseError("invalid worker port")
+    _validated_worker_count(contract.worker_count, contract.worker_unit)
+    if contract.worker_port + contract.worker_count - 1 > 65535:
+        raise WorkerReleaseError("indexed worker ports exceed the valid range")
+    for sibling in _indexed_worker_units(contract.worker_unit, contract.worker_count):
+        if not _SAFE_UNIT.fullmatch(sibling):
+            raise WorkerReleaseError("invalid indexed worker systemd unit")
+        if sibling == contract.tunnel_unit:
+            raise WorkerReleaseError("indexed worker unit collides with the tunnel unit")
     public_url = _validated_https_url(
         contract.worker_public_url,
         label="worker public URL",
@@ -1616,11 +1691,41 @@ def _validate_profile_dropins(
     layout: SecureProfileLayout,
     profile_mode: str,
     allow_legacy_loopback: bool = False,
+    indexed_worker_units: tuple[str, ...] = (),
 ) -> Path | None:
     if PROFILE_DROPIN_NAME >= PUBLIC_OVERRIDE_NAME:
         raise WorkerReleaseError("secure profile must sort before public override")
     worker_dropin_dir.mkdir(parents=True, exist_ok=True)
     tunnel_dropin_dir.mkdir(parents=True, exist_ok=True)
+    # ADR-0009: indexed workers (gpu1..N-1) live under the same refusal rules
+    # as worker 0 — their drop-in dirs may hold only the managed profile link
+    # and, on first-install, the staged guard. No override, no legacy shims:
+    # indexed workers postdate both mechanisms.
+    for indexed_unit in indexed_worker_units:
+        indexed_dir = layout.systemd_root / f"{indexed_unit}.d"
+        indexed_dir.mkdir(parents=True, exist_ok=True)
+        allowed = {
+            PROFILE_DROPIN_NAME,
+            *({STAGED_GUARD_DROPIN_NAME} if profile_mode == "first-install" else set()),
+        }
+        unknown_indexed = [
+            path.name
+            for path in sorted(indexed_dir.glob("*.conf"))
+            if path.name not in allowed
+        ]
+        if unknown_indexed:
+            raise WorkerReleaseError(
+                f"unmanaged worker drop-ins would survive secure cutover ({indexed_unit}): "
+                + ", ".join(unknown_indexed)
+            )
+        for name in allowed:
+            candidate = indexed_dir / name
+            if (candidate.exists() or candidate.is_symlink()) and not _is_managed_profile_path(
+                candidate, layout
+            ):
+                raise WorkerReleaseError(
+                    f"existing indexed worker drop-in is not repo-managed ({indexed_unit})"
+                )
     worker_dropins = sorted(path for path in worker_dropin_dir.glob("*.conf"))
     unknown_worker = [
         path.name
@@ -1795,6 +1900,9 @@ def stage_secure_profile(
         layout=layout,
         profile_mode=contract.profile_mode,
         allow_legacy_loopback=legacy_profile is not None,
+        indexed_worker_units=tuple(
+            _indexed_worker_units(contract.worker_unit, contract.worker_count)
+        ),
     )
 
     contract_data: dict[str, object] = {
@@ -1914,7 +2022,7 @@ def stage_secure_profile(
                 _copy_secret(tunnel_credential_source, tunnel_credential_path)
                 _write_text(tunnel_config_path, _render_tunnel_config(tunnel_config_source, public_url=contract.worker_public_url.rstrip("/"), local_url=contract.tunnel_local_url.rstrip("/"), source_credential=tunnel_credential_source, staged_credential=final_tunnel_credential), mode=0o600)
             else:
-                _write_text(tunnel_config_path, _render_caddy_config(tunnel_config_source, public_url=contract.worker_public_url.rstrip("/"), local_url=contract.tunnel_local_url.rstrip("/")), mode=0o600)
+                _write_text(tunnel_config_path, _render_caddy_config(tunnel_config_source, public_url=contract.worker_public_url.rstrip("/"), local_url=contract.tunnel_local_url.rstrip("/"), worker_count=contract.worker_count), mode=0o600)
             staged_tunnel_env = dict(tunnel_env)
             if contract.edge_provider == "cloudflared":
                 staged_tunnel_env.update({"FILMFORGE_TUNNEL_CONFIG_FILE": str(final_tunnel_config), "FILMFORGE_TUNNEL_CREDENTIAL_FILE": str(final_tunnel_credential), "FILMFORGE_TUNNEL_WORKER_SECRET_FILE": str(final_worker_env), "FILMFORGE_TUNNEL_CUTOVER_AUTHORIZATION_FILE": str(release_dir / "cutover-authorized"), "FILMFORGE_TUNNEL_WORKER_CODE_RELEASE_ID": contract.worker_code_release_id, "CLOUDFLARED_BIN": str(final_tunnel_binary)})
@@ -1967,6 +2075,32 @@ def stage_secure_profile(
                 worker_dropin_content,
                 mode=0o644,
             )
+            # ADR-0009: one staged drop-in per additional worker. Identical to
+            # worker 0's except the loopback port and a WORKER_PUBLIC_URL set
+            # AFTER the EnvironmentFile line — systemd's last-assignment-wins
+            # gives each indexed worker its /gpu{i} path-suffixed identity
+            # while every secret still comes from the one staged env file.
+            for _idx in range(1, contract.worker_count):
+                indexed_content = (
+                    "[Unit]\n"
+                    f"BindsTo={contract.tunnel_unit}\n"
+                    f"Requires={contract.tunnel_unit}\n"
+                    f"After={contract.tunnel_unit}\n\n"
+                    "[Service]\n"
+                    f"EnvironmentFile={final_worker_env}\n"
+                    f"Environment=WORKER_PUBLIC_URL={_indexed_public_url(contract.worker_public_url, _idx)}\n"
+                    "Environment=PYTHONDONTWRITEBYTECODE=1\n"
+                    f"Environment=WORKER_CODE_RELEASE_ID={contract.worker_code_release_id}\n"
+                    f"WorkingDirectory={contract.worker_module_dir}\n"
+                    "ExecStart=\n"
+                    f"ExecStart={contract.worker_exec} -m uvicorn gpu_worker.app:app "
+                    f"--host 127.0.0.1 --port {contract.worker_port + _idx}\n"
+                )
+                _write_text(
+                    staging / f"worker-secure-profile-gpu{_idx}.conf",
+                    indexed_content,
+                    mode=0o644,
+                )
             _write_text(
                 staging / "tunnel-secure-profile.conf",
                 tunnel_dropin_content,
@@ -2032,6 +2166,12 @@ def stage_secure_profile(
                 "worker_guard_sha256": _sha256_file(
                     staging / "worker-staged-guard.conf"
                 ),
+                **{
+                    f"worker_dropin_gpu{_idx}_sha256": _sha256_file(
+                        staging / f"worker-secure-profile-gpu{_idx}.conf"
+                    )
+                    for _idx in range(1, contract.worker_count)
+                },
                 "staged_at_epoch": int(time.time()),
                 "tunnel_prepared": False,
                 "cutover_performed": False,
@@ -2059,6 +2199,14 @@ def stage_secure_profile(
             release_dir / "worker-staged-guard.conf",
             worker_dropin_dir / STAGED_GUARD_DROPIN_NAME,
         )
+        # ADR-0009: indexed workers get the same start guard — the deploy layer
+        # enables their base units, and none may start before the receipt-gated
+        # cutover authorizes the release, exactly like worker 0.
+        for _unit in _indexed_worker_units(contract.worker_unit, contract.worker_count):
+            _atomic_symlink(
+                release_dir / "worker-staged-guard.conf",
+                layout.systemd_root / f"{_unit}.d" / STAGED_GUARD_DROPIN_NAME,
+            )
     _atomic_symlink(release_dir, layout.state_root / "staged" / contract.worker_unit)
     # Re-check after tunnel-only link installation. The worker dependency and
     # ExecStart are intentionally not linked until the receipt-gated cutover;
@@ -2070,6 +2218,9 @@ def stage_secure_profile(
         layout=layout,
         profile_mode=contract.profile_mode,
         allow_legacy_loopback=legacy_profile is not None,
+        indexed_worker_units=tuple(
+            _indexed_worker_units(contract.worker_unit, contract.worker_count)
+        ),
     )
     _verify_staged_release(release_dir, _stage_data(release_dir))
     return StagedSecureProfile(
@@ -2105,7 +2256,23 @@ def _staged_artifacts(stage_data: dict[str, object]) -> dict[str, tuple[str, int
         artifacts["caddy_config_sha256"] = ("Caddyfile", 0o600)
         artifacts["caddy_exec_sha256"] = ("filmforge-worker-caddy", 0o755)
         artifacts["caddy_binary_sha256"] = ("caddy", 0o755)
+    for _idx in range(1, int(stage_data.get("worker_count") or 1)):
+        artifacts[f"worker_dropin_gpu{_idx}_sha256"] = (
+            f"worker-secure-profile-gpu{_idx}.conf",
+            0o644,
+        )
     return artifacts
+
+
+def _stage_worker_count(stage_data: dict[str, object]) -> int:
+    """worker_count from a receipt; pre-ADR-0009 receipts read as 1."""
+    return int(stage_data.get("worker_count") or 1)
+
+
+def _stage_indexed_units(stage_data: dict[str, object]) -> list[str]:
+    return _indexed_worker_units(
+        str(stage_data["worker_unit"]), _stage_worker_count(stage_data)
+    )
 
 
 def _verify_staged_release(
@@ -2149,12 +2316,20 @@ def _assert_active_profile_links(
         tunnel_dropin: release_dir / "tunnel-secure-profile.conf",
         tunnel_unit_path: release_dir / "filmforge-worker-tunnel.service",
     }
+    indexed_dropins = {
+        layout.systemd_root / f"{unit}.d" / PROFILE_DROPIN_NAME:
+            release_dir / f"worker-secure-profile-gpu{idx}.conf"
+        for idx, unit in enumerate(_stage_indexed_units(stage_data), start=1)
+    }
     if require_worker_profile:
         expected[worker_dropin] = release_dir / "worker-secure-profile.conf"
-    elif worker_dropin.exists() or worker_dropin.is_symlink():
-        raise WorkerReleaseError(
-            "worker secure profile became active before receipt-gated cutover"
-        )
+        expected.update(indexed_dropins)
+    else:
+        for pending in (worker_dropin, *indexed_dropins):
+            if pending.exists() or pending.is_symlink():
+                raise WorkerReleaseError(
+                    "worker secure profile became active before receipt-gated cutover"
+                )
     for managed_path, target in expected.items():
         if not managed_path.is_symlink() or managed_path.resolve() != target.resolve():
             raise WorkerReleaseError("staged secure profile is not the active managed set")
@@ -2197,6 +2372,7 @@ def prepare_secure_profile(
         layout=layout,
         profile_mode=profile_mode,
         allow_legacy_loopback=stage_data.get("legacy_loopback_dropin_sha256") is not None,
+        indexed_worker_units=tuple(_stage_indexed_units(stage_data)),
     )
     if override is not None and _sha256_file(override) != stage_data.get(
         "public_override_sha256"
@@ -2565,6 +2741,7 @@ def cutover_secure_profile(
             layout=layout,
             profile_mode="migration" if transition_incomplete else "first-install",
             allow_legacy_loopback=transition_incomplete,
+            indexed_worker_units=tuple(_stage_indexed_units(stage_data)),
         )
     else:
         override = _validate_profile_dropins(
@@ -2574,6 +2751,7 @@ def cutover_secure_profile(
             layout=layout,
             profile_mode=profile_mode,
             allow_legacy_loopback=stage_data.get("legacy_loopback_dropin_sha256") is not None,
+            indexed_worker_units=tuple(_stage_indexed_units(stage_data)),
         )
     if override is not None and _sha256_file(override) != stage_data.get(
         "public_override_sha256"
@@ -2642,6 +2820,16 @@ def cutover_secure_profile(
         )
         if not already_switched:
             _atomic_symlink(expected_worker_dropin, worker_dropin)
+        # ADR-0009: indexed worker links install idempotently on every cutover
+        # pass — a crash between link writes must not strand a rerun, and
+        # _atomic_symlink is a safe overwrite toward the same target.
+        indexed_units_by_dropin: dict[Path, str] = {}
+        for _idx, _unit in enumerate(_stage_indexed_units(stage_data), start=1):
+            _indexed_dropin = layout.systemd_root / f"{_unit}.d" / PROFILE_DROPIN_NAME
+            _atomic_symlink(
+                release_dir / f"worker-secure-profile-gpu{_idx}.conf", _indexed_dropin
+            )
+            indexed_units_by_dropin[_indexed_dropin] = _unit
         if not authorization.exists():
             _write_text(authorization, release_id + "\n", mode=0o600)
         elif (
@@ -2664,6 +2852,7 @@ def cutover_secure_profile(
             tunnel_unit_path=tunnel_unit_path,
             layout=layout,
             profile_mode="first-install",
+            indexed_worker_units=tuple(_stage_indexed_units(stage_data)),
         )
         service_controller.daemon_reload()
         worker_allowed_dropins = [worker_dropin]
@@ -2681,6 +2870,21 @@ def cutover_secure_profile(
         # Public port closure is checked only after the loopback profile has
         # restarted, never before the verified receipt and override removal.
         service_controller.assert_loopback_only(worker_port)
+        for _offset, (_indexed_dropin, _unit) in enumerate(
+            indexed_units_by_dropin.items(), start=1
+        ):
+            _indexed_allowed = [_indexed_dropin]
+            if profile_mode == "first-install":
+                _indexed_allowed.insert(
+                    0, _indexed_dropin.parent / STAGED_GUARD_DROPIN_NAME
+                )
+            service_controller.assert_unit_loaded(
+                _unit,
+                fragment_path=layout.systemd_root / _unit,
+                dropin_paths=_indexed_allowed,
+            )
+            service_controller.restart(_unit)
+            service_controller.assert_loopback_only(worker_port + _offset)
         probe_env = _strict_secret_env(release_dir / "backend-cutover-probe.env")
         service_controller.assert_authenticated_backend_route(
             probe_url=probe_env["FILMFORGE_BACKEND_CUTOVER_PROBE_URL"],
@@ -2704,6 +2908,9 @@ def cutover_secure_profile(
             service_controller.enable(worker_unit)
             service_controller.assert_enabled(tunnel_unit)
             service_controller.assert_enabled(worker_unit)
+            for _unit in indexed_units_by_dropin.values():
+                service_controller.enable(_unit)
+                service_controller.assert_enabled(_unit)
     except Exception as exc:
         active_profile = layout.state_root / "active" / worker_unit
         _atomic_symlink(release_dir, active_profile)
@@ -2967,6 +3174,10 @@ def _rollback_secure_profile_unlocked(
     boot_authorization.unlink(missing_ok=True)
     if worker_dropin.is_symlink():
         worker_dropin.unlink()
+    for _unit in _stage_indexed_units(stage_data):
+        _indexed_dropin = worker_dropin.parent.parent / f"{_unit}.d" / PROFILE_DROPIN_NAME
+        if _indexed_dropin.is_symlink():
+            _indexed_dropin.unlink()
     _restore_legacy_profile(
         release_dir=release_dir,
         stage_data=stage_data,
@@ -2989,6 +3200,9 @@ def _rollback_secure_profile_unlocked(
     else:
         service_controller.stop(worker_unit)
         service_controller.disable(worker_unit)
+        for _unit in _stage_indexed_units(stage_data):
+            service_controller.stop(_unit)
+            service_controller.disable(_unit)
     service_controller.stop(tunnel_unit)
     if profile_mode == "first-install":
         service_controller.disable(tunnel_unit)
@@ -2997,6 +3211,12 @@ def _rollback_secure_profile_unlocked(
             managed.unlink()
     if guard.is_symlink():
         guard.unlink()
+    for _unit in _stage_indexed_units(stage_data):
+        _indexed_guard = (
+            worker_dropin.parent.parent / f"{_unit}.d" / STAGED_GUARD_DROPIN_NAME
+        )
+        if _indexed_guard.is_symlink():
+            _indexed_guard.unlink()
     service_controller.daemon_reload()
     if active_profile.is_symlink():
         active_profile.unlink()
