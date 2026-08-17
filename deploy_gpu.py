@@ -264,11 +264,22 @@ def _preflight_complete_worker_contract(
         for value in rendered["WORKER_SECURITY_STAGE_RECEIPTS"].split(",")
         if value.strip()
     ]
+    # ADR-0009 (one edge, N workers): public and local URLs pair index-for-
+    # index per worker, while the tunnel unit and stage receipt describe the
+    # single shared edge — exactly one of each regardless of worker count.
+    # The pre-ADR one-list-per-worker shape (equal cardinality across all
+    # four) remains valid for its callers.
+    shared_edge = len(tunnel_units) == 1 and len(stage_receipts) == 1
     if (
         not public_urls
         or len(public_urls) != len(local_urls)
-        or len(public_urls) != len(tunnel_units)
-        or len(public_urls) != len(stage_receipts)
+        or (
+            not shared_edge
+            and (
+                len(public_urls) != len(tunnel_units)
+                or len(public_urls) != len(stage_receipts)
+            )
+        )
     ):
         raise RuntimeError(
             "Worker public URLs, tunnel local URLs, tunnel units, and stage receipts must have equal cardinality"
