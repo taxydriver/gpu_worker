@@ -3673,23 +3673,49 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   systemctl enable --now "comfyui-gpu${{idx}}.service"
 done
 
-for idx in $(seq 0 $((GPU_COUNT - 1))); do
-  test "$(dept_for_idx "$idx")" = "generation" || continue
-  port=$((COMFY_PORT_BASE + idx))
-  stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
-  rm -f "$stats_file"
-  for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >"$stats_file" 2>/dev/null; then
-      break
+wait_comfy_healthy() {{
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    test "$(dept_for_idx "$idx")" = "generation" || continue
+    port=$((COMFY_PORT_BASE + idx))
+    stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
+    rm -f "$stats_file"
+    for _ in $(seq 1 60); do
+      if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >"$stats_file" 2>/dev/null; then
+        break
+      fi
+      sleep 2
+    done
+    if ! test -s "$stats_file"; then
+      echo "ComfyUI gpu${{idx}} failed system_stats health check" >&2
+      journalctl -u "comfyui-gpu${{idx}}.service" -n 120 --no-pager >&2 || true
+      exit 1
     fi
-    sleep 2
   done
-  if ! test -s "$stats_file"; then
-    echo "ComfyUI gpu${{idx}} failed system_stats health check" >&2
-    journalctl -u "comfyui-gpu${{idx}}.service" -n 120 --no-pager >&2 || true
-    exit 1
-  fi
-done
+}}
+wait_comfy_healthy
+
+# ── InfiniteTalk Comfy custom-node provisioner ────────────────────────────────
+# This is GPU-stack work and must run before the secure provision-only exit.
+# The cutover pass returns through the security stage gate at the top of this
+# script, so anything after the exit is dead code on the one-click rent path.
+# Comfy discovers custom nodes only at start: restart generation instances and
+# prove them healthy again before releasing the staged receipt.
+_infinitetalk_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
+esac
+if test -n "$_infinitetalk_wanted"; then
+  echo "[infinitetalk] provisioning Comfy talking-shot runtime"
+  cd "$WORKER_ROOT"
+  bash provision_infinitetalk.sh
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    echo "[infinitetalk] restarting ComfyUI on generation gpu$idx after provisioning"
+    systemctl restart "comfyui-gpu${{idx}}.service"
+  done
+  wait_comfy_healthy
+fi
 
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
   echo "WORKER_RELEASE_STAGED_ONLY=${{WORKER_CODE_RELEASE_ID}}"
@@ -3837,27 +3863,6 @@ if test -n "$_audio_wanted"; then
     bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
 fi
 )
-
-# ── InfiniteTalk / MultiTalk Comfy extension ───────────────────────────────────
-# A1 is a generation-card runtime: its Wan 2.1 weights are handled by the worker
-# asset manager, while this provisioner installs the custom nodes and wav2vec
-# Python path. Run it only for an explicit capability selection. A restart comes
-# strictly after the provisioner so Comfy discovers the new node classes.
-_infinitetalk_wanted=""
-case ",${{WORKER_CAPABILITIES:-}}," in
-  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
-esac
-if test -n "$_infinitetalk_wanted"; then
-  echo "[infinitetalk] provisioning Comfy talking-shot runtime"
-  cd "$WORKER_ROOT"
-  bash provision_infinitetalk.sh
-  for idx in $(seq 0 $((GPU_COUNT - 1))); do
-    dept="$(dept_for_idx "$idx")"
-    test "$dept" = "generation" || continue
-    echo "[infinitetalk] restarting ComfyUI on generation gpu$idx after provisioning"
-    systemctl restart "comfyui-gpu${{idx}}.service"
-  done
-fi
 
 # ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
 # The provisioners above are shell scripts read from the box's git checkout of

@@ -223,12 +223,21 @@ def test_audio_still_triggers_on_capabilities_without_a_plan() -> None:
     assert "*,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;" in _script(None)
 
 
+def _provision_only_exit(script: str) -> int:
+    # Select the rehydrate body's provision-only gate, not the earlier security
+    # stage gate which emits the same receipt token.
+    return script.index("WORKER_RELEASE_STAGED_ONLY=", script.index("wait_comfy_healthy()"))
+
+
 def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
-    script = _script(PLAN)
-    provision = script.index("bash provision_infinitetalk.sh")
-    restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
-    assert provision < restart
-    assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_infinitetalk.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        rewait = script.index("wait_comfy_healthy", restart)
+        gate = _provision_only_exit(script)
+        assert provision < restart < rewait < gate
+        assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:
