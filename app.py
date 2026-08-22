@@ -60,7 +60,7 @@ from gpu_worker.infinitetalk import (
 )
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.stitch import stitch_clips, upload_via_signed_put
-from gpu_worker.utils import sha256_file
+from gpu_worker.utils import ensure_no_symlink_path, sha256_file
 from gpu_worker.worker_auth import (
     WorkerAPIAuthError,
     verify_worker_api_authorization,
@@ -321,19 +321,25 @@ def _normalize_infinitetalk_audio_inputs(
         staged_name = node["inputs"].get(file_spec.input_name)
         if not isinstance(staged_name, str) or not staged_name:
             raise ValueError(f"InfiniteTalk audio input is missing: {file_spec.node_id}")
-        source = (input_root / staged_name).resolve(strict=False)
-        try:
-            source.relative_to(input_root)
-        except ValueError as exc:
-            raise ValueError("InfiniteTalk staged audio escapes Comfy input") from exc
+        source = ensure_no_symlink_path(
+            input_root,
+            input_root / staged_name,
+            require_leaf=True,
+            require_regular_file=True,
+            action="InfiniteTalk staged audio",
+        )
         normalized_path = normalize_approved_mpeg_to_wav(source, job_id=job_id)
-        if normalized_path.is_symlink():
-            raise RuntimeError("InfiniteTalk normalized audio lost source/job ownership")
         expected_normalized = normalized_audio_path_for_source(
             source_digest,
             job_id=job_id,
-        ).resolve(strict=False)
-        normalized = normalized_path.resolve(strict=False)
+        )
+        normalized = ensure_no_symlink_path(
+            input_root,
+            normalized_path,
+            require_leaf=True,
+            require_regular_file=True,
+            action="InfiniteTalk normalized audio",
+        )
         if normalized != expected_normalized:
             raise RuntimeError("InfiniteTalk normalized audio lost source/job ownership")
         try:

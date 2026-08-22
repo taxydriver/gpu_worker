@@ -23,7 +23,12 @@ from urllib3.util import Timeout
 
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import ComfyInputFile, OutputFile
-from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
+from gpu_worker.utils import (
+    ensure_no_symlink_path,
+    is_non_empty_file,
+    safe_unlink,
+    sha256_file,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -810,12 +815,16 @@ def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) 
     if subfolder.is_absolute():
         raise ValueError(f"Comfy input subfolder must be relative: {file_spec.subfolder}")
 
-    destination_dir = (base_dir / subfolder).resolve(strict=False)
+    destination = base_dir / subfolder / staged_filename
     try:
-        destination_dir.relative_to(base_dir)
-    except ValueError as exc:
-        raise ValueError(f"Comfy input subfolder escapes input dir: {file_spec.subfolder}") from exc
-    return destination_dir / staged_filename
+        return ensure_no_symlink_path(
+            base_dir,
+            destination,
+            require_leaf=False,
+            action="Comfy input destination",
+        )
+    except RuntimeError as exc:
+        raise ValueError(f"Unsafe Comfy input subfolder: {file_spec.subfolder}") from exc
 
 
 def _decode_inline_source_data(source_data: str) -> bytes:
@@ -871,6 +880,12 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
     destination = _resolve_input_destination(file_spec, staged_filename)
     destination_dir = destination.parent
     destination_dir.mkdir(parents=True, exist_ok=True)
+    ensure_no_symlink_path(
+        comfy_input_dir(),
+        destination,
+        require_leaf=False,
+        action="Comfy input destination",
+    )
     if destination.is_symlink():
         LOGGER.warning("Removing unsafe staged Comfy input symlink")
         safe_unlink(destination)
@@ -940,11 +955,13 @@ def observe_staged_input_receipts(
         staged_name = inputs.get(file_spec.input_name) if isinstance(inputs, dict) else None
         if not isinstance(staged_name, str) or not staged_name:
             raise RuntimeError("Staged Comfy input is missing from graph")
-        staged = (input_root / staged_name).resolve(strict=False)
-        try:
-            staged.relative_to(input_root)
-        except ValueError as exc:
-            raise RuntimeError("Staged Comfy input escapes input directory") from exc
+        staged = ensure_no_symlink_path(
+            input_root,
+            input_root / staged_name,
+            require_leaf=True,
+            require_regular_file=True,
+            action="Observed staged input",
+        )
         _ensure_valid_staged_input(staged, file_spec, "Observed staged")
         digest = sha256_file(staged)
         expected = str(file_spec.expected_sha256 or "").strip().lower()

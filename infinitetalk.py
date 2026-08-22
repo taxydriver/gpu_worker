@@ -21,6 +21,7 @@ import requests
 
 from gpu_worker.asset_registry import get_asset_group
 from gpu_worker.config import get_settings
+from gpu_worker.utils import ensure_no_symlink_path
 
 
 INFINITETALK_ASSET_GROUP = "infinitetalk_v1"
@@ -187,7 +188,7 @@ def normalized_audio_path_for_source(source_content_sha256: str, *, job_id: str)
     digest = str(source_content_sha256 or "").strip().lower()
     if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
         raise ValueError("InfiniteTalk source audio digest is invalid")
-    input_root = Path(get_settings().comfy_input_dir).expanduser()
+    input_root = Path(get_settings().comfy_input_dir).expanduser().resolve(strict=False)
     return input_root / "infinitetalk" / _job_scope(job_id) / f"{digest}.wav"
 
 
@@ -270,13 +271,32 @@ def normalize_approved_mpeg_to_wav(source: Path, *, job_id: str) -> Path:
 
     _job_scope(job_id)  # Reject an unusable ownership scope before probing media.
     digest = _hash_approved_mpeg(source)
-    _probe_approved_duration(source)
     destination = normalized_audio_path_for_source(digest, job_id=job_id)
+    input_root = Path(get_settings().comfy_input_dir).expanduser().resolve(strict=False)
+    ensure_no_symlink_path(
+        input_root,
+        destination,
+        require_leaf=False,
+        action="InfiniteTalk normalized audio",
+    )
+    _probe_approved_duration(source)
     if _is_valid_normalized_wav(destination):
         return destination
     _discard_invalid_wav(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    ensure_no_symlink_path(
+        input_root,
+        destination,
+        require_leaf=False,
+        action="InfiniteTalk normalized audio",
+    )
     temporary = destination.with_name(f".{destination.stem}.part.wav")
+    ensure_no_symlink_path(
+        input_root,
+        temporary,
+        require_leaf=False,
+        action="InfiniteTalk normalized audio temporary",
+    )
     try:
         subprocess.run(
             [
@@ -288,9 +308,23 @@ def normalize_approved_mpeg_to_wav(source: Path, *, job_id: str) -> Path:
             capture_output=True,
             timeout=120,
         )
+        ensure_no_symlink_path(
+            input_root,
+            temporary,
+            require_leaf=True,
+            require_regular_file=True,
+            action="InfiniteTalk normalized audio temporary",
+        )
         if not _is_valid_normalized_wav(temporary):
             raise RuntimeError("ffmpeg produced no bounded 16 kHz mono PCM WAV")
         temporary.replace(destination)
+        ensure_no_symlink_path(
+            input_root,
+            destination,
+            require_leaf=True,
+            require_regular_file=True,
+            action="InfiniteTalk normalized audio",
+        )
     finally:
         if temporary.exists():
             temporary.unlink()

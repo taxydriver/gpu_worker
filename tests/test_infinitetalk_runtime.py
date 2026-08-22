@@ -301,6 +301,67 @@ def test_execute_run_reobserves_effective_inputs_on_retry(monkeypatch):
     assert result.error == "Observed staged input digest mismatch"
 
 
+def test_normalizer_rejects_symlinked_job_dir_before_cache_reuse(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_input_root(monkeypatch, input_root)
+    source = input_root / "approved.mp3"
+    source.write_bytes(b"approved-dialogue")
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    job_id = "symlink-cache-proof"
+    job_scope = runtime._job_scope(job_id)
+    attacker_dir = tmp_path / "attacker-controlled"
+    attacker_dir.mkdir()
+    wrong_wav = attacker_dir / f"{source_digest}.wav"
+    _write_pcm_wav(wrong_wav, seconds=1.0)
+    job_dir = input_root / "infinitetalk" / job_scope
+    job_dir.parent.mkdir()
+    job_dir.symlink_to(attacker_dir, target_is_directory=True)
+    subprocess_calls = []
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe symlink"):
+        runtime.normalize_approved_mpeg_to_wav(source, job_id=job_id)
+
+    assert runtime._is_valid_normalized_wav(wrong_wav)
+    assert subprocess_calls == []
+
+
+def test_observer_rejects_ancestor_symlink_even_for_matching_wav(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    monkeypatch.setattr(comfy_client, "comfy_input_dir", lambda: input_root)
+    job_scope = runtime._job_scope("observer-symlink-proof")
+    attacker_dir = tmp_path / "attacker-controlled"
+    matching_wav = attacker_dir / "matching.wav"
+    _write_pcm_wav(matching_wav, seconds=1.0)
+    digest = hashlib.sha256(matching_wav.read_bytes()).hexdigest()
+    job_dir = input_root / "infinitetalk" / job_scope
+    job_dir.parent.mkdir()
+    job_dir.symlink_to(attacker_dir, target_is_directory=True)
+    payload = {
+        "10": {
+            "inputs": {
+                "audio": f"infinitetalk/{job_scope}/{matching_wav.name}",
+            }
+        }
+    }
+    spec = ComfyInputFile(
+        node_id="10",
+        input_name="audio",
+        filename=matching_wav.name,
+        expected_sha256=digest,
+        content_type="audio/wav",
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe symlink"):
+        comfy_client.observe_staged_input_receipts(payload, [spec])
+
+
 def test_mpeg_normalization_is_streamed_bounded_and_job_isolated(monkeypatch, tmp_path):
     source = tmp_path / "approved.mp3"
     source.write_bytes(b"approved-dialogue")
