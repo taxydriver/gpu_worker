@@ -234,14 +234,20 @@ def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
         provision = script.index("bash provision_infinitetalk.sh")
         restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
         rewait = script.index("wait_comfy_healthy", restart)
-        materialize = script.index('ensure_asset_group("infinitetalk_v1")', rewait)
-        readiness = script.index("readiness = check_infinitetalk_readiness()", materialize)
+        materialize = script.index("result = ensure_asset_group(asset_group)", rewait)
+        readiness = script.index(
+            "readiness = check_infinitetalk_readiness(require_two_person=require_two_person)",
+            materialize,
+        )
         seal = script.index("immutable worker candidate failed pre-cutover seal", readiness)
         gate = _provision_only_exit(script)
         assert provision < restart < rewait < materialize < readiness < seal < gate
         assert "bash provision_infinitetalk.sh" not in script[gate:]
-        assert 'ensure_asset_group("infinitetalk_v1")' not in script[gate:]
+        assert "ensure_asset_group(asset_group)" not in script[gate:]
         assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+        assert '*,infinitetalk_two_person_v1,*' in script
+        assert '_infinitetalk_asset_group="infinitetalk_two_person_v1"' in script
+        assert 'INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"' in script
         assert 'COMFY_BASE_URL="http://127.0.0.1:${_infinitetalk_comfy_port}"' in script
         assert 'COMFY_DIR="$COMFY_ROOT"' in script
         assert 'PYTHONDONTWRITEBYTECODE=1' in script[materialize - 500:materialize]
@@ -249,6 +255,21 @@ def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
         assert '"$WORKER_ROOT/.venv/bin/python" -' in script
         assert "InfiniteTalk readiness failed before secure cutover" in script
         assert "worker release candidate is incomplete; refusing staged receipt" in script
+
+
+def test_two_person_infinitetalk_preflight_is_strict_and_precedes_staged_receipt() -> None:
+    script = _script(None)
+    a2_case = script.index("*,infinitetalk_two_person_v1,*")
+    a1_case = script.index("*,infinitetalk,*|*,infinitetalk_v1,*", a2_case)
+    group_env = script.index('INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group"', a1_case)
+    strict_env = script.index('INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"', group_env)
+    strict_readiness = script.index(
+        "check_infinitetalk_readiness(require_two_person=require_two_person)",
+        strict_env,
+    )
+    gate = _provision_only_exit(script)
+
+    assert a2_case < a1_case < group_env < strict_env < strict_readiness < gate
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:
@@ -261,6 +282,11 @@ def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> N
     # The mutating clone path is strictly after the lock acquisition, so both
     # rehydrate and asset-manager ensure calls use the same filesystem lock.
     assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
+    assert "WAN_WRAPPER_COMMIT=088128b224242e110d3906c6750e9a3a348a659b" in source
+    assert 'git -C "$d" checkout --detach "$approved_commit"' in source
+    assert "FATAL: mask-patch site not found in approved wrapper" in source
+    assert "WARN: mask-patch site not found" not in source
+    assert "two-speaker mask patch was not positively verified" in source
 
 
 def test_hf_token_is_injected_for_a_plan_with_audio(monkeypatch, tmp_path: Path) -> None:

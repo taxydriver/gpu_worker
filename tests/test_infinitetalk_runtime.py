@@ -10,12 +10,13 @@ import wave
 import zlib
 
 import pytest
+from pydantic import ValidationError
 
 from gpu_worker import app
 from gpu_worker import asset_manager
 from gpu_worker import comfy_client
 from gpu_worker import infinitetalk as runtime
-from gpu_worker.schemas import ComfyInputFile, RunRequest
+from gpu_worker.schemas import ComfyInputFile, InfiniteTalkTwoPersonRouting, RunRequest
 
 
 PNG_BYTES = (
@@ -43,6 +44,44 @@ def _rgb_png(red: int, green: int, blue: int) -> bytes:
         + chunk(b"IDAT", zlib.compress(bytes((0, red, green, blue))))
         + chunk(b"IEND", b"")
     )
+
+
+def _gray_png(width: int, height: int, value: int = 127) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", binascii.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    rows = b"".join(b"\0" + bytes([value]) * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _decode_gray_png(data: bytes) -> tuple[int, int, bytes]:
+    width, height = struct.unpack(">II", data[16:24])
+    offset = 8
+    compressed = bytearray()
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:offset + 8 + length]
+        if kind == b"IDAT":
+            compressed.extend(payload)
+        offset += 12 + length
+    rows = zlib.decompress(bytes(compressed))
+    pixels = bytearray()
+    stride = width + 1
+    for row in range(height):
+        assert rows[row * stride] == 0
+        pixels.extend(rows[row * stride + 1:(row + 1) * stride])
+    return width, height, bytes(pixels)
 
 
 def test_readiness_requires_every_a1_node_and_wav2vec_dependency(monkeypatch, tmp_path):
@@ -76,7 +115,7 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
     monkeypatch.setattr(
         app,
         "check_infinitetalk_readiness",
-        lambda: runtime.InfiniteTalkReadiness(ready=False, missing_files=("missing",)),
+        lambda **_kwargs: runtime.InfiniteTalkReadiness(ready=False, missing_files=("missing",)),
     )
 
     capabilities, readiness = app._advertised_capabilities()
@@ -87,8 +126,132 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
         "missing_files": ["missing"],
         "missing_node_classes": [],
         "wav2vec_dependency_error": None,
+        "multitalk_contract_error": None,
+        "multi_checkpoint_error": None,
         "comfy_error": None,
     }
+
+
+def test_a2_capability_is_withheld_without_strict_readiness_but_a1_remains(monkeypatch):
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(
+            resolved_capabilities=lambda: [
+                "infinitetalk_v1",
+                "infinitetalk_two_person_v1",
+            ]
+        ),
+    )
+    checks = []
+
+    def readiness(*, require_two_person=False):
+        checks.append(require_two_person)
+        return runtime.InfiniteTalkReadiness(
+            ready=not require_two_person,
+            multitalk_contract_error=("missing explicit-mask schema" if require_two_person else None),
+        )
+
+    monkeypatch.setattr(app, "check_infinitetalk_readiness", readiness)
+
+    capabilities, details = app._advertised_capabilities()
+
+    assert checks == [False, True]
+    assert capabilities == ["infinitetalk_v1"]
+    assert details["ready"] is False
+    assert details["multitalk_contract_error"] == "missing explicit-mask schema"
+
+
+def test_a2_object_info_requires_audio2_masks_and_para_schema():
+    valid = {
+        "MultiTalkWav2VecEmbeds": {
+            "input": {
+                "required": {"multi_audio_type": [["para", "add"], {}]},
+                "optional": {"audio_2": ["AUDIO"], "ref_target_masks": ["MASK"]},
+            }
+        }
+    }
+    assert runtime._multitalk_object_contract_error(valid) is None
+
+    no_masks = {
+        "MultiTalkWav2VecEmbeds": {
+            "input": {
+                "required": {"multi_audio_type": [["para", "add"], {}]},
+                "optional": {"audio_2": ["AUDIO"]},
+            }
+        }
+    }
+    assert "ref_target_masks" in runtime._multitalk_object_contract_error(no_masks)
+
+    no_para = {
+        "MultiTalkWav2VecEmbeds": {
+            "input": {
+                "required": {"multi_audio_type": [["add"], {}]},
+                "optional": {"audio_2": ["AUDIO"], "ref_target_masks": ["MASK"]},
+            }
+        }
+    }
+    assert "para" in runtime._multitalk_object_contract_error(no_para)
+
+
+def test_a2_checkpoint_readiness_requires_exact_ensure_digest_and_detects_replacement(monkeypatch, tmp_path):
+    header = b'{"tensor":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}'
+    checkpoint = tmp_path / "multi.safetensors"
+    checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"ABCD")
+    approved = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_PATH", checkpoint)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_BYTES", checkpoint.stat().st_size)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_SHA256", approved)
+    asset_manager._VERIFIED_CHECKSUM_FACTS.clear()
+
+    assert "has not passed exact digest verification" in runtime._multi_checkpoint_error()
+    asset_manager.verify_asset_checksum(checkpoint, approved)
+    assert runtime._multi_checkpoint_error() is None
+
+    checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"WXYZ")
+    assert "has not passed exact digest verification" in runtime._multi_checkpoint_error()
+
+
+def test_a2_wrapper_readiness_requires_pinned_commit_and_positive_patch(monkeypatch, tmp_path):
+    wrapper = tmp_path / "custom_nodes" / "ComfyUI-WanVideoWrapper"
+    wrapper.mkdir(parents=True)
+    sampler = wrapper / "nodes_sampler.py"
+    sampler.write_text(
+        '"ref_target_masks": (multitalk_embeds or {}).get("ref_target_masks", ref_target_masks) '
+        "if multitalk_audio_embeds is not None else None,\n"
+    )
+    monkeypatch.setenv("COMFY_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=runtime._WAN_WRAPPER_COMMIT + "\n",
+            stderr="",
+        ),
+    )
+    assert runtime._wrapper_patch_error() is None
+
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="0" * 40 + "\n", stderr=""),
+    )
+    assert "commit does not match" in runtime._wrapper_patch_error()
+
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=runtime._WAN_WRAPPER_COMMIT + "\n",
+            stderr="",
+        ),
+    )
+    sampler.write_text(
+        '"ref_target_masks": ref_target_masks if multitalk_audio_embeds is not None else None,\n'
+    )
+    assert "not positively verified" in runtime._wrapper_patch_error()
 
 
 def _write_pcm_wav(path: Path, *, seconds: float = 2.0) -> None:
@@ -153,6 +316,387 @@ def _fake_normalizer(source: Path, *, job_id: str) -> Path:
     # 97,324-byte normalized WAV while remaining a valid 3.04 second input.
     _write_pcm_wav(destination, seconds=3.04)
     return destination
+
+
+def _a2_graph(*, speaker_slot: int, num_frames: int = 53) -> dict:
+    listener_slot = 1 if speaker_slot == 2 else 2
+    audio_inputs = {
+        f"audio_{speaker_slot}": ["10", 0],
+        f"audio_{listener_slot}": ["16", 0],
+    }
+    return {
+        "2": {"class_type": "MultiTalkModelLoader", "inputs": {"model": "Wan2_1-InfiniteTalk-Multi_fp16.safetensors"}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": "approved.png"}},
+        "10": {"class_type": "LoadAudio", "inputs": {"audio": "approved.mp3"}},
+        "11": {"class_type": "MultiTalkWav2VecEmbeds", "inputs": {
+            **audio_inputs,
+            "multi_audio_type": "para",
+            "normalize_loudness": False,
+            "num_frames": num_frames,
+            "fps": 25.0,
+            "ref_target_masks": ["93", 0],
+        }},
+        "12": {"class_type": "WanVideoImageToVideoMultiTalk", "inputs": {
+            "width": 832,
+            "height": 480,
+            "mode": "multitalk",
+            "start_image": ["6", 0],
+        }},
+        "15": {"class_type": "VHS_VideoCombine", "inputs": {
+            "audio": ["10", 0],
+            "frame_rate": 25.0,
+        }},
+        "16": {"class_type": "LoadAudio", "inputs": {"audio": "listener.wav"}},
+        "90": {"class_type": "LoadImage", "inputs": {"image": "slot1.png"}},
+        "91": {"class_type": "LoadImage", "inputs": {"image": "slot2.png"}},
+        "92": {"class_type": "ImageBatch", "inputs": {"image1": ["90", 0], "image2": ["91", 0]}},
+        "93": {"class_type": "ImageToMask", "inputs": {"image": ["95", 0], "channel": "red"}},
+        "94": {"class_type": "LoadImage", "inputs": {"image": "background.png"}},
+        "95": {"class_type": "ImageBatch", "inputs": {"image1": ["92", 0], "image2": ["94", 0]}},
+    }
+
+
+def _a2_request(*, speaker_slot: int, job_id: str = "scene23-b0") -> RunRequest:
+    still = _gray_png(1024, 576)
+    mpeg = b"approved-mpeg" * 100
+    still_digest = hashlib.sha256(still).hexdigest()
+    mpeg_digest = hashlib.sha256(mpeg).hexdigest()
+    slot_regions = (
+        (0.08, 0.18, 0.42, 0.92),
+        (0.58, 0.16, 0.92, 0.94),
+    )
+    listener_slot = 1 if speaker_slot == 2 else 2
+    routing = InfiniteTalkTwoPersonRouting(
+        schema_version="infinitetalk_two_person_routing_v1",
+        mode="two_person_parallel",
+        multi_audio_type="para",
+        speaker_slot=speaker_slot,
+        listener_slot=listener_slot,
+        slot_regions=slot_regions,
+        speaker_region=slot_regions[speaker_slot - 1],
+        listener_region=slot_regions[listener_slot - 1],
+        coordinate_space="normalized_0_1",
+        source_still_sha256=still_digest,
+        source_dimensions={"width": 1024, "height": 576},
+        spatial_authority_sha256=hashlib.sha256(f"authority-{job_id}".encode()).hexdigest(),
+        expected_duration_sec=2.0,
+        listener_audio_kind="silence_pcm",
+    )
+    return RunRequest(
+        job_id=job_id,
+        asset_group="infinitetalk_two_person_v1",
+        comfy_payload=_a2_graph(speaker_slot=speaker_slot),
+        comfy_input_files=[
+            ComfyInputFile(
+                node_id="6",
+                input_name="image",
+                filename="approved.png",
+                source_data=base64.b64encode(still).decode("ascii"),
+                expected_sha256=still_digest,
+                content_type="image/png",
+            ),
+            ComfyInputFile(
+                node_id="10",
+                input_name="audio",
+                filename="approved.mp3",
+                source_data=base64.b64encode(mpeg).decode("ascii"),
+                expected_sha256=mpeg_digest,
+                content_type="audio/mpeg",
+            ),
+        ],
+        infinitetalk_routing=routing,
+    )
+
+
+def _configure_a2_runtime(monkeypatch, input_root: Path) -> None:
+    _configure_input_root(monkeypatch, input_root)
+
+    def normalize(source: Path, *, job_id: str) -> Path:
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        destination = runtime.normalized_audio_path_for_source(digest, job_id=job_id)
+        _write_pcm_wav(destination, seconds=2.0)
+        return destination
+
+    monkeypatch.setattr(app, "normalize_approved_mpeg_to_wav", normalize)
+    monkeypatch.setattr(runtime, "_multi_checkpoint_error", lambda: None)
+    monkeypatch.setattr(runtime, "_wrapper_patch_error", lambda: None)
+
+
+def test_a2_materializes_slot_order_background_and_exact_silence(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+    request = _a2_request(speaker_slot=2)
+
+    payload, observer_specs = app._prepare_comfy_inputs(request)
+    receipts = comfy_client.observe_staged_input_receipts(payload, observer_specs)
+    receipt_by_node = {receipt["node_id"]: receipt for receipt in receipts}
+
+    assert set(receipt_by_node) == {"6", "10", "16", "90", "91", "94"}
+    assert payload["11"]["inputs"]["audio_1"] == ["16", 0]
+    assert payload["11"]["inputs"]["audio_2"] == ["10", 0]
+    assert payload["11"]["inputs"]["multi_audio_type"] == "para"
+    assert payload["11"]["inputs"]["ref_target_masks"] == ["93", 0]
+    assert payload["15"]["inputs"]["audio"] == ["10", 0]
+
+    listener_path = input_root / payload["16"]["inputs"]["audio"]
+    with wave.open(str(listener_path), "rb") as listener:
+        assert (listener.getnchannels(), listener.getframerate(), listener.getsampwidth()) == (1, 16_000, 2)
+        assert listener.getnframes() == 32_000
+        assert listener.readframes(listener.getnframes()) == b"\0\0" * 32_000
+    speaker_path = input_root / payload["10"]["inputs"]["audio"]
+    with wave.open(str(speaker_path), "rb") as speaker:
+        assert speaker.getnframes() == 32_000
+
+    decoded = {}
+    for node_id in ("90", "91", "94"):
+        decoded[node_id] = _decode_gray_png(
+            (input_root / payload[node_id]["inputs"]["image"]).read_bytes()
+        )
+    assert all((width, height) == (832, 480) for width, height, _ in decoded.values())
+    slot_1, slot_2, background = (decoded[node][2] for node in ("90", "91", "94"))
+    assert any(slot_1) and any(slot_2) and any(background)
+    for left, right, neutral in zip(slot_1, slot_2, background):
+        assert not (left and right)
+        assert neutral == (0 if left or right else 255)
+
+    routing_receipt = runtime.build_two_person_routing_receipt(
+        request.infinitetalk_routing,
+        receipts,
+    )
+    assert routing_receipt["speaker_slot"] == 2
+    assert routing_receipt["listener_slot"] == 1
+    assert routing_receipt["mask_sha256"] == {
+        "slot_1": receipt_by_node["90"]["content_sha256"],
+        "slot_2": receipt_by_node["91"]["content_sha256"],
+        "background": receipt_by_node["94"]["content_sha256"],
+    }
+    generated_specs = {spec.node_id: spec for spec in observer_specs if spec.node_id in {"16", "90", "91", "94"}}
+    assert all(
+        spec.source_data is None and spec.source_path is None and spec.source_url is None
+        for spec in generated_specs.values()
+    )
+
+
+def test_scene23_speaker_swap_changes_audio_slot_not_authored_mask_order(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+    b0 = _a2_request(speaker_slot=2, job_id="scene23-b0")
+    b1 = _a2_request(speaker_slot=1, job_id="scene23-b1")
+
+    payload_b0, specs_b0 = app._prepare_comfy_inputs(b0)
+    payload_b1, specs_b1 = app._prepare_comfy_inputs(b1)
+    receipts_b0 = comfy_client.observe_staged_input_receipts(payload_b0, specs_b0)
+    receipts_b1 = comfy_client.observe_staged_input_receipts(payload_b1, specs_b1)
+
+    assert payload_b0["11"]["inputs"]["audio_2"] == ["10", 0]
+    assert payload_b1["11"]["inputs"]["audio_1"] == ["10", 0]
+    hashes_b0 = {receipt["node_id"]: receipt["content_sha256"] for receipt in receipts_b0}
+    hashes_b1 = {receipt["node_id"]: receipt["content_sha256"] for receipt in receipts_b1}
+    assert hashes_b0["90"] == hashes_b1["90"]
+    assert hashes_b0["91"] == hashes_b1["91"]
+    assert hashes_b0["94"] == hashes_b1["94"]
+
+
+def test_a2_effective_mask_and_silence_tampering_fail_before_submit(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+    request = _a2_request(speaker_slot=1)
+    payload, specs = app._prepare_comfy_inputs(request)
+
+    slot_1_path = input_root / payload["90"]["inputs"]["image"]
+    slot_1_path.write_bytes(_gray_png(832, 480, value=255))
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, specs)
+
+    payload, specs = app._prepare_comfy_inputs(request)
+    listener_path = input_root / payload["16"]["inputs"]["audio"]
+    _write_pcm_wav(listener_path, seconds=1.0)
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, specs)
+
+
+def test_a2_retry_reobserves_all_effective_graph_inputs(monkeypatch):
+    request = _a2_request(speaker_slot=2, job_id="retry-a2")
+    sentinel_specs = [
+        ComfyInputFile(
+            node_id=node_id,
+            input_name="audio" if node_id in {"10", "16"} else "image",
+            filename=f"{node_id}.bin",
+            expected_sha256="a" * 64,
+        )
+        for node_id in ("6", "10", "16", "90", "91", "94")
+    ]
+    observations = []
+    monkeypatch.setattr(app, "_asset_group_allowed", lambda _group: True)
+    monkeypatch.setattr(app, "_effective_vram_floor", lambda _group: None)
+    monkeypatch.setattr(app, "_free_vram_on_group_switch", lambda _group: None)
+    monkeypatch.setattr(
+        app,
+        "ensure_asset_group",
+        lambda _group: SimpleNamespace(downloaded_assets=[], asset_check_sec=0.0, download_sec=0.0),
+    )
+    monkeypatch.setattr(app, "_ensure_runtime_provisioned", lambda _group: False)
+    monkeypatch.setattr(app, "_prepare_comfy_inputs", lambda _request: (request.comfy_payload, sentinel_specs))
+
+    def observe(_payload, specs):
+        observations.append([spec.node_id for spec in specs])
+        if len(observations) == 2:
+            raise RuntimeError("Observed staged input digest mismatch")
+        return []
+
+    monkeypatch.setattr(app, "observe_staged_input_receipts", observe)
+    monkeypatch.setattr(app, "submit_prompt", lambda _payload: (_ for _ in ()).throw(RuntimeError("Comfy stopped")))
+    monkeypatch.setattr(app, "is_comfy_healthy", lambda: False)
+    monkeypatch.setattr(app, "restart_comfy", lambda: 0.0)
+    monkeypatch.setattr(app, "_send_heartbeat_now", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(comfy_start_cmd="restart", comfy_base_url="http://127.0.0.1:8188"),
+    )
+
+    result = app._execute_run(request)
+
+    assert observations == [
+        ["6", "10", "16", "90", "91", "94"],
+        ["6", "10", "16", "90", "91", "94"],
+    ]
+    assert result.ok is False
+    assert result.restart_performed is True
+    assert result.error == "Observed staged input digest mismatch"
+
+
+def test_success_response_exposes_top_level_a2_routing_receipt(monkeypatch):
+    request = _a2_request(speaker_slot=2, job_id="receipt-a2")
+    mask_hashes = {"90": "1" * 64, "91": "2" * 64, "94": "3" * 64}
+    receipts = [
+        {"node_id": "6", "input_name": "image", "content_sha256": "6" * 64},
+        {"node_id": "10", "input_name": "audio", "content_sha256": "a" * 64},
+        {"node_id": "16", "input_name": "audio", "content_sha256": "b" * 64},
+        *[
+            {"node_id": node_id, "input_name": "image", "content_sha256": digest}
+            for node_id, digest in mask_hashes.items()
+        ],
+    ]
+    monkeypatch.setattr(app, "_asset_group_allowed", lambda _group: True)
+    monkeypatch.setattr(app, "_effective_vram_floor", lambda _group: None)
+    monkeypatch.setattr(app, "_free_vram_on_group_switch", lambda _group: None)
+    monkeypatch.setattr(
+        app,
+        "ensure_asset_group",
+        lambda _group: SimpleNamespace(downloaded_assets=[], asset_check_sec=0.0, download_sec=0.0),
+    )
+    monkeypatch.setattr(app, "_ensure_runtime_provisioned", lambda _group: False)
+    monkeypatch.setattr(app, "_prepare_comfy_inputs", lambda _request: (request.comfy_payload, []))
+    monkeypatch.setattr(app, "observe_staged_input_receipts", lambda *_args: receipts)
+    monkeypatch.setattr(app, "submit_prompt", lambda _payload: "prompt-a2")
+    monkeypatch.setattr(app, "poll_for_completion", lambda **_kwargs: {"outputs": {}})
+    monkeypatch.setattr(app, "collect_output_paths", lambda _history: [])
+    monkeypatch.setattr(app, "build_output_files", lambda _outputs: [])
+    monkeypatch.setattr(app, "_send_heartbeat_now", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(comfy_start_cmd="", comfy_base_url="http://127.0.0.1:8188"),
+    )
+
+    result = app._execute_run(request)
+
+    assert result.ok is True
+    assert result.infinitetalk_routing_receipt is not None
+    assert result.infinitetalk_routing_receipt.model_dump() == {
+        "schema_version": "infinitetalk_two_person_routing_receipt_v1",
+        "spatial_authority_sha256": request.infinitetalk_routing.spatial_authority_sha256,
+        "source_still_sha256": request.infinitetalk_routing.source_still_sha256,
+        "speaker_slot": 2,
+        "listener_slot": 1,
+        "mode": "two_person_parallel",
+        "multi_audio_type": "para",
+        "mask_sha256": {
+            "slot_1": "1" * 64,
+            "slot_2": "2" * 64,
+            "background": "3" * 64,
+        },
+    }
+
+
+def test_a2_rejects_missing_overlapping_or_invalid_masks(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+
+    missing = _a2_request(speaker_slot=1)
+    del missing.comfy_payload["94"]
+    with pytest.raises(ValueError, match="node 94"):
+        app._prepare_comfy_inputs(missing)
+
+    with pytest.raises(ValidationError, match="must not overlap"):
+        InfiniteTalkTwoPersonRouting(
+            schema_version="infinitetalk_two_person_routing_v1",
+            mode="two_person_parallel",
+            multi_audio_type="para",
+            speaker_slot=1,
+            listener_slot=2,
+            slot_regions=((0.1, 0.1, 0.7, 0.8), (0.6, 0.1, 0.9, 0.8)),
+            speaker_region=(0.1, 0.1, 0.7, 0.8),
+            listener_region=(0.6, 0.1, 0.9, 0.8),
+            coordinate_space="normalized_0_1",
+            source_still_sha256="a" * 64,
+            source_dimensions={"width": 1024, "height": 576},
+            spatial_authority_sha256="b" * 64,
+            expected_duration_sec=2.0,
+            listener_audio_kind="silence_pcm",
+        )
+
+    no_background = _a2_request(speaker_slot=1, job_id="no-background")
+    no_background.infinitetalk_routing.slot_regions = (
+        (0.0, 0.0, 0.5, 1.0),
+        (0.5, 0.0, 1.0, 1.0),
+    )
+    no_background.infinitetalk_routing.speaker_region = no_background.infinitetalk_routing.slot_regions[0]
+    no_background.infinitetalk_routing.listener_region = no_background.infinitetalk_routing.slot_regions[1]
+    with pytest.raises(ValueError, match="neutral background must each be nonempty"):
+        app._prepare_comfy_inputs(no_background)
+
+
+def test_a2_rejects_add_mode_wrong_duration_or_sum_frame_guard(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+
+    add_mode = _a2_request(speaker_slot=1, job_id="add-mode")
+    add_mode.comfy_payload["11"]["inputs"]["multi_audio_type"] = "add"
+    with pytest.raises(ValueError, match="parallel audio routing"):
+        app._prepare_comfy_inputs(add_mode)
+
+    wrong_duration = _a2_request(speaker_slot=1, job_id="wrong-duration")
+    wrong_duration.infinitetalk_routing.expected_duration_sec = 2.2
+    with pytest.raises(ValueError, match="duration does not match"):
+        app._prepare_comfy_inputs(wrong_duration)
+
+    summed_guard = _a2_request(speaker_slot=1, job_id="summed-guard")
+    summed_guard.comfy_payload["11"]["inputs"]["num_frames"] = 101
+    with pytest.raises(ValueError, match="frame guard"):
+        app._prepare_comfy_inputs(summed_guard)
+
+
+def test_a2_requires_distinct_capability_and_frozen_routing(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root)
+    request = _a2_request(speaker_slot=1)
+
+    request.asset_group = "infinitetalk_v1"
+    with pytest.raises(ValueError, match="requires infinitetalk_two_person_v1"):
+        app._prepare_comfy_inputs(request)
+
+    request.asset_group = "infinitetalk_two_person_v1"
+    request.infinitetalk_routing = None
+    with pytest.raises(ValueError, match="requires frozen routing authority"):
+        app._prepare_comfy_inputs(request)
 
 
 def test_effective_receipts_attest_png_and_normalized_wav(monkeypatch, tmp_path):

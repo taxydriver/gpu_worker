@@ -208,6 +208,10 @@ Comfy processes; `/health` advertises the capability only after exact weights, n
 wav2vec imports and Comfy reachability pass. The runtime/provisioner work is published at commit
 `a526cb5`.
 
+Two-person A2 workers must instead declare `infinitetalk_two_person_v1`. Secure cutover hashes the
+approved Multi checkpoint during asset ensure, verifies the pinned wrapper and two-speaker patch,
+and requires the explicit-mask/parallel-audio node schema before emitting the staged receipt.
+
 The backend's managed redeploy control accepts an explicit canonical capability list, permits only
 one in-flight redeploy per instance, records the subprocess terminal status, redacts the remote
 target from its receipt, and performs no provider VM/volume mutation beyond a read-only inventory

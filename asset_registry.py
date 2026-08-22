@@ -159,7 +159,10 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
         {
             "name": "infinitetalk_multi",
             "path": "/workspace/ComfyUI/models/diffusion_models/Wan2_1-InfiniteTalk-Multi_fp16.safetensors",
-            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/InfiniteTalk/Wan2_1-InfiniteTalk-Multi_fp16.safetensors",
+            "url": "https://huggingface.co/Kijai/WanVideo_comfy/resolve/8260d429d19fd7a72304cad059160b95d843913f/InfiniteTalk/Wan2_1-InfiniteTalk-Multi_fp16.safetensors",
+            # Hugging Face LFS object digest at repo revision
+            # 8260d429d19fd7a72304cad059160b95d843913f.
+            "sha256": "4c2486cdfb6ff9a9f27408e98e11e20619136933b20411e0c365b1e84075d195",
         },
         {
             "name": "wan21_vae",
@@ -236,6 +239,13 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
     "stable_audio3_v1": [],
 }
 
+# A2 reuses the same immutable files as A1 but has a deliberately distinct
+# broker capability.  Old A1 workers must never be eligible for a two-person
+# graph merely because they advertise ``infinitetalk_v1``.
+ASSET_REGISTRY["infinitetalk_two_person_v1"] = deepcopy(
+    ASSET_REGISTRY["infinitetalk_v1"]
+)
+
 
 # Provisioner-backed groups: capability declared -> deploy runs this script instead of
 # (or in addition to) asset_manager file downloads. Keys are canonical ASSET_REGISTRY groups.
@@ -245,6 +255,7 @@ PROVISIONERS: dict[str, str] = {
     # Runs IN ADDITION to infinitetalk_v1's file downloads: installs the custom node
     # the graphs need. Weights stay with asset_manager so they cache on the data volume.
     "infinitetalk_v1": "gpu_worker/provision_infinitetalk.sh",
+    "infinitetalk_two_person_v1": "gpu_worker/provision_infinitetalk.sh",
     # Same shape as infinitetalk: file downloads above + the WanVideoWrapper custom node.
     "recammaster_v1": "gpu_worker/provision_recammaster.sh",
 }
@@ -288,6 +299,7 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "talking_shot": ["infinitetalk_v1"],
     "multitalk": ["infinitetalk_v1"],
     "infinitetalk_v1": ["infinitetalk_v1"],
+    "infinitetalk_two_person_v1": ["infinitetalk_two_person_v1"],
     # Opt-in: ReCamMaster parametric camera re-shoot (video→video, Wan 2.1 1.3B).
     # Deliberately NOT implied by wan_i2v — a separate Wan 2.1 weight set.
     "recammaster": ["recammaster_v1"],

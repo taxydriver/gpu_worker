@@ -3701,8 +3701,17 @@ wait_comfy_healthy
 # Comfy discovers custom nodes only at start: restart generation instances and
 # prove them healthy again before releasing the staged receipt.
 _infinitetalk_wanted=""
+_infinitetalk_asset_group="infinitetalk_v1"
+_infinitetalk_require_two_person="0"
 case ",${{WORKER_CAPABILITIES:-}}," in
-  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
+  *,infinitetalk_two_person_v1,*)
+    _infinitetalk_wanted=1
+    _infinitetalk_asset_group="infinitetalk_two_person_v1"
+    _infinitetalk_require_two_person="1"
+    ;;
+  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*)
+    _infinitetalk_wanted=1
+    ;;
 esac
 if test -n "$_infinitetalk_wanted"; then
   echo "[infinitetalk] provisioning Comfy talking-shot runtime"
@@ -3736,21 +3745,28 @@ if test -n "$_infinitetalk_wanted"; then
   cd "$WORKER_MODULE_DIR"
   COMFY_BASE_URL="http://127.0.0.1:${{_infinitetalk_comfy_port}}" \
   COMFY_DIR="$COMFY_ROOT" \
+  INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group" \
+  INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person" \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH="$WORKER_MODULE_DIR" \
     "$WORKER_ROOT/.venv/bin/python" - <<'PY'
+import os
+
 from gpu_worker.asset_manager import ensure_asset_group
 from gpu_worker.infinitetalk import check_infinitetalk_readiness
 
-result = ensure_asset_group("infinitetalk_v1")
-readiness = check_infinitetalk_readiness()
+asset_group = os.environ["INFINITETALK_PREFLIGHT_GROUP"]
+require_two_person = os.environ["INFINITETALK_REQUIRE_TWO_PERSON"] == "1"
+result = ensure_asset_group(asset_group)
+readiness = check_infinitetalk_readiness(require_two_person=require_two_person)
 if not readiness.ready:
     raise SystemExit(
         "InfiniteTalk readiness failed before secure cutover: "
         + str(readiness.as_dict())
     )
 print(
-    "[infinitetalk] exact asset group ready before secure cutover; downloaded="
+    "[infinitetalk] exact asset group " + asset_group
+    + " ready before secure cutover; downloaded="
     + str(len(result.downloaded_assets))
 )
 PY

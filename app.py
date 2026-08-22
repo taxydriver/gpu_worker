@@ -54,9 +54,12 @@ from gpu_worker.comfy_process import (
 from gpu_worker.config import get_settings
 from gpu_worker.infinitetalk import (
     INFINITETALK_ASSET_GROUP,
+    INFINITETALK_TWO_PERSON_ASSET_GROUP,
+    build_two_person_routing_receipt,
     check_infinitetalk_readiness,
     normalize_approved_mpeg_to_wav,
     normalized_audio_path_for_source,
+    prepare_two_person_routing_inputs,
 )
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.stitch import stitch_clips, upload_via_signed_put
@@ -134,7 +137,11 @@ threading.Thread(
 ).start()
 
 _STILL_ASSET_GROUPS = {"flux_stills_v1"}
-_VIDEO_ASSET_GROUPS = {"wan_i2v_v1", "infinitetalk_v1"}
+_VIDEO_ASSET_GROUPS = {
+    "wan_i2v_v1",
+    INFINITETALK_ASSET_GROUP,
+    INFINITETALK_TWO_PERSON_ASSET_GROUP,
+}
 _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0
 _BASE_VIDEO_SEC = 30.0
@@ -281,18 +288,27 @@ def _advertised_capabilities() -> tuple[list[str], dict | None]:
     capabilities = canonicalize_groups(raw_capabilities)
     infinitetalk_readiness = None
     if INFINITETALK_ASSET_GROUP in capabilities:
-        readiness = check_infinitetalk_readiness()
+        readiness = check_infinitetalk_readiness(require_two_person=False)
         infinitetalk_readiness = readiness.as_dict()
         if not readiness.ready:
             capabilities.remove(INFINITETALK_ASSET_GROUP)
+    if INFINITETALK_TWO_PERSON_ASSET_GROUP in capabilities:
+        readiness = check_infinitetalk_readiness(require_two_person=True)
+        infinitetalk_readiness = readiness.as_dict()
+        if not readiness.ready:
+            capabilities.remove(INFINITETALK_TWO_PERSON_ASSET_GROUP)
     return capabilities, infinitetalk_readiness
 
 
 def _ensure_runtime_provisioned(asset_group: str) -> bool:
     """Keep this runtime hook narrow: legacy audio provisioners retain their path."""
 
-    if canonical_asset_group(asset_group) != INFINITETALK_ASSET_GROUP:
+    if canonical_asset_group(asset_group) not in {
+        INFINITETALK_ASSET_GROUP,
+        INFINITETALK_TWO_PERSON_ASSET_GROUP,
+    }:
         return False
+    # A1 and A2 share one pinned wrapper install; track the provisioner once.
     return ensure_asset_group_provisioned(INFINITETALK_ASSET_GROUP)
 
 
@@ -371,10 +387,25 @@ def _prepare_comfy_inputs(request: RunRequest) -> tuple[dict, list[ComfyInputFil
     # approved MP3 digest is checked before its graph entry becomes a WAV.
     observe_staged_input_receipts(prepared_payload, request.comfy_input_files)
     observer_specs = request.comfy_input_files
-    if canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP:
+    canonical_group = canonical_asset_group(request.asset_group)
+    if canonical_group in {
+        INFINITETALK_ASSET_GROUP,
+        INFINITETALK_TWO_PERSON_ASSET_GROUP,
+    }:
+        if canonical_group == INFINITETALK_ASSET_GROUP and request.infinitetalk_routing is not None:
+            raise ValueError("Two-person routing requires infinitetalk_two_person_v1")
+        if canonical_group == INFINITETALK_TWO_PERSON_ASSET_GROUP and request.infinitetalk_routing is None:
+            raise ValueError("infinitetalk_two_person_v1 requires frozen routing authority")
         prepared_payload, observer_specs = _normalize_infinitetalk_audio_inputs(
             prepared_payload,
             request.comfy_input_files,
+            job_id=request.job_id,
+        )
+        prepared_payload, observer_specs = prepare_two_person_routing_inputs(
+            prepared_payload,
+            request.comfy_input_files,
+            observer_specs,
+            routing=request.infinitetalk_routing,
             job_id=request.job_id,
         )
     return prepared_payload, observer_specs
@@ -1688,6 +1719,10 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         # start (see _free_vram_on_group_switch).
 
         _store_eta_sample(request.asset_group, resolution_bucket, timings.comfy_run_sec)
+        routing_receipt = build_two_person_routing_receipt(
+            request.infinitetalk_routing,
+            staged_input_receipts,
+        )
 
         return RunResponse(
             ok=True,
@@ -1699,6 +1734,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             outputs=outputs,
             output_files=output_files,
             staged_input_receipts=staged_input_receipts,
+            infinitetalk_routing_receipt=routing_receipt,
             keyframes=keyframes,
             timings=timings,
             debug=RunDebug(

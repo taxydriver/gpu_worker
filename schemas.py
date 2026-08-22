@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ActiveJobSummary(BaseModel):
@@ -97,6 +98,90 @@ class OutputUploadTarget(BaseModel):
     content_type: str = "application/octet-stream"
 
 
+class InfiniteTalkSourceDimensions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    width: int = Field(gt=0, le=8192)
+    height: int = Field(gt=0, le=8192)
+
+
+class InfiniteTalkTwoPersonRouting(BaseModel):
+    """Frozen A2 authority for one speaker and one silent listener.
+
+    Regions are semantic authorities, not caller-supplied mask files.  The
+    worker rasterizes them against the attested source still and owns every
+    graph-bound mask and silence byte.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["infinitetalk_two_person_routing_v1"]
+    mode: Literal["two_person_parallel"]
+    multi_audio_type: Literal["para"]
+    speaker_slot: Literal[1, 2]
+    listener_slot: Literal[1, 2]
+    slot_regions: tuple[
+        tuple[float, float, float, float],
+        tuple[float, float, float, float],
+    ]
+    speaker_region: tuple[float, float, float, float]
+    listener_region: tuple[float, float, float, float]
+    coordinate_space: Literal["normalized_0_1"]
+    source_still_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_dimensions: InfiniteTalkSourceDimensions
+    spatial_authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_duration_sec: float = Field(gt=0, le=15.0)
+    listener_audio_kind: Literal["silence_pcm"]
+
+    @field_validator("speaker_region", "listener_region")
+    @classmethod
+    def _validate_region(cls, value: tuple[float, float, float, float]):
+        if any(not math.isfinite(coordinate) for coordinate in value):
+            raise ValueError("routing region coordinates must be finite")
+        x0, y0, x1, y1 = value
+        if not (0.0 <= x0 < x1 <= 1.0 and 0.0 <= y0 < y1 <= 1.0):
+            raise ValueError("routing regions must be positive normalized xyxy boxes")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_two_person_authority(self):
+        if {self.speaker_slot, self.listener_slot} != {1, 2}:
+            raise ValueError("speaker_slot and listener_slot must be exactly {1, 2}")
+        sx0, sy0, sx1, sy1 = self.speaker_region
+        lx0, ly0, lx1, ly1 = self.listener_region
+        overlaps = sx0 < lx1 and lx0 < sx1 and sy0 < ly1 and ly0 < sy1
+        if overlaps:
+            raise ValueError("speaker and listener routing regions must not overlap")
+        if self.slot_regions[self.speaker_slot - 1] != self.speaker_region:
+            raise ValueError("speaker_region must equal its ordered slot_regions entry")
+        if self.slot_regions[self.listener_slot - 1] != self.listener_region:
+            raise ValueError("listener_region must equal its ordered slot_regions entry")
+        return self
+
+
+class InfiniteTalkMaskHashes(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    slot_1: str = Field(pattern=r"^[0-9a-f]{64}$")
+    slot_2: str = Field(pattern=r"^[0-9a-f]{64}$")
+    background: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class InfiniteTalkRoutingReceipt(BaseModel):
+    """Locator-free proof of the exact A2 routing bytes submitted to Comfy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["infinitetalk_two_person_routing_receipt_v1"]
+    spatial_authority_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_still_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    speaker_slot: Literal[1, 2]
+    listener_slot: Literal[1, 2]
+    mode: Literal["two_person_parallel"]
+    multi_audio_type: Literal["para"]
+    mask_sha256: InfiniteTalkMaskHashes
+
+
 class RunRequest(BaseModel):
     """Request payload for a worker run."""
 
@@ -104,6 +189,7 @@ class RunRequest(BaseModel):
     asset_group: str
     comfy_payload: dict[str, Any] = Field(description="Raw ComfyUI workflow payload.")
     comfy_input_files: list["ComfyInputFile"] = Field(default_factory=list)
+    infinitetalk_routing: InfiniteTalkTwoPersonRouting | None = None
     timeout_sec: int = 3600
     poll_interval_sec: float = 2.0
     # When set, the worker uploads its primary output straight to storage.
@@ -194,6 +280,7 @@ class RunResponse(BaseModel):
     outputs: list[str]
     output_files: list[OutputFile] = Field(default_factory=list)
     staged_input_receipts: list[StagedInputReceipt] = Field(default_factory=list)
+    infinitetalk_routing_receipt: InfiniteTalkRoutingReceipt | None = None
     # Worker-extracted keyframes for any video outputs (inline base64). The
     # backend uses these for observation instead of re-downloading + ffmpeg.
     keyframes: list[ClipKeyframes] = Field(default_factory=list)

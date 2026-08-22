@@ -17,6 +17,7 @@ set -euo pipefail
 COMFY=${COMFY_DIR:-/workspace/ComfyUI}
 PY="$COMFY/.venv/bin/python"
 PIP="$PY -m pip install --break-system-packages"
+WAN_WRAPPER_COMMIT=088128b224242e110d3906c6750e9a3a348a659b
 
 # This script is invoked both during box rehydration and from the worker's
 # asset ensure path.  Serialise those callers on the persistent Comfy volume:
@@ -30,18 +31,35 @@ flock -w "${INFINITETALK_PROVISION_LOCK_TIMEOUT_SEC:-1800}" 9 || {
 
 [ -x "$PY" ] || { echo "[infinitetalk] FATAL: no ComfyUI venv at $PY" >&2; exit 1; }
 
-node () {  # node <dir-name> <git-url>
+node () {  # node <dir-name> <git-url> [approved-commit]
   local d="$COMFY/custom_nodes/$1"
-  if [ -d "$d" ]; then
+  local approved_commit="${3:-}"
+  if [ ! -d "$d" ]; then
+    echo "[infinitetalk] cloning $1"
+    git clone --depth 1 "$2" "$d"
+  else
     echo "[infinitetalk] have node $1"
-    return
   fi
-  echo "[infinitetalk] cloning $1"
-  git clone --depth 1 "$2" "$d"
+  if [ -n "$approved_commit" ]; then
+    local observed_commit
+    observed_commit=$(git -C "$d" rev-parse HEAD)
+    if [ "$observed_commit" != "$approved_commit" ]; then
+      if ! git -C "$d" diff --quiet || ! git -C "$d" diff --cached --quiet; then
+        echo "[infinitetalk] FATAL: $1 is modified at unapproved commit $observed_commit" >&2
+        exit 1
+      fi
+      git -C "$d" fetch --depth 1 origin "$approved_commit"
+      git -C "$d" checkout --detach "$approved_commit"
+    fi
+    [ "$(git -C "$d" rev-parse HEAD)" = "$approved_commit" ] || {
+      echo "[infinitetalk] FATAL: $1 did not reach approved commit $approved_commit" >&2
+      exit 1
+    }
+  fi
   [ -f "$d/requirements.txt" ] && $PIP -r "$d/requirements.txt"
 }
 
-node ComfyUI-WanVideoWrapper https://github.com/kijai/ComfyUI-WanVideoWrapper
+node ComfyUI-WanVideoWrapper https://github.com/kijai/ComfyUI-WanVideoWrapper "$WAN_WRAPPER_COMMIT"
 node ComfyUI-VideoHelperSuite https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite
 
 # These back the wav2vec audio embedding path in the wrapper's talking nodes.
@@ -86,9 +104,18 @@ open(path, "w").write(src.replace(old, new))
 print("[infinitetalk] applied two-speaker mask patch")
 PATCH
   else
-    echo "[infinitetalk] WARN: mask-patch site not found — wrapper changed upstream," >&2
-    echo "[infinitetalk]       two-speaker renders may fail; re-diagnose before trusting A2." >&2
+    echo "[infinitetalk] FATAL: mask-patch site not found in approved wrapper" >&2
+    exit 1
   fi
+else
+  echo "[infinitetalk] FATAL: approved wrapper sampler is missing" >&2
+  exit 1
 fi
+
+PATCHED='"ref_target_masks": (multitalk_embeds or {}).get("ref_target_masks", ref_target_masks)'
+[ "$(grep -F -c "$PATCHED" "$SAMPLER")" -eq 1 ] || {
+  echo "[infinitetalk] FATAL: two-speaker mask patch was not positively verified" >&2
+  exit 1
+}
 
 echo "[infinitetalk] PROVISION OK — restart ComfyUI if a node was just cloned or patched"

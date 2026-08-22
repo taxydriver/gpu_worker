@@ -151,6 +151,59 @@ def _verify_sha256(path: Path, expected_sha256: str) -> None:
     )
 
 
+_VERIFIED_CHECKSUM_FACTS_LOCK = Lock()
+_VERIFIED_CHECKSUM_FACTS: set[tuple[str, int, int, int, int, int, str]] = set()
+
+
+def _checksum_fact(path: Path, expected_sha256: str) -> tuple[str, int, int, int, int, int, str]:
+    stat = path.stat()
+    return (
+        str(path.resolve(strict=False)),
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        expected_sha256.lower(),
+    )
+
+
+def verify_asset_checksum(path: Path, expected_sha256: str) -> None:
+    """Hash once per unchanged on-disk file identity in this worker process."""
+
+    fact = _checksum_fact(path, expected_sha256)
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if fact in _VERIFIED_CHECKSUM_FACTS:
+            return
+    _verify_sha256(path, expected_sha256)
+    observed_fact = _checksum_fact(path, expected_sha256)
+    if observed_fact != fact:
+        raise RuntimeError(f"Asset changed during checksum verification: {path}")
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if len(_VERIFIED_CHECKSUM_FACTS) >= 128:
+            _VERIFIED_CHECKSUM_FACTS.clear()
+        _VERIFIED_CHECKSUM_FACTS.add(fact)
+
+
+def _register_verified_checksum(path: Path, expected_sha256: str) -> None:
+    fact = _checksum_fact(path, expected_sha256)
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if len(_VERIFIED_CHECKSUM_FACTS) >= 128:
+            _VERIFIED_CHECKSUM_FACTS.clear()
+        _VERIFIED_CHECKSUM_FACTS.add(fact)
+
+
+def asset_checksum_is_verified(path: Path, expected_sha256: str) -> bool:
+    """Fast readiness query; full hashing belongs to background asset ensure."""
+
+    try:
+        fact = _checksum_fact(path, expected_sha256)
+    except OSError:
+        return False
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        return fact in _VERIFIED_CHECKSUM_FACTS
+
+
 def _aria2c_available() -> bool:
     """Return True if aria2c is installed on this system."""
     import shutil
@@ -572,6 +625,8 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
     checksum = asset.get("sha256")
 
     if is_non_empty_file(target_path):
+        if checksum:
+            verify_asset_checksum(target_path, checksum)
         LOGGER.info("Asset already present: %s -> %s", asset_name, target_path)
         return None
 
@@ -593,8 +648,12 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
             safe_unlink(temp_path)
             _download_to_path(url, temp_path, asset_name=asset_name)
             if checksum:
-                _verify_sha256(temp_path, checksum)
+                verify_asset_checksum(temp_path, checksum)
             os.replace(temp_path, target_path)
+            if checksum:
+                # The atomic rename changes path and ctime facts; register the
+                # final immutable-looking identity without hashing 5 GB twice.
+                _register_verified_checksum(target_path, checksum)
             LOGGER.info("Downloaded asset: %s", target_path)
             return str(target_path)
     except requests.RequestException as exc:
