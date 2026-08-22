@@ -253,7 +253,7 @@ def test_health_is_not_ready_when_required_auth_is_unconfigured(monkeypatch) -> 
     )
     monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
     monkeypatch.setattr(app_mod, "is_comfy_healthy", lambda: True)
-    monkeypatch.setattr(app_mod, "_advertised_capabilities", lambda: ([], None))
+    monkeypatch.setattr(app_mod, "_advertised_capabilities", lambda: ([], None, None))
     monkeypatch.setattr(app_mod, "active_download_status", lambda: None)
 
     response = pytest.importorskip("fastapi.testclient").TestClient(app_mod.app).get(

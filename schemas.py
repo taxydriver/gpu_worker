@@ -38,6 +38,7 @@ class HealthResponse(BaseModel):
     vram_gb: float | None = None
     capabilities: list[str] = Field(default_factory=list)
     infinitetalk_readiness: dict[str, Any] | None = None
+    flux_ipadapter_readiness: dict[str, Any] | None = None
     active_jobs: int = 0
     max_concurrent_jobs: int = 1
     download_status: dict[str, Any] | None = None

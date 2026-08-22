@@ -52,6 +52,10 @@ from gpu_worker.comfy_process import (
     run_gpu_smoke_test,
 )
 from gpu_worker.config import get_settings
+from gpu_worker.flux_ipadapter import (
+    FLUX_IPADAPTER_ASSET_GROUP,
+    check_flux_ipadapter_readiness,
+)
 from gpu_worker.infinitetalk import (
     INFINITETALK_ASSET_GROUP,
     check_infinitetalk_readiness,
@@ -271,8 +275,12 @@ def _asset_group_mismatch_error(asset_group: str) -> ValueError:
     )
 
 
-def _advertised_capabilities() -> tuple[list[str], dict | None]:
-    """Return only capabilities whose runtime contract is actually present."""
+def _advertised_capabilities() -> tuple[list[str], dict | None, dict | None]:
+    """Return only capabilities whose runtime contract is actually present.
+
+    Returns ``(capabilities, infinitetalk_readiness, flux_ipadapter_readiness)``;
+    a readiness dict is ``None`` when its group was not declared at all.
+    """
 
     raw_capabilities = get_settings().resolved_capabilities() or sorted(ASSET_REGISTRY)
     capabilities = canonicalize_groups(raw_capabilities)
@@ -282,7 +290,17 @@ def _advertised_capabilities() -> tuple[list[str], dict | None]:
         infinitetalk_readiness = readiness.as_dict()
         if not readiness.ready:
             capabilities.remove(INFINITETALK_ASSET_GROUP)
-    return capabilities, infinitetalk_readiness
+    flux_ipadapter_readiness = None
+    if FLUX_IPADAPTER_ASSET_GROUP in capabilities:
+        # The custom node loads only at a Comfy start and the weights arrive
+        # asynchronously; until both are true the group is a promise the first
+        # render breaks (missing_node_type, 2026-08-22). Withhold it, and say why
+        # in /health so the operator reaches for the provisioner, not the key.
+        readiness = check_flux_ipadapter_readiness()
+        flux_ipadapter_readiness = readiness.as_dict()
+        if not readiness.ready:
+            capabilities.remove(FLUX_IPADAPTER_ASSET_GROUP)
+    return capabilities, infinitetalk_readiness, flux_ipadapter_readiness
 
 
 def _ensure_runtime_provisioned(asset_group: str) -> bool:
@@ -538,7 +556,7 @@ def _broker_worker_payload() -> dict[str, object]:
     if free_vram_mb is None and settings.worker_vram_gb is not None:
         free_vram_mb = int(settings.worker_vram_gb * 1024)
 
-    capabilities, infinitetalk_readiness = _advertised_capabilities()
+    capabilities, infinitetalk_readiness, flux_ipadapter_readiness = _advertised_capabilities()
     public_url = settings.resolved_worker_public_url()
 
     with _WARMED_GROUPS_LOCK:
@@ -560,6 +578,7 @@ def _broker_worker_payload() -> dict[str, object]:
         "max_concurrent_jobs": max_concurrent_jobs,
         "warmed_asset_groups": warmed,
         "infinitetalk_readiness": infinitetalk_readiness,
+        "flux_ipadapter_readiness": flux_ipadapter_readiness,
         # Non-secret readiness fact: the backend withholds paid dispatch unless
         # the worker proves it can fetch this deployment's public storage host.
         "input_url_allowed_hosts": sorted(
@@ -1089,7 +1108,7 @@ def health() -> HealthResponse:
     with _ACTIVE_JOBS_LOCK:
         active_jobs = _ACTIVE_JOBS
 
-    capabilities, infinitetalk_readiness = _advertised_capabilities()
+    capabilities, infinitetalk_readiness, flux_ipadapter_readiness = _advertised_capabilities()
     auth_ready = _worker_api_auth_ready()
 
     return HealthResponse(
@@ -1106,6 +1125,7 @@ def health() -> HealthResponse:
         vram_gb=settings.worker_vram_gb,
         capabilities=capabilities,
         infinitetalk_readiness=infinitetalk_readiness,
+        flux_ipadapter_readiness=flux_ipadapter_readiness,
         active_jobs=active_jobs,
         max_concurrent_jobs=settings.resolved_max_concurrent_jobs(),
         download_status=active_download_status(),
