@@ -243,6 +243,25 @@ def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> N
     assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
 
 
+def test_flux_ipadapter_provisioning_precedes_generation_comfy_restart() -> None:
+    # A box rented with the capability carried the weights and still 400d with
+    # missing_node_type: the deploy never ran the provisioner (2026-08-22). The
+    # node is only discovered at ComfyUI start, so the restart must follow it.
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_flux_ipadapter.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        assert provision < restart
+        assert "*,flux_ipadapter,*|*,flux_ipadapter_v1,*|*,flux2_ipadapter,*" in script
+
+
+def test_flux_ipadapter_provisioner_is_lockstepped_and_lints() -> None:
+    provisioner = Path(deploy_gpu.__file__).with_name("provision_flux_ipadapter.sh")
+    source = provisioner.read_text()
+    subprocess.run(["bash", "-n", str(provisioner)], check=True)
+    assert 'LOCK_FILE="$COMFY/.filmforge_flux_ipadapter.provision.lock"' in source
+    assert source.index("flock -w") < source.index("node x-flux-comfyui")
+
+
 def test_hf_token_is_injected_for_a_plan_with_audio(monkeypatch, tmp_path: Path) -> None:
     from types import SimpleNamespace
 

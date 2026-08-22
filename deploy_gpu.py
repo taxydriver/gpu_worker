@@ -3859,6 +3859,29 @@ if test -n "$_infinitetalk_wanted"; then
   done
 fi
 
+# ── XLabs Flux IPAdapter Comfy extension ───────────────────────────────────────
+# Same shape as InfiniteTalk: the adapter + CLIP-vision weights ride the worker
+# asset manager (flux_ipadapter_v1), this provisioner installs the custom node
+# that provides LoadFluxIPAdapter, and the restart comes strictly after it —
+# ComfyUI only discovers new node classes at start. Without this block a box
+# rented with the capability carried the weights and still 400d every render
+# with `missing_node_type: LoadFluxIPAdapter` (observed 2026-08-22).
+_flux_ipadapter_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,flux_ipadapter,*|*,flux_ipadapter_v1,*|*,flux2_ipadapter,*) _flux_ipadapter_wanted=1 ;;
+esac
+if test -n "$_flux_ipadapter_wanted"; then
+  echo "[flux_ipadapter] provisioning XLabs Flux IPAdapter node"
+  cd "$WORKER_ROOT"
+  bash provision_flux_ipadapter.sh
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    echo "[flux_ipadapter] restarting ComfyUI on generation gpu$idx after provisioning"
+    systemctl restart "comfyui-gpu${{idx}}.service"
+  done
+fi
+
 # ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
 # The provisioners above are shell scripts read from the box's git checkout of
 # gpu_worker, NOT from the deploy we just piped in — so an older checkout can

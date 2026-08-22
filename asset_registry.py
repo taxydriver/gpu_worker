@@ -213,15 +213,23 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
     #
     # v2 of the adapter: the v1 path (XLabs-AI/flux-ip-adapter/flux-ip-adapter
     # .safetensors) 404s as of 2026-08-22; v2 verified 200 the same day.
+    #
+    # The on-disk FILENAMES are a contract with the backend graph
+    # (backend app/workflows/flux2_stills_xlabs_ipa.json, node LoadFluxIPAdapter):
+    # ComfyUI lists this directory and the graph names a file in it, so a
+    # rename on either side is a `value not in list` 400 on the first render.
+    # The encoder must be OpenAI CLIP ViT-L/14: XLabs' FluxClipViT loads the
+    # file against a hard-coded ViT-L config, and its projection model takes
+    # 768-dim image embeds — a bigG file (1280-dim) cannot feed it.
     "flux_ipadapter_v1": [
         {
             "name": "flux_ip_adapter_v2",
-            "path": "/workspace/ComfyUI/models/xlabs/ipadapters/ip_adapter.safetensors",
+            "path": "/workspace/ComfyUI/models/xlabs/ipadapters/flux-ip-adapter-v2.safetensors",
             "url": "https://huggingface.co/XLabs-AI/flux-ip-adapter-v2/resolve/main/ip_adapter.safetensors",
         },
         {
             "name": "clip_vision_large",
-            "path": "/workspace/ComfyUI/models/clip_vision/model.safetensors",
+            "path": "/workspace/ComfyUI/models/clip_vision/clip-vit-large-patch14.safetensors",
             "url": "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/model.safetensors",
         },
     ],
@@ -320,6 +328,16 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "recammaster": ["recammaster_v1"],
     "reshoot_camera": ["recammaster_v1"],
     "recammaster_v1": ["recammaster_v1"],
+    # Opt-in: XLabs Flux IPAdapter (reference conditioning on a FACE).
+    # Deliberately NOT implied by flux2_stills — separate weights plus a custom
+    # node. This alias row is load-bearing: the worker canonicalises
+    # WORKER_CAPABILITIES through this table, so without it the token the
+    # backend emits for the rent selection was dropped and the box advertised
+    # only flux_stills_v1 — the group sat in known_asset_groups and never in
+    # capabilities (observed 2026-08-22).
+    "flux_ipadapter": ["flux_ipadapter_v1"],
+    "flux2_ipadapter": ["flux_ipadapter_v1"],
+    "flux_ipadapter_v1": ["flux_ipadapter_v1"],
 }
 
 
