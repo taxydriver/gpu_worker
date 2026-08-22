@@ -229,15 +229,23 @@ def _provision_only_exit(script: str) -> int:
     return script.index("WORKER_RELEASE_STAGED_ONLY=", script.index("wait_comfy_healthy()"))
 
 
-def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
+def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
     for script in (_script(PLAN), _script(None)):
         provision = script.index("bash provision_infinitetalk.sh")
         restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
         rewait = script.index("wait_comfy_healthy", restart)
+        materialize = script.index('ensure_asset_group("infinitetalk_v1")', rewait)
+        readiness = script.index("readiness = check_infinitetalk_readiness()", materialize)
         gate = _provision_only_exit(script)
-        assert provision < restart < rewait < gate
+        assert provision < restart < rewait < materialize < readiness < gate
         assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert 'ensure_asset_group("infinitetalk_v1")' not in script[gate:]
         assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+        assert 'COMFY_BASE_URL="http://127.0.0.1:${_infinitetalk_comfy_port}"' in script
+        assert 'COMFY_DIR="$COMFY_ROOT"' in script
+        assert 'PYTHONPATH="$WORKER_MODULE_DIR"' in script
+        assert '"$WORKER_ROOT/.venv/bin/python" -' in script
+        assert "InfiniteTalk readiness failed before secure cutover" in script
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:

@@ -3715,6 +3715,44 @@ if test -n "$_infinitetalk_wanted"; then
     systemctl restart "comfyui-gpu${{idx}}.service"
   done
   wait_comfy_healthy
+
+  # Secure one-click confirms the advertised capability immediately after the
+  # staged receipt. Download the exact canonical group now, then prove the
+  # restarted Comfy runtime can actually load its nodes and audio dependencies.
+  # A fresh box therefore fails closed before broker registration/cutover rather
+  # than advertising a capability that is still warming in the background.
+  _infinitetalk_comfy_port=""
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    _infinitetalk_comfy_port=$((COMFY_PORT_BASE + idx))
+    break
+  done
+  if test -z "$_infinitetalk_comfy_port"; then
+    echo "InfiniteTalk requires at least one generation worker" >&2
+    exit 1
+  fi
+  echo "[infinitetalk] materializing exact talking-shot asset group before cutover"
+  cd "$WORKER_MODULE_DIR"
+  COMFY_BASE_URL="http://127.0.0.1:${{_infinitetalk_comfy_port}}" \
+  COMFY_DIR="$COMFY_ROOT" \
+  PYTHONPATH="$WORKER_MODULE_DIR" \
+    "$WORKER_ROOT/.venv/bin/python" - <<'PY'
+from gpu_worker.asset_manager import ensure_asset_group
+from gpu_worker.infinitetalk import check_infinitetalk_readiness
+
+result = ensure_asset_group("infinitetalk_v1")
+readiness = check_infinitetalk_readiness()
+if not readiness.ready:
+    raise SystemExit(
+        "InfiniteTalk readiness failed before secure cutover: "
+        + str(readiness.as_dict())
+    )
+print(
+    "[infinitetalk] exact asset group ready before secure cutover; downloaded="
+    + str(len(result.downloaded_assets))
+)
+PY
 fi
 
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
