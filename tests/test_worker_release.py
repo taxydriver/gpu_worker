@@ -715,6 +715,69 @@ def test_release_installer_is_immutable_and_never_pulls_or_mutates_git() -> None
     subprocess.run(["bash", "-n"], input=activation, text=True, check=True)
 
 
+def test_cutover_activation_refuses_root_bytecode_drift_from_provision(
+    tmp_path: Path,
+) -> None:
+    """Regression for the fresh InfiniteTalk provision -> cutover failure.
+
+    The paid box ran the readiness interpreter as root without ``-B``.  Root
+    could create a writable ``__pycache__`` below the read-only candidate; a
+    cutover retry must never promote that candidate even when its ready marker
+    and dependency snapshot still look valid.
+    """
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("APP = 1\n")
+    (source / "requirements.txt").write_text("")
+    (source / "requirements.lock").write_text("")
+    releases_root = tmp_path / "worker-releases"
+    venv_seed = Path(sys.executable).parent.parent
+
+    with build_worker_release_bundle(source) as bundle:
+        subprocess.run(
+            ["bash", "-s"],
+            input=worker_release_install_script(
+                archive_path=str(bundle.archive_path),
+                archive_sha256=bundle.archive_sha256,
+                source_sha256=bundle.source_sha256,
+                release_id=bundle.release_id,
+                releases_root=str(releases_root),
+                venv_path=str(venv_seed),
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        release_id = bundle.release_id
+
+    candidate = releases_root / "releases" / release_id
+    package = candidate / "gpu_worker"
+    # Model root's ability to bypass a 0555 package directory: leave the
+    # resulting bytecode artifact writable, exactly as on the paid VM.
+    package.chmod(0o755)
+    cache = package / "__pycache__"
+    cache.mkdir()
+    (cache / "app.cpython-312.pyc").write_bytes(b"runtime bytecode")
+    cache.chmod(0o755)
+    package.chmod(0o555)
+
+    activation = subprocess.run(
+        ["bash", "-s"],
+        input=worker_release_activate_script(
+            releases_root=str(releases_root),
+            release_id=release_id,
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert activation.returncode != 0
+    assert "worker candidate became writable" in activation.stderr
+    assert not (releases_root / "current").exists()
+
+
 def test_release_rollback_is_compare_and_swap_guarded() -> None:
     script = worker_release_rollback_script(
         releases_root="/opt/filmforge-worker-releases",

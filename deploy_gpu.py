@@ -3736,6 +3736,7 @@ if test -n "$_infinitetalk_wanted"; then
   cd "$WORKER_MODULE_DIR"
   COMFY_BASE_URL="http://127.0.0.1:${{_infinitetalk_comfy_port}}" \
   COMFY_DIR="$COMFY_ROOT" \
+  PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH="$WORKER_MODULE_DIR" \
     "$WORKER_ROOT/.venv/bin/python" - <<'PY'
 from gpu_worker.asset_manager import ensure_asset_group
@@ -3753,6 +3754,70 @@ print(
     + str(len(result.downloaded_assets))
 )
 PY
+fi
+
+# Provision-only code executes as root, which can bypass the immutable
+# candidate's read-only directory modes.  Prove that no runtime import or
+# provisioner dirtied the candidate before emitting the receipt cutover trusts.
+if ! python3 - "$WORKER_MODULE_DIR" "$WORKER_CODE_RELEASE_ID" <<'PY'
+import hashlib
+import itertools
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+release_id = sys.argv[2]
+problems = []
+
+ready = root / ".ready"
+source_marker = root / ".source-sha256"
+dependency_freeze = root / ".dependency-freeze.txt"
+dependency_marker = root / ".dependency-freeze.sha256"
+
+def regular_file(path):
+    return not path.is_symlink() and path.is_file()
+
+try:
+    ready_mode = stat.S_IMODE(ready.lstat().st_mode)
+except OSError:
+    ready_mode = None
+if not regular_file(ready) or ready_mode != 0o444:
+    problems.append("readiness marker missing or mode drifted")
+
+source_digest = source_marker.read_text().strip() if regular_file(source_marker) else ""
+if not source_digest or release_id != "sha256-" + source_digest[:24]:
+    problems.append("source marker does not match release id")
+elif regular_file(ready) and ready.read_text().strip() != source_digest:
+    problems.append("readiness marker does not match source digest")
+
+if regular_file(dependency_freeze) and regular_file(dependency_marker):
+    dependency_digest = hashlib.sha256(dependency_freeze.read_bytes()).hexdigest()
+    recorded_dependency_digest = dependency_marker.read_text().strip()
+else:
+    dependency_digest = ""
+    recorded_dependency_digest = ""
+if not dependency_digest or recorded_dependency_digest != dependency_digest:
+    problems.append("dependency snapshot missing or drifted")
+
+writable = next(
+    (
+        path
+        for path in itertools.chain((root,), root.rglob("*"))
+        if not path.is_symlink()
+        and stat.S_IMODE(path.lstat().st_mode) & 0o222
+    ),
+    None,
+)
+if writable is not None:
+    problems.append("writable path present: " + str(writable.relative_to(root) or "."))
+
+if problems:
+    raise SystemExit("immutable worker candidate failed pre-cutover seal: " + "; ".join(problems))
+PY
+then
+  echo "worker release candidate is incomplete; refusing staged receipt" >&2
+  exit 1
 fi
 
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
