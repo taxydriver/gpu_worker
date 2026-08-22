@@ -3673,23 +3673,75 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   systemctl enable --now "comfyui-gpu${{idx}}.service"
 done
 
-for idx in $(seq 0 $((GPU_COUNT - 1))); do
-  test "$(dept_for_idx "$idx")" = "generation" || continue
-  port=$((COMFY_PORT_BASE + idx))
-  stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
-  rm -f "$stats_file"
-  for _ in $(seq 1 60); do
-    if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >"$stats_file" 2>/dev/null; then
-      break
+wait_comfy_healthy() {{
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    test "$(dept_for_idx "$idx")" = "generation" || continue
+    port=$((COMFY_PORT_BASE + idx))
+    stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
+    rm -f "$stats_file"
+    for _ in $(seq 1 60); do
+      if curl -fsS "http://127.0.0.1:${{port}}/system_stats" >"$stats_file" 2>/dev/null; then
+        break
+      fi
+      sleep 2
+    done
+    if ! test -s "$stats_file"; then
+      echo "ComfyUI gpu${{idx}} failed system_stats health check" >&2
+      journalctl -u "comfyui-gpu${{idx}}.service" -n 120 --no-pager >&2 || true
+      exit 1
     fi
-    sleep 2
   done
-  if ! test -s "$stats_file"; then
-    echo "ComfyUI gpu${{idx}} failed system_stats health check" >&2
-    journalctl -u "comfyui-gpu${{idx}}.service" -n 120 --no-pager >&2 || true
-    exit 1
-  fi
-done
+}}
+wait_comfy_healthy
+
+# ── Comfy custom-node provisioners (GPU-stack work, NOT worker-start work) ────
+# These blocks MUST sit before the provision-only exit below. The secure
+# one-click runs this script twice: the provision-only pass exits at that gate,
+# and the cutover pass is answered by the security stage gate at the top of the
+# script before any of this runs. Anything after the gate is dead code on the
+# path the Rent button uses — which is where these blocks lived until
+# 2026-08-22, when a box rented with flux_ipadapter carried the weights and
+# still 400d every render with missing_node_type: LoadFluxIPAdapter.
+# Each provisioner installs nodes ComfyUI only discovers at start, so a
+# restart follows it, and Comfy is re-verified healthy before the gate.
+_provisioned_any=""
+
+# InfiniteTalk / MultiTalk: its Wan 2.1 weights are handled by the worker asset
+# manager; this provisioner installs the custom nodes and wav2vec Python path.
+_infinitetalk_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
+esac
+if test -n "$_infinitetalk_wanted"; then
+  echo "[infinitetalk] provisioning Comfy talking-shot runtime"
+  cd "$WORKER_ROOT"
+  bash provision_infinitetalk.sh
+  _provisioned_any=1
+fi
+
+# XLabs Flux IPAdapter: the adapter + CLIP-vision weights ride the asset manager
+# (flux_ipadapter_v1); this provisioner installs the node that provides
+# LoadFluxIPAdapter / ApplyFluxIPAdapter.
+_flux_ipadapter_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,flux_ipadapter,*|*,flux_ipadapter_v1,*|*,flux2_ipadapter,*) _flux_ipadapter_wanted=1 ;;
+esac
+if test -n "$_flux_ipadapter_wanted"; then
+  echo "[flux_ipadapter] provisioning XLabs Flux IPAdapter node"
+  cd "$WORKER_ROOT"
+  bash provision_flux_ipadapter.sh
+  _provisioned_any=1
+fi
+
+if test -n "$_provisioned_any"; then
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    echo "[provision] restarting ComfyUI on generation gpu$idx so new node classes load"
+    systemctl restart "comfyui-gpu${{idx}}.service"
+  done
+  wait_comfy_healthy
+fi
 
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
   echo "WORKER_RELEASE_STAGED_ONLY=${{WORKER_CODE_RELEASE_ID}}"
@@ -3837,50 +3889,6 @@ if test -n "$_audio_wanted"; then
     bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
 fi
 )
-
-# ── InfiniteTalk / MultiTalk Comfy extension ───────────────────────────────────
-# A1 is a generation-card runtime: its Wan 2.1 weights are handled by the worker
-# asset manager, while this provisioner installs the custom nodes and wav2vec
-# Python path. Run it only for an explicit capability selection. A restart comes
-# strictly after the provisioner so Comfy discovers the new node classes.
-_infinitetalk_wanted=""
-case ",${{WORKER_CAPABILITIES:-}}," in
-  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
-esac
-if test -n "$_infinitetalk_wanted"; then
-  echo "[infinitetalk] provisioning Comfy talking-shot runtime"
-  cd "$WORKER_ROOT"
-  bash provision_infinitetalk.sh
-  for idx in $(seq 0 $((GPU_COUNT - 1))); do
-    dept="$(dept_for_idx "$idx")"
-    test "$dept" = "generation" || continue
-    echo "[infinitetalk] restarting ComfyUI on generation gpu$idx after provisioning"
-    systemctl restart "comfyui-gpu${{idx}}.service"
-  done
-fi
-
-# ── XLabs Flux IPAdapter Comfy extension ───────────────────────────────────────
-# Same shape as InfiniteTalk: the adapter + CLIP-vision weights ride the worker
-# asset manager (flux_ipadapter_v1), this provisioner installs the custom node
-# that provides LoadFluxIPAdapter, and the restart comes strictly after it —
-# ComfyUI only discovers new node classes at start. Without this block a box
-# rented with the capability carried the weights and still 400d every render
-# with `missing_node_type: LoadFluxIPAdapter` (observed 2026-08-22).
-_flux_ipadapter_wanted=""
-case ",${{WORKER_CAPABILITIES:-}}," in
-  *,flux_ipadapter,*|*,flux_ipadapter_v1,*|*,flux2_ipadapter,*) _flux_ipadapter_wanted=1 ;;
-esac
-if test -n "$_flux_ipadapter_wanted"; then
-  echo "[flux_ipadapter] provisioning XLabs Flux IPAdapter node"
-  cd "$WORKER_ROOT"
-  bash provision_flux_ipadapter.sh
-  for idx in $(seq 0 $((GPU_COUNT - 1))); do
-    dept="$(dept_for_idx "$idx")"
-    test "$dept" = "generation" || continue
-    echo "[flux_ipadapter] restarting ComfyUI on generation gpu$idx after provisioning"
-    systemctl restart "comfyui-gpu${{idx}}.service"
-  done
-fi
 
 # ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
 # The provisioners above are shell scripts read from the box's git checkout of
