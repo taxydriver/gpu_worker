@@ -1,14 +1,48 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 from pathlib import Path
+import struct
 from types import SimpleNamespace
 import wave
+import zlib
 
 import pytest
 
 from gpu_worker import app
 from gpu_worker import asset_manager
+from gpu_worker import comfy_client
 from gpu_worker import infinitetalk as runtime
+from gpu_worker.schemas import ComfyInputFile, RunRequest
+
+
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+    b"\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4"
+    b"\x00\x00\x00\x00IEND\xaeB`\x82"
+)
+
+
+def _rgb_png(red: int, green: int, blue: int) -> bytes:
+    """Build a CRC-valid one-pixel RGB PNG for container-preserving tamper tests."""
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", binascii.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes((0, red, green, blue))))
+        + chunk(b"IEND", b"")
+    )
 
 
 def test_readiness_requires_every_a1_node_and_wav2vec_dependency(monkeypatch, tmp_path):
@@ -58,11 +92,213 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
 
 
 def _write_pcm_wav(path: Path, *, seconds: float = 2.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16_000)
         output.writeframes(b"\0\0" * int(16_000 * seconds))
+
+
+def _infinitetalk_request() -> tuple[RunRequest, bytes, bytes]:
+    image = PNG_BYTES
+    # Match the failed proof's non-empty source size. The conversion is faked
+    # below because staging/receipt provenance, not ffmpeg, is under test.
+    mpeg = b"M" * 49_781
+    image_digest = hashlib.sha256(image).hexdigest()
+    mpeg_digest = hashlib.sha256(mpeg).hexdigest()
+    return (
+        RunRequest(
+            job_id="36c870a5-db87-5771-b2de-3464aa552d54",
+            asset_group="infinitetalk_v1",
+            comfy_payload={
+                "6": {"class_type": "LoadImage", "inputs": {"image": "old.png"}},
+                "10": {"class_type": "LoadAudio", "inputs": {"audio": "old.mp3"}},
+            },
+            comfy_input_files=[
+                ComfyInputFile(
+                    node_id="6",
+                    input_name="image",
+                    filename="approved.png",
+                    source_data=base64.b64encode(image).decode("ascii"),
+                    expected_sha256=image_digest,
+                    content_type="image/png",
+                ),
+                ComfyInputFile(
+                    node_id="10",
+                    input_name="audio",
+                    filename="approved.mp3",
+                    source_data=base64.b64encode(mpeg).decode("ascii"),
+                    expected_sha256=mpeg_digest,
+                    content_type="audio/mpeg",
+                ),
+            ],
+        ),
+        image,
+        mpeg,
+    )
+
+
+def _configure_input_root(monkeypatch, input_root: Path) -> None:
+    settings = SimpleNamespace(comfy_input_dir=str(input_root))
+    monkeypatch.setattr(comfy_client, "comfy_input_dir", lambda: input_root)
+    monkeypatch.setattr(app, "get_settings", lambda: settings)
+    monkeypatch.setattr(runtime, "get_settings", lambda: settings)
+
+
+def _fake_normalizer(source: Path, *, job_id: str) -> Path:
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    destination = runtime.normalized_audio_path_for_source(source_digest, job_id=job_id)
+    # 48,640 mono s16 frames plus the 44-byte header reproduces the observed
+    # 97,324-byte normalized WAV while remaining a valid 3.04 second input.
+    _write_pcm_wav(destination, seconds=3.04)
+    return destination
+
+
+def test_effective_receipts_attest_png_and_normalized_wav(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_input_root(monkeypatch, input_root)
+    monkeypatch.setattr(app, "normalize_approved_mpeg_to_wav", _fake_normalizer)
+    request, image, mpeg = _infinitetalk_request()
+
+    payload, observer_specs = app._prepare_comfy_inputs(request)
+    receipts = comfy_client.observe_staged_input_receipts(payload, observer_specs)
+
+    wav_name = payload["10"]["inputs"]["audio"]
+    wav_path = input_root / wav_name
+    wav_digest = hashlib.sha256(wav_path.read_bytes()).hexdigest()
+    assert len(mpeg) == 49_781
+    assert wav_path.stat().st_size == 97_324
+    assert receipts == [
+        {
+            "node_id": "6",
+            "input_name": "image",
+            "content_sha256": hashlib.sha256(image).hexdigest(),
+        },
+        {"node_id": "10", "input_name": "audio", "content_sha256": wav_digest},
+    ]
+    assert wav_digest != hashlib.sha256(mpeg).hexdigest()
+    wav_spec = observer_specs[1]
+    assert wav_spec.content_type == "audio/wav"
+    assert wav_spec.expected_sha256 == wav_digest
+    assert wav_spec.source_data is None
+    assert wav_spec.source_path is None
+    assert wav_spec.source_url is None
+    assert wav_spec.subfolder == ""
+
+
+def test_effective_receipts_reject_valid_png_or_wav_tampering(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_input_root(monkeypatch, input_root)
+    monkeypatch.setattr(app, "normalize_approved_mpeg_to_wav", _fake_normalizer)
+    request, _, _ = _infinitetalk_request()
+    payload, observer_specs = app._prepare_comfy_inputs(request)
+    wav_path = input_root / payload["10"]["inputs"]["audio"]
+    original_wav = wav_path.read_bytes()
+
+    _write_pcm_wav(wav_path, seconds=2.0)
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, observer_specs)
+
+    wav_path.write_bytes(original_wav)
+    image_path = input_root / payload["6"]["inputs"]["image"]
+    image_path.write_bytes(_rgb_png(255, 0, 0))
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, observer_specs)
+
+
+def test_empty_audio_and_nonempty_digest_mismatch_have_distinct_errors(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    monkeypatch.setattr(comfy_client, "comfy_input_dir", lambda: input_root)
+    expected = hashlib.sha256(b"approved-mp3").hexdigest()
+    spec = ComfyInputFile(
+        node_id="10",
+        input_name="audio",
+        filename="approved.mp3",
+        expected_sha256=expected,
+        content_type="audio/mpeg",
+    )
+    payload = {"10": {"inputs": {"audio": "observed.mp3"}}}
+    observed = input_root / "observed.mp3"
+
+    observed.write_bytes(b"non-empty-but-different")
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, [spec])
+    observed.write_bytes(b"")
+    with pytest.raises(RuntimeError, match="Observed staged input file is empty"):
+        comfy_client.observe_staged_input_receipts(payload, [spec])
+
+
+def test_bad_mp3_is_rejected_before_normalization(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_input_root(monkeypatch, input_root)
+    request, _, _ = _infinitetalk_request()
+    real_apply = app.apply_comfy_input_files
+    normalize_calls = []
+
+    def apply_then_corrupt(payload, specs):
+        staged = real_apply(payload, specs)
+        audio_path = input_root / staged["10"]["inputs"]["audio"]
+        audio_path.write_bytes(b"non-empty-mutated-mp3")
+        return staged
+
+    monkeypatch.setattr(app, "apply_comfy_input_files", apply_then_corrupt)
+    monkeypatch.setattr(
+        app,
+        "normalize_approved_mpeg_to_wav",
+        lambda *args, **kwargs: normalize_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        app._prepare_comfy_inputs(request)
+    assert normalize_calls == []
+
+
+def test_execute_run_reobserves_effective_inputs_on_retry(monkeypatch):
+    request = RunRequest(job_id="retry-proof", asset_group="infinitetalk_v1", comfy_payload={})
+    observations = []
+    monkeypatch.setattr(app, "_asset_group_allowed", lambda _group: True)
+    monkeypatch.setattr(app, "_effective_vram_floor", lambda _group: None)
+    monkeypatch.setattr(app, "_free_vram_on_group_switch", lambda _group: None)
+    monkeypatch.setattr(
+        app,
+        "ensure_asset_group",
+        lambda _group: SimpleNamespace(downloaded_assets=[], asset_check_sec=0.0, download_sec=0.0),
+    )
+    monkeypatch.setattr(app, "_ensure_runtime_provisioned", lambda _group: False)
+    monkeypatch.setattr(app, "_prepare_comfy_inputs", lambda _request: ({}, []))
+
+    def observe(_payload, _specs):
+        observations.append("observed")
+        if len(observations) == 2:
+            raise RuntimeError("Observed staged input digest mismatch")
+        return []
+
+    monkeypatch.setattr(app, "observe_staged_input_receipts", observe)
+    monkeypatch.setattr(
+        app,
+        "submit_prompt",
+        lambda _payload: (_ for _ in ()).throw(RuntimeError("Comfy stopped")),
+    )
+    monkeypatch.setattr(app, "is_comfy_healthy", lambda: False)
+    monkeypatch.setattr(app, "restart_comfy", lambda: 0.0)
+    monkeypatch.setattr(app, "_send_heartbeat_now", lambda: None)
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(comfy_start_cmd="restart", comfy_base_url="http://127.0.0.1:8188"),
+    )
+
+    result = app._execute_run(request)
+
+    assert observations == ["observed", "observed"]
+    assert result.ok is False
+    assert result.restart_performed is True
+    assert result.error == "Observed staged input digest mismatch"
 
 
 def test_mpeg_normalization_is_streamed_bounded_and_job_isolated(monkeypatch, tmp_path):

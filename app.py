@@ -56,9 +56,11 @@ from gpu_worker.infinitetalk import (
     INFINITETALK_ASSET_GROUP,
     check_infinitetalk_readiness,
     normalize_approved_mpeg_to_wav,
+    normalized_audio_path_for_source,
 )
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
 from gpu_worker.stitch import stitch_clips, upload_via_signed_put
+from gpu_worker.utils import sha256_file
 from gpu_worker.worker_auth import (
     WorkerAPIAuthError,
     verify_worker_api_authorization,
@@ -69,6 +71,7 @@ from gpu_worker.schemas import (
     ActiveJobSummary,
     ClipKeyframe,
     ClipKeyframes,
+    ComfyInputFile,
     EnsureAssetGroupResult,
     EnsureAssetsRequest,
     EnsureAssetsResponse,
@@ -298,15 +301,20 @@ def _normalize_infinitetalk_audio_inputs(
     comfy_input_files: list[ComfyInputFile],
     *,
     job_id: str,
-) -> dict:
-    """Replace approved MPEG inputs in the A1 graph with job-scoped 16 kHz WAVs."""
+) -> tuple[dict, list[ComfyInputFile]]:
+    """Replace MPEG inputs and return specs for the effective PNG+WAV graph."""
 
     input_root = Path(get_settings().comfy_input_dir).expanduser().resolve(strict=False)
+    observer_specs: list[ComfyInputFile] = []
     for file_spec in comfy_input_files:
         if file_spec.input_name != "audio":
+            observer_specs.append(file_spec)
             continue
         if (file_spec.content_type or "").lower() != "audio/mpeg":
             raise ValueError("InfiniteTalk audio input must be approved audio/mpeg")
+        source_digest = str(file_spec.expected_sha256 or "").strip().lower()
+        if not source_digest:
+            raise ValueError("InfiniteTalk audio input requires an approved source digest")
         node = comfy_payload.get(str(file_spec.node_id))
         if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
             raise ValueError(f"InfiniteTalk audio node is missing: {file_spec.node_id}")
@@ -318,9 +326,52 @@ def _normalize_infinitetalk_audio_inputs(
             source.relative_to(input_root)
         except ValueError as exc:
             raise ValueError("InfiniteTalk staged audio escapes Comfy input") from exc
-        normalized = normalize_approved_mpeg_to_wav(source, job_id=job_id)
-        node["inputs"][file_spec.input_name] = str(normalized.relative_to(input_root))
-    return comfy_payload
+        normalized_path = normalize_approved_mpeg_to_wav(source, job_id=job_id)
+        if normalized_path.is_symlink():
+            raise RuntimeError("InfiniteTalk normalized audio lost source/job ownership")
+        expected_normalized = normalized_audio_path_for_source(
+            source_digest,
+            job_id=job_id,
+        ).resolve(strict=False)
+        normalized = normalized_path.resolve(strict=False)
+        if normalized != expected_normalized:
+            raise RuntimeError("InfiniteTalk normalized audio lost source/job ownership")
+        try:
+            normalized_name = str(normalized.relative_to(input_root))
+        except ValueError as exc:
+            raise RuntimeError("InfiniteTalk normalized audio escapes Comfy input") from exc
+        node["inputs"][file_spec.input_name] = normalized_name
+        observer_specs.append(
+            ComfyInputFile(
+                node_id=file_spec.node_id,
+                input_name=file_spec.input_name,
+                filename=normalized.name,
+                expected_sha256=sha256_file(normalized),
+                content_type="audio/wav",
+                type=file_spec.type,
+            )
+        )
+    return comfy_payload, observer_specs
+
+
+def _prepare_comfy_inputs(request: RunRequest) -> tuple[dict, list[ComfyInputFile]]:
+    """Stage source bytes, attest them, then describe the effective graph inputs."""
+
+    prepared_payload = apply_comfy_input_files(
+        request.comfy_payload,
+        request.comfy_input_files,
+    )
+    # Transformations must never hide a bad source receipt. In particular, the
+    # approved MP3 digest is checked before its graph entry becomes a WAV.
+    observe_staged_input_receipts(prepared_payload, request.comfy_input_files)
+    observer_specs = request.comfy_input_files
+    if canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP:
+        prepared_payload, observer_specs = _normalize_infinitetalk_audio_inputs(
+            prepared_payload,
+            request.comfy_input_files,
+            job_id=request.job_id,
+        )
+    return prepared_payload, observer_specs
 
 
 def _note_job_completed() -> None:
@@ -1474,13 +1525,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             timings.restart_sec = restart_comfy()
             restart_performed = True
 
-        prepared_payload = apply_comfy_input_files(request.comfy_payload, request.comfy_input_files)
-        if canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP:
-            prepared_payload = _normalize_infinitetalk_audio_inputs(
-                prepared_payload,
-                request.comfy_input_files,
-                job_id=request.job_id,
-            )
+        prepared_payload, observer_specs = _prepare_comfy_inputs(request)
         expected_prompt_sec = _initial_prompt_eta_sec(request.asset_group, resolution_bucket)
         stage_started = time.monotonic()
         if progress is not None:
@@ -1498,7 +1543,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
                 comfy_started = time.monotonic()
                 staged_input_receipts = observe_staged_input_receipts(
                     prepared_payload,
-                    request.comfy_input_files,
+                    observer_specs,
                 )
                 prompt_id = submit_prompt(prepared_payload)
                 history = poll_for_completion(

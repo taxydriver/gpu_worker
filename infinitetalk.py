@@ -181,6 +181,16 @@ def _job_scope(job_id: str) -> str:
     return scope
 
 
+def normalized_audio_path_for_source(source_content_sha256: str, *, job_id: str) -> Path:
+    """Return the only worker-owned WAV path allowed for a source/job pair."""
+
+    digest = str(source_content_sha256 or "").strip().lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("InfiniteTalk source audio digest is invalid")
+    input_root = Path(get_settings().comfy_input_dir).expanduser()
+    return input_root / "infinitetalk" / _job_scope(job_id) / f"{digest}.wav"
+
+
 def _probe_approved_duration(source: Path) -> float:
     """Require a finite decoded duration within the one-line proof envelope."""
 
@@ -258,11 +268,10 @@ def normalize_approved_mpeg_to_wav(source: Path, *, job_id: str) -> Path:
     if not source.is_file():
         raise ValueError(f"InfiniteTalk audio source is missing or empty: {source}")
 
-    job_scope = _job_scope(job_id)
+    _job_scope(job_id)  # Reject an unusable ownership scope before probing media.
     digest = _hash_approved_mpeg(source)
     _probe_approved_duration(source)
-    input_root = Path(get_settings().comfy_input_dir).expanduser()
-    destination = input_root / "infinitetalk" / job_scope / f"{digest}.wav"
+    destination = normalized_audio_path_for_source(digest, job_id=job_id)
     if _is_valid_normalized_wav(destination):
         return destination
     _discard_invalid_wav(destination)

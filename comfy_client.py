@@ -23,7 +23,7 @@ from urllib3.util import Timeout
 
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import ComfyInputFile, OutputFile
-from gpu_worker.utils import is_non_empty_file, safe_unlink
+from gpu_worker.utils import is_non_empty_file, safe_unlink, sha256_file
 
 
 LOGGER = logging.getLogger(__name__)
@@ -764,6 +764,8 @@ def _requires_image_validation(file_spec: ComfyInputFile) -> bool:
 
 
 def _is_valid_staged_input(path: Path, file_spec: ComfyInputFile) -> bool:
+    if path.is_symlink():
+        return False
     valid_container = (
         _is_supported_image_file(path)
         if _requires_image_validation(file_spec)
@@ -775,17 +777,29 @@ def _is_valid_staged_input(path: Path, file_spec: ComfyInputFile) -> bool:
     if not expected:
         return True
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest() == expected
+        return sha256_file(path) == expected
     except OSError:
         return False
 
 
 def _ensure_valid_staged_input(path: Path, file_spec: ComfyInputFile, action: str) -> None:
-    if _is_valid_staged_input(path, file_spec):
-        return
+    if path.is_symlink():
+        raise RuntimeError(f"{action} input file is an unsafe symlink")
     if _requires_image_validation(file_spec):
-        raise RuntimeError(f"{action} input file is not a valid image")
-    raise RuntimeError(f"{action} input file is empty")
+        if not _is_supported_image_file(path):
+            raise RuntimeError(f"{action} input file is not a valid image")
+    elif not is_non_empty_file(path):
+        raise RuntimeError(f"{action} input file is empty")
+
+    expected = str(file_spec.expected_sha256 or "").strip().lower()
+    if not expected:
+        return
+    try:
+        observed = sha256_file(path)
+    except OSError as exc:
+        raise RuntimeError(f"{action} input file could not be read") from exc
+    if observed != expected:
+        raise RuntimeError(f"{action} input digest mismatch")
 
 
 def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) -> Path:
@@ -932,7 +946,7 @@ def observe_staged_input_receipts(
         except ValueError as exc:
             raise RuntimeError("Staged Comfy input escapes input directory") from exc
         _ensure_valid_staged_input(staged, file_spec, "Observed staged")
-        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        digest = sha256_file(staged)
         expected = str(file_spec.expected_sha256 or "").strip().lower()
         if expected and digest != expected:
             raise RuntimeError("Observed staged input digest mismatch")
