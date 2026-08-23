@@ -212,6 +212,76 @@ def test_a2_checkpoint_readiness_requires_exact_ensure_digest_and_detects_replac
     assert "has not passed exact digest verification" in runtime._multi_checkpoint_error()
 
 
+def test_warm_a2_ensure_hashes_once_then_enables_strict_readiness(monkeypatch, tmp_path):
+    header = b'{"tensor":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}'
+    checkpoint = tmp_path / "multi.safetensors"
+    checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"ABCD")
+    approved = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_PATH", checkpoint)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_BYTES", checkpoint.stat().st_size)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_SHA256", approved)
+    monkeypatch.setattr(
+        asset_manager,
+        "get_asset_group",
+        lambda _group: [{
+            "name": "infinitetalk_multi",
+            "path": str(checkpoint),
+            "url": "https://example.invalid/multi.safetensors",
+            "sha256": approved,
+        }],
+    )
+    monkeypatch.setattr(runtime, "_required_files", lambda: ())
+    python = tmp_path / "python"
+    python.touch()
+    monkeypatch.setattr(runtime, "_comfy_python", lambda: python)
+    monkeypatch.setattr(
+        runtime.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    object_info = {name: {} for name in runtime.A2_REQUIRED_NODE_CLASSES}
+    object_info["MultiTalkWav2VecEmbeds"] = {
+        "input": {
+            "required": {"multi_audio_type": [["para", "add"], {}]},
+            "optional": {"audio_2": ["AUDIO"], "ref_target_masks": ["MASK"]},
+        }
+    }
+    monkeypatch.setattr(
+        runtime.requests,
+        "get",
+        lambda *args, **kwargs: SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: object_info,
+        ),
+    )
+    monkeypatch.setattr(runtime, "_wrapper_patch_error", lambda: None)
+    asset_manager._VERIFIED_CHECKSUM_FACTS.clear()
+    original_verify = asset_manager._verify_sha256
+    verify_calls = []
+
+    def verify(path, expected):
+        verify_calls.append((path, expected))
+        original_verify(path, expected)
+
+    monkeypatch.setattr(asset_manager, "_verify_sha256", verify)
+
+    first = asset_manager.ensure_asset_group("infinitetalk_two_person_v1")
+    assert first.downloaded_assets == []
+    assert len(verify_calls) == 1
+    assert runtime.check_infinitetalk_readiness(require_two_person=True).ready is True
+
+    second = asset_manager.ensure_asset_group("infinitetalk_two_person_v1")
+    assert second.downloaded_assets == []
+    assert len(verify_calls) == 1
+
+    checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"WXYZ")
+    assert "has not passed exact digest verification" in runtime._multi_checkpoint_error()
+    with pytest.raises(RuntimeError, match="Checksum mismatch"):
+        asset_manager.ensure_asset_group("infinitetalk_two_person_v1")
+    assert len(verify_calls) == 2
+    assert not checkpoint.exists()
+
+
 def test_a2_wrapper_readiness_requires_pinned_commit_and_positive_patch(monkeypatch, tmp_path):
     wrapper = tmp_path / "custom_nodes" / "ComfyUI-WanVideoWrapper"
     wrapper.mkdir(parents=True)

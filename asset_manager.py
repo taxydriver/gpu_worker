@@ -698,7 +698,13 @@ def ensure_asset_group(asset_group: str) -> EnsureAssetsResult:
 
     for asset in assets:
         check_started = time.monotonic()
-        already_present = is_non_empty_file(Path(asset["path"]).expanduser())
+        target_path = Path(asset["path"]).expanduser()
+        already_present = is_non_empty_file(target_path)
+        if already_present and asset.get("sha256"):
+            # Readiness consumes this same-process proof for very large pinned
+            # assets.  Do not let the warm-file fast path bypass the exact
+            # digest verification performed by _ensure_single_asset().
+            verify_asset_checksum(target_path, asset["sha256"])
         asset_check_sec += time.monotonic() - check_started
         if already_present:
             LOGGER.info("Asset already present: %s", asset["path"])
