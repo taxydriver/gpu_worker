@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Protocol, Sequence
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -45,6 +46,8 @@ STAGE_SCHEMA = "filmforge.worker-secure-stage.v1"
 BACKEND_PROBE_SCHEMA = "filmforge.worker-cutover-probe.v1"
 MAX_RECEIPT_AGE_SECONDS = 15 * 60
 MAX_BACKEND_PROBE_RESPONSE_BYTES = 64 * 1024
+BACKEND_PROBE_REGISTRATION_RETRY_SECONDS = 150
+BACKEND_PROBE_REGISTRATION_RETRY_INTERVAL_SECONDS = 2
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 _SAFE_UNIT = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$")
@@ -308,8 +311,13 @@ class SystemdServiceController:
             if separator:
                 fields[key] = value
         fragment_candidates = {str(fragment_path), str(fragment_path.resolve())}
-        if fields.get("FragmentPath") not in fragment_candidates:
+        loaded_fragment = fields.get("FragmentPath")
+        if loaded_fragment not in fragment_candidates:
             raise WorkerReleaseError("systemd did not load the exact managed unit")
+        if Path(str(loaded_fragment)).name != unit:
+            raise WorkerReleaseError(
+                "systemd loaded the managed unit as an alias instead of its exact name"
+            )
         loaded_dropins = fields.get("DropInPaths", "").split()
         if len(loaded_dropins) != len(dropin_paths):
             raise WorkerReleaseError("systemd loaded an unexpected unit drop-in set")
@@ -396,27 +404,51 @@ class SystemdServiceController:
             },
             sort_keys=True,
         ).encode("utf-8")
-        request = Request(
-            probe_url,
-            data=payload,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {probe_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
         opener = build_opener(ProxyHandler({}), _NoRedirect())
-        try:
-            with opener.open(request, timeout=30) as response:
-                raw = response.read(MAX_BACKEND_PROBE_RESPONSE_BYTES + 1)
-                if len(raw) > MAX_BACKEND_PROBE_RESPONSE_BYTES:
-                    raise WorkerReleaseError("backend cutover probe response is too large")
-                value = json.loads(raw)
-        except WorkerReleaseError:
-            raise
-        except Exception as exc:
-            raise WorkerReleaseError("backend cutover probe failed") from exc
+        deadline = time.monotonic() + BACKEND_PROBE_REGISTRATION_RETRY_SECONDS
+        while True:
+            request = Request(
+                probe_url,
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {probe_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with opener.open(request, timeout=30) as response:
+                    raw = response.read(MAX_BACKEND_PROBE_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_BACKEND_PROBE_RESPONSE_BYTES:
+                        raise WorkerReleaseError(
+                            "backend cutover probe response is too large"
+                        )
+                    value = json.loads(raw)
+                break
+            except HTTPError as exc:
+                # A freshly restarted worker registers before its background
+                # preload has rebuilt process-local checksum facts. The backend
+                # deliberately returns 409 until the next capability-confirmed
+                # heartbeat promotes that exact URL online. No other response
+                # is transient: auth, contract, identity and route failures stay
+                # immediate fail-closed errors.
+                if exc.code != 409:
+                    exc.close()
+                    raise WorkerReleaseError("backend cutover probe failed") from exc
+                exc.close()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerReleaseError(
+                        "backend cutover registration did not become ready"
+                    ) from exc
+                time.sleep(
+                    min(BACKEND_PROBE_REGISTRATION_RETRY_INTERVAL_SECONDS, remaining)
+                )
+            except WorkerReleaseError:
+                raise
+            except Exception as exc:
+                raise WorkerReleaseError("backend cutover probe failed") from exc
         expected = {
             "schema": BACKEND_PROBE_SCHEMA,
             "ok": True,
@@ -1991,6 +2023,7 @@ def stage_secure_profile(
         staging = layout.releases_root / f".{contract.release_id}.{uuid.uuid4().hex}.stage"
         staging.mkdir(mode=0o700)
         try:
+            tunnel_unit_artifact = contract.tunnel_unit
             worker_env_path = staging / "worker-secrets.env"
             tunnel_env_path = staging / ("tunnel-secrets.env" if contract.edge_provider == "cloudflared" else "caddy-secrets.env")
             backend_probe_env_path = staging / "backend-cutover-probe.env"
@@ -2107,7 +2140,7 @@ def stage_secure_profile(
                 mode=0o644,
             )
             _write_text(
-                staging / "filmforge-worker-tunnel.service",
+                staging / tunnel_unit_artifact,
                 tunnel_unit_content,
                 mode=0o644,
             )
@@ -2161,8 +2194,9 @@ def stage_secure_profile(
                     staging / "tunnel-secure-profile.conf"
                 ),
                 "tunnel_unit_sha256": _sha256_file(
-                    staging / "filmforge-worker-tunnel.service"
+                    staging / tunnel_unit_artifact
                 ),
+                "tunnel_unit_artifact": tunnel_unit_artifact,
                 "worker_guard_sha256": _sha256_file(
                     staging / "worker-staged-guard.conf"
                 ),
@@ -2192,7 +2226,10 @@ def stage_secure_profile(
 
     worker_dropin = worker_dropin_dir / PROFILE_DROPIN_NAME
     tunnel_dropin = tunnel_dropin_dir / PROFILE_DROPIN_NAME
-    _atomic_symlink(release_dir / "filmforge-worker-tunnel.service", tunnel_unit_path)
+    staged_data = _stage_data(release_dir)
+    _atomic_symlink(
+        release_dir / _tunnel_unit_artifact(staged_data), tunnel_unit_path
+    )
     _atomic_symlink(release_dir / "tunnel-secure-profile.conf", tunnel_dropin)
     if contract.profile_mode == "first-install":
         _atomic_symlink(
@@ -2242,13 +2279,31 @@ _STAGED_ARTIFACTS: dict[str, tuple[str, int]] = {
     "tunnel_binary_sha256": ("cloudflared", 0o755),
     "worker_dropin_sha256": ("worker-secure-profile.conf", 0o644),
     "tunnel_dropin_sha256": ("tunnel-secure-profile.conf", 0o644),
-    "tunnel_unit_sha256": ("filmforge-worker-tunnel.service", 0o644),
     "worker_guard_sha256": ("worker-staged-guard.conf", 0o644),
 }
 
 
+def _tunnel_unit_artifact(stage_data: dict[str, object]) -> str:
+    """Return the exact unit basename, accepting old staged receipts read-only."""
+
+    value = stage_data.get("tunnel_unit_artifact")
+    if value is None:
+        return "filmforge-worker-tunnel.service"
+    if (
+        not isinstance(value, str)
+        or not _SAFE_UNIT.fullmatch(value)
+        or value != stage_data.get("tunnel_unit")
+    ):
+        raise WorkerReleaseError("staged tunnel unit artifact identity is invalid")
+    return value
+
+
 def _staged_artifacts(stage_data: dict[str, object]) -> dict[str, tuple[str, int]]:
     artifacts = dict(_STAGED_ARTIFACTS)
+    artifacts["tunnel_unit_sha256"] = (
+        _tunnel_unit_artifact(stage_data),
+        0o644,
+    )
     if stage_data.get("edge_provider") == "caddy":
         for field in ("tunnel_secret_sha256", "tunnel_config_sha256", "tunnel_credential_sha256", "tunnel_exec_sha256", "tunnel_binary_sha256"):
             artifacts.pop(field)
@@ -2314,7 +2369,7 @@ def _assert_active_profile_links(
     tunnel_unit_path = layout.systemd_root / tunnel_unit
     expected = {
         tunnel_dropin: release_dir / "tunnel-secure-profile.conf",
-        tunnel_unit_path: release_dir / "filmforge-worker-tunnel.service",
+        tunnel_unit_path: release_dir / _tunnel_unit_artifact(stage_data),
     }
     indexed_dropins = {
         layout.systemd_root / f"{unit}.d" / PROFILE_DROPIN_NAME:
@@ -3084,7 +3139,7 @@ def _rollback_secure_profile_unlocked(
         ),
         "tunnel unit": _assert_managed_link_or_absent(
             tunnel_unit_path,
-            release_dir / "filmforge-worker-tunnel.service",
+            release_dir / _tunnel_unit_artifact(stage_data),
             label="tunnel unit",
         ),
         "active profile": _assert_managed_link_or_absent(
@@ -3095,6 +3150,7 @@ def _rollback_secure_profile_unlocked(
     }
     if not rollback_in_progress and not rollback_complete and not all(link_state.values()):
         raise WorkerReleaseError("secure-profile rollback release is not fully active")
+    guard_present = False
     if profile_mode == "first-install":
         guard_present = _assert_managed_link_or_absent(
             guard,
@@ -3154,6 +3210,58 @@ def _rollback_secure_profile_unlocked(
     if prevalidate_only:
         return
 
+    safe_links_absent = not any(link_state.values()) and not guard_present
+    safe_markers_absent = not (
+        authorization.exists()
+        or authorization.is_symlink()
+        or boot_authorization.exists()
+        or boot_authorization.is_symlink()
+    )
+    if rollback_complete:
+        if not safe_links_absent or not safe_markers_absent:
+            raise WorkerReleaseError(
+                "completed secure-profile rollback still has active managed state"
+            )
+        # Repeated outer rollback is a no-op after the inner cutover rollback
+        # has already stopped/disabled services and removed their managed unit.
+        # Re-run the code CAS check and canonicalize old/incomplete journal
+        # fields without asking systemd to operate on a now-missing unit.
+        _rollback_code_pointer_for_profile(stage_data)
+        changed = False
+        if stage_data.get("cutover_state") != "rolled_back":
+            stage_data["cutover_state"] = "rolled_back"
+            changed = True
+        if not isinstance(stage_data.get("rolled_back_at_epoch"), int):
+            stage_data["rolled_back_at_epoch"] = int(time.time())
+            changed = True
+        if changed:
+            _write_text(
+                release_dir / "stage-receipt.json",
+                json.dumps(stage_data, sort_keys=True, indent=2) + "\n",
+                mode=0o600,
+            )
+        return
+    if (
+        rollback_in_progress
+        and stage_data.get("cutover_performed") is False
+        and isinstance(stage_data.get("rolled_back_at_epoch"), int)
+        and safe_links_absent
+        and safe_markers_absent
+    ):
+        # A process may be interrupted after writing every durable safe-state
+        # marker but before normalizing the journal seen by an outer rollback.
+        # The final timestamp plus the absence of every managed link/authority
+        # is the fail-closed completion proof; do not re-stop a removed unit.
+        _rollback_code_pointer_for_profile(stage_data)
+        stage_data["cutover_state"] = "rolled_back"
+        stage_data["rollback_state"] = "complete"
+        _write_text(
+            release_dir / "stage-receipt.json",
+            json.dumps(stage_data, sort_keys=True, indent=2) + "\n",
+            mode=0o600,
+        )
+        return
+
     # Journal precedes the first destructive operation. Every subsequent step
     # accepts its own completed state, so SSH loss/systemd failure is retryable.
     stage_data["rollback_state"] = "in_progress"
@@ -3203,9 +3311,14 @@ def _rollback_secure_profile_unlocked(
         for _unit in _stage_indexed_units(stage_data):
             service_controller.stop(_unit)
             service_controller.disable(_unit)
-    service_controller.stop(tunnel_unit)
-    if profile_mode == "first-install":
-        service_controller.disable(tunnel_unit)
+    # The managed tunnel link is removed only after stop+disable below. If an
+    # interrupted retry finds it absent, those operations already completed;
+    # asking systemd to stop an absent linked unit would turn safe rollback into
+    # a false failure.
+    if link_state["tunnel unit"]:
+        service_controller.stop(tunnel_unit)
+        if profile_mode == "first-install":
+            service_controller.disable(tunnel_unit)
     for managed in (tunnel_dropin, tunnel_unit_path):
         if managed.is_symlink():
             managed.unlink()

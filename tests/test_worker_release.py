@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
 import stat
 import subprocess
@@ -10,6 +11,7 @@ import tarfile
 import threading
 from dataclasses import replace
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -76,6 +78,148 @@ def test_systemd_disabled_gate_rejects_enabled_or_unknown_states(
         SystemdServiceController().assert_disabled(
             "filmforge-worker-edge-gpu0.service"
         )
+
+
+def test_systemd_loaded_unit_rejects_alias_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    controller = SystemdServiceController()
+    configured = tmp_path / "filmforge-worker-edge-gpu0.service"
+    generic = tmp_path / "filmforge-worker-tunnel.service"
+    generic.write_text("[Service]\nExecStart=/bin/true\n")
+    configured.symlink_to(generic)
+    monkeypatch.setattr(
+        controller,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=f"FragmentPath={generic}\nDropInPaths=\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(WorkerReleaseError, match="as an alias"):
+        controller.assert_unit_loaded(
+            "filmforge-worker-edge-gpu0.service",
+            fragment_path=configured,
+            dropin_paths=[],
+        )
+
+
+class _ProbeResponse:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self, _: int) -> bytes:
+        return self.body
+
+
+class _ProbeOpener:
+    def __init__(self, outcomes: list[object]) -> None:
+        self.outcomes = iter(outcomes)
+        self.calls = 0
+
+    def open(self, request: object, timeout: int):
+        self.calls += 1
+        outcome = next(self.outcomes)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+def _probe_kwargs() -> dict[str, str]:
+    return {
+        "probe_url": "https://backend.example/api/internal/worker-cutover-probe",
+        "probe_token": "fixture-probe-token-123456",
+        "release_id": "profile-release-a",
+        "worker_code_release_id": "sha256-" + "a" * 24,
+        "worker_dependency_freeze_sha256": "b" * 64,
+        "worker_public_url": "https://gpu0.worker.example",
+    }
+
+
+def _successful_probe_response() -> _ProbeResponse:
+    fields = _probe_kwargs()
+    return _ProbeResponse(
+        json.dumps(
+            {
+                "schema": "filmforge.worker-cutover-probe.v1",
+                "ok": True,
+                "release_id": fields["release_id"],
+                "worker_code_release_id": fields["worker_code_release_id"],
+                "worker_dependency_freeze_sha256": fields[
+                    "worker_dependency_freeze_sha256"
+                ],
+                "worker_public_url": fields["worker_public_url"],
+                "tunnel_ready": True,
+                "worker_auth_ready": True,
+                "registration_ready": True,
+            }
+        ).encode()
+    )
+
+
+def _http_error(status: int) -> HTTPError:
+    return HTTPError(
+        _probe_kwargs()["probe_url"], status, "fixture", None, io.BytesIO(b"{}")
+    )
+
+
+def test_backend_cutover_probe_retries_only_registration_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opener = _ProbeOpener([_http_error(409), _http_error(409), _successful_probe_response()])
+    sleeps: list[float] = []
+    monkeypatch.setattr("gpu_worker.worker_release.build_opener", lambda *args: opener)
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", sleeps.append)
+
+    SystemdServiceController().assert_authenticated_backend_route(**_probe_kwargs())
+
+    assert opener.calls == 3
+    assert sleeps == [2, 2]
+
+
+def test_backend_cutover_probe_bounds_perpetual_registration_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opener = _ProbeOpener([_http_error(409), _http_error(409)])
+    monotonic = iter([0.0, 0.0, 1.0])
+    monkeypatch.setattr("gpu_worker.worker_release.build_opener", lambda *args: opener)
+    monkeypatch.setattr("gpu_worker.worker_release.time.monotonic", lambda: next(monotonic))
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "gpu_worker.worker_release.BACKEND_PROBE_REGISTRATION_RETRY_SECONDS", 1
+    )
+
+    with pytest.raises(WorkerReleaseError, match="registration did not become ready"):
+        SystemdServiceController().assert_authenticated_backend_route(**_probe_kwargs())
+
+    assert opener.calls == 2
+
+
+@pytest.mark.parametrize("status", [400, 401, 502])
+def test_backend_cutover_probe_does_not_retry_non_registration_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    opener = _ProbeOpener([_http_error(status)])
+    sleeps: list[float] = []
+    monkeypatch.setattr("gpu_worker.worker_release.build_opener", lambda *args: opener)
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", sleeps.append)
+
+    with pytest.raises(WorkerReleaseError, match="backend cutover probe failed"):
+        SystemdServiceController().assert_authenticated_backend_route(**_probe_kwargs())
+
+    assert opener.calls == 1
+    assert sleeps == []
 
 
 def test_caddy_launcher_uses_portable_secure_mktemp_templates() -> None:
@@ -465,6 +609,10 @@ class _Controller:
         fragment_path: Path,
         dropin_paths: list[Path],
     ) -> None:
+        # Match systemd's alias rule: a configured name whose resolved unit
+        # file has a different basename cannot later be enabled by that alias.
+        if fragment_path.resolve().name != unit:
+            raise RuntimeError("fixture refuses systemd alias unit")
         self.events.append(("unit-loaded", unit, self.override.exists()))
 
     def assert_authenticated_backend_route(
@@ -828,8 +976,11 @@ def test_stage_keeps_public_override_lexically_authoritative_and_noops_on_restar
     tunnel_unit = layout.systemd_root / contract.tunnel_unit
     assert tunnel_unit.is_symlink()
     assert tunnel_unit.resolve() == (
-        staged.release_dir / "filmforge-worker-tunnel.service"
+        staged.release_dir / contract.tunnel_unit
     ).resolve()
+    assert json.loads(staged.stage_receipt.read_text())["tunnel_unit_artifact"] == (
+        contract.tunnel_unit
+    )
     assert (staged.release_dir / "filmforge-worker-tunnel").stat().st_mode & 0o111
     assert stat.S_IMODE((staged.release_dir / "worker-secrets.env").stat().st_mode) == 0o600
     assert stat.S_IMODE((staged.release_dir / "tunnel-secrets.env").stat().st_mode) == 0o600
@@ -1258,6 +1409,50 @@ def test_failed_post_restart_backend_probe_restores_override(tmp_path: Path) -> 
     assert ("backend-route", contract.worker_public_url, False) in controller.events
 
 
+def test_perpetual_backend_registration_409_rolls_back_cutover(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    contract, layout = _fixture(tmp_path, with_override=False, profile_mode="first-install")
+    staged = stage_secure_profile(contract, layout)
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    now = 1_800_000_000
+    _prepare(staged, contract, layout, _Controller(override), now=now)
+    opener = _ProbeOpener([_http_error(409), _http_error(409)])
+    monotonic = iter([0.0, 0.0, 1.0])
+    monkeypatch.setattr("gpu_worker.worker_release.build_opener", lambda *args: opener)
+    monkeypatch.setattr("gpu_worker.worker_release.time.monotonic", lambda: next(monotonic))
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "gpu_worker.worker_release.BACKEND_PROBE_REGISTRATION_RETRY_SECONDS", 1
+    )
+
+    class _RegistrationProbeController(_Controller):
+        def assert_authenticated_backend_route(self, **kwargs: str) -> None:
+            self.events.append(("backend-route", kwargs["worker_public_url"], False))
+            SystemdServiceController().assert_authenticated_backend_route(**kwargs)
+
+    controller = _RegistrationProbeController(override)
+    with pytest.raises(WorkerReleaseError, match="safe state was restored"):
+        cutover_secure_profile(
+            release_id=contract.release_id,
+            receipt_path=_first_install_receipt(
+                staged, tmp_path / "receipt.json", now=now
+            ),
+            layout=layout,
+            controller=controller,
+            now_epoch=now,
+        )
+
+    result = json.loads(staged.stage_receipt.read_text())
+    assert opener.calls == 2
+    assert result["cutover_performed"] is False
+    assert result["cutover_state"] == "rolled_back"
+    assert result["rollback_state"] == "complete"
+    assert ("stop", contract.worker_unit, False) in controller.events
+    assert ("stop", contract.tunnel_unit, False) in controller.events
+
+
 def test_cutover_resumes_after_worker_link_before_override_removal(
     tmp_path: Path,
 ) -> None:
@@ -1489,6 +1684,70 @@ def test_first_install_post_start_probe_failure_rolls_back_and_stops(tmp_path: P
     assert data["rollback_state"] == "complete"
     assert ("stop", contract.worker_unit, False) in failing.events
     assert ("stop", contract.tunnel_unit, False) in failing.events
+
+
+def test_outer_rollback_is_noop_after_inner_cutover_rollback(tmp_path: Path) -> None:
+    contract, layout = _fixture(tmp_path, with_override=False, profile_mode="first-install")
+    staged = stage_secure_profile(contract, layout)
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    now = 1_800_000_000
+    _prepare(staged, contract, layout, _Controller(override), now=now)
+    with pytest.raises(WorkerReleaseError, match="safe state was restored"):
+        cutover_secure_profile(
+            release_id=contract.release_id,
+            receipt_path=_first_install_receipt(
+                staged, tmp_path / "receipt.json", now=now
+            ),
+            layout=layout,
+            controller=_Controller(override, fail_backend_probe=True),
+            now_epoch=now,
+        )
+
+    outer = _Controller(override, fail_stop_once=True)
+    rollback_secure_profile(
+        release_id=contract.release_id,
+        layout=layout,
+        controller=outer,
+    )
+
+    assert outer.events == []
+    assert json.loads(staged.stage_receipt.read_text())["rollback_state"] == "complete"
+
+
+def test_outer_rollback_normalizes_stale_completed_journal(tmp_path: Path) -> None:
+    contract, layout = _fixture(tmp_path, with_override=False, profile_mode="first-install")
+    staged = stage_secure_profile(contract, layout)
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    now = 1_800_000_000
+    _prepare(staged, contract, layout, _Controller(override), now=now)
+    with pytest.raises(WorkerReleaseError, match="safe state was restored"):
+        cutover_secure_profile(
+            release_id=contract.release_id,
+            receipt_path=_first_install_receipt(
+                staged, tmp_path / "receipt.json", now=now
+            ),
+            layout=layout,
+            controller=_Controller(override, fail_backend_probe=True),
+            now_epoch=now,
+        )
+    stale = json.loads(staged.stage_receipt.read_text())
+    assert stale["rolled_back_at_epoch"]
+    stale["rollback_state"] = "in_progress"
+    stale["cutover_state"] = "in_progress"
+    _write_0600(staged.stage_receipt, json.dumps(stale))
+
+    outer = _Controller(override, fail_stop_once=True)
+    rollback_secure_profile(
+        release_id=contract.release_id,
+        layout=layout,
+        controller=outer,
+    )
+
+    normalized = json.loads(staged.stage_receipt.read_text())
+    assert normalized["rollback_state"] == "complete"
+    assert normalized["cutover_state"] == "rolled_back"
+    assert normalized["cutover_performed"] is False
+    assert outer.events == []
 
 
 def test_migration_refuses_false_pre_cutover_backend_readiness(tmp_path: Path) -> None:

@@ -905,6 +905,16 @@ for raw_path in receipt_paths:
         profile_release_id, worker_unit, tunnel_unit
     )):
         raise SystemExit("secure-profile identity is invalid")
+    tunnel_unit_artifact = receipt.get(
+        "tunnel_unit_artifact", "filmforge-worker-tunnel.service"
+    )
+    if (
+        not isinstance(tunnel_unit_artifact, str)
+        or not tunnel_unit_artifact.endswith(".service")
+        or "/" in tunnel_unit_artifact
+        or ("tunnel_unit_artifact" in receipt and tunnel_unit_artifact != tunnel_unit)
+    ):
+        raise SystemExit("secure-profile tunnel unit artifact identity is invalid")
     profile_dir = receipt_path.parent
     active = pathlib.Path("/etc/filmforge/worker-security/active") / worker_unit
     worker_dropin_dir = pathlib.Path("/etc/systemd/system") / f"{{worker_unit}}.d"
@@ -913,7 +923,7 @@ for raw_path in receipt_paths:
         active: profile_dir,
         worker_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "worker-secure-profile.conf",
         tunnel_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "tunnel-secure-profile.conf",
-        pathlib.Path("/etc/systemd/system") / tunnel_unit: profile_dir / "filmforge-worker-tunnel.service",
+        pathlib.Path("/etc/systemd/system") / tunnel_unit: profile_dir / tunnel_unit_artifact,
     }}
     for managed, expected in expected_links.items():
         if not managed.is_symlink() or managed.resolve() != expected.resolve():
@@ -1316,7 +1326,6 @@ artifacts = {
     "tunnel_binary_sha256": ("cloudflared", 0o755),
     "worker_dropin_sha256": ("worker-secure-profile.conf", 0o644),
     "tunnel_dropin_sha256": ("tunnel-secure-profile.conf", 0o644),
-    "tunnel_unit_sha256": ("filmforge-worker-tunnel.service", 0o644),
     "worker_guard_sha256": ("worker-staged-guard.conf", 0o644),
 }
 all_cutover = True
@@ -1388,7 +1397,22 @@ for index, raw_path in enumerate(receipt_paths):
     if any(data.get(key) != value for key, value in expected):
         raise SystemExit("secure-profile stage receipt does not match deploy contract")
     release = path.parent
-    for field, (relative, expected_mode) in artifacts.items():
+    tunnel_unit_artifact = data.get(
+        "tunnel_unit_artifact", "filmforge-worker-tunnel.service"
+    )
+    if (
+        not isinstance(tunnel_unit_artifact, str)
+        or not tunnel_unit_artifact.endswith(".service")
+        or "/" in tunnel_unit_artifact
+        or (
+            "tunnel_unit_artifact" in data
+            and tunnel_unit_artifact != tunnel_units[index]
+        )
+    ):
+        raise SystemExit("secure-profile tunnel unit artifact identity is invalid")
+    receipt_artifacts = dict(artifacts)
+    receipt_artifacts["tunnel_unit_sha256"] = (tunnel_unit_artifact, 0o644)
+    for field, (relative, expected_mode) in receipt_artifacts.items():
         artifact = release / relative
         if artifact.is_symlink() or not artifact.is_file():
             raise SystemExit("secure-profile staged artifact is missing")
@@ -1398,7 +1422,7 @@ for index, raw_path in enumerate(receipt_paths):
             raise SystemExit("secure-profile staged artifact drifted")
     worker_unit = data["worker_unit"]
     managed = {
-        pathlib.Path("/etc/systemd/system") / tunnel_units[index]: release / "filmforge-worker-tunnel.service",
+        pathlib.Path("/etc/systemd/system") / tunnel_units[index]: release / tunnel_unit_artifact,
         pathlib.Path("/etc/systemd/system") / f"{tunnel_units[index]}.d/20-filmforge-secure-profile.conf": release / "tunnel-secure-profile.conf",
     }
     worker_profile = pathlib.Path("/etc/systemd/system") / f"{worker_unit}.d/20-filmforge-secure-profile.conf"
