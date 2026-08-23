@@ -21,7 +21,9 @@ def test_legacy_aliases_resolve_to_canonical():
 def test_two_person_infinitetalk_is_a_distinct_exact_capability():
     assert canonical_asset_group("infinitetalk_v1") == "infinitetalk_v1"
     assert canonical_asset_group("infinitetalk_two_person_v1") == "infinitetalk_two_person_v1"
+    assert canonical_asset_group("infinitetalk_two_person_v2") == "infinitetalk_two_person_v2"
     assert ASSET_REGISTRY["infinitetalk_two_person_v1"] == ASSET_REGISTRY["infinitetalk_v1"]
+    assert ASSET_REGISTRY["infinitetalk_two_person_v2"] == ASSET_REGISTRY["infinitetalk_v1"]
 
 
 def test_retired_stable_audio1_aliases_are_unknown():

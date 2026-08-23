@@ -28,11 +28,12 @@ from gpu_worker.asset_registry import get_asset_group
 from gpu_worker.comfy_client import apply_comfy_input_files
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import ComfyInputFile, InfiniteTalkTwoPersonRouting
-from gpu_worker.utils import ensure_no_symlink_path
+from gpu_worker.utils import ensure_no_symlink_path, safe_unlink
 
 
 INFINITETALK_ASSET_GROUP = "infinitetalk_v1"
 INFINITETALK_TWO_PERSON_ASSET_GROUP = "infinitetalk_two_person_v1"
+INFINITETALK_TWO_PERSON_V2_ASSET_GROUP = "infinitetalk_two_person_v2"
 # This is intentionally a very small, compatibility-proof-only input contract:
 # one spoken line no longer than roughly 15 seconds.  Keeping the limits here
 # (rather than trusting ffmpeg) prevents a broker-approved mp3 from consuming
@@ -73,6 +74,24 @@ _MULTITALK_MODEL_SHA256 = "4c2486cdfb6ff9a9f27408e98e11e20619136933b20411e0c365b
 _WAN_WRAPPER_COMMIT = "088128b224242e110d3906c6750e9a3a348a659b"
 _A2_FPS = 25.0
 _A2_DECLARED_DURATION_TOLERANCE_SEC = 0.050
+_A2_FRAME_WINDOW_SIZE = 81
+_A2_FRAME_WINDOW_STRIDE = 72
+_A2_PCM_SAMPLE_RATE = 16_000
+_A2_SAMPLES_PER_VIDEO_FRAME = int(_A2_PCM_SAMPLE_RATE / _A2_FPS)
+_A2_CONDITIONING_LEAD_IN_FRAMES = 3
+_A2_CONDITIONING_LEAD_IN_SAMPLES = (
+    _A2_CONDITIONING_LEAD_IN_FRAMES * _A2_SAMPLES_PER_VIDEO_FRAME
+)
+# FFmpeg's accepted A3 ``anoisesrc=amplitude=0.0015:color=pink`` artifact
+# measured at ~0.001068 peak / ~0.000269 RMS after PCM quantization.  The fixed
+# point generator below targets that observed output rather than treating the
+# filter's amplitude parameter as a literal PCM peak.
+_A2_ROOMTONE_PEAK_PCM = 35
+_A2_ROOMTONE_RMS_ENVELOPE = (0.00020, 0.00035)
+_A2_ROOMTONE_PEAK_ENVELOPE = (0.00080, 0.00130)
+_A2_ROOMTONE_ROWS = 12
+_A2_V2_ROUTING_SCHEMA = "infinitetalk_two_person_routing_v2"
+_A2_V2_LISTENER_KIND = "deterministic_pink_roomtone_pcm_s16le_16000_mono_v1"
 _A2_NODE_IDS = {
     "model": "2",
     "still": "6",
@@ -100,6 +119,7 @@ class InfiniteTalkReadiness:
     wav2vec_dependency_error: str | None = None
     multitalk_contract_error: str | None = None
     multi_checkpoint_error: str | None = None
+    roomtone_contract_error: str | None = None
     comfy_error: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -110,6 +130,7 @@ class InfiniteTalkReadiness:
             "wav2vec_dependency_error": self.wav2vec_dependency_error,
             "multitalk_contract_error": self.multitalk_contract_error,
             "multi_checkpoint_error": self.multi_checkpoint_error,
+            "roomtone_contract_error": self.roomtone_contract_error,
             "comfy_error": self.comfy_error,
         }
 
@@ -227,7 +248,50 @@ def _wrapper_patch_error() -> str | None:
     return None
 
 
-def check_infinitetalk_readiness(*, require_two_person: bool = False) -> InfiniteTalkReadiness:
+def _roomtone_v2_contract_error() -> str | None:
+    """Exercise the deterministic v2 conditioning primitive before advertising it."""
+
+    try:
+        frame_count = _A2_FRAME_WINDOW_SIZE * _A2_SAMPLES_PER_VIDEO_FRAME
+        first, levels = _pink_roomtone_pcm_wav_bytes(
+            frame_count,
+            authority_sha256="0" * 64,
+            slot=1,
+        )
+        second, repeated_levels = _pink_roomtone_pcm_wav_bytes(
+            frame_count,
+            authority_sha256="0" * 64,
+            slot=1,
+        )
+        if first != second or levels != repeated_levels:
+            return "v2 listener roomtone is not deterministic"
+        if not (_A2_ROOMTONE_RMS_ENVELOPE[0] <= levels["rms"] <= _A2_ROOMTONE_RMS_ENVELOPE[1]):
+            return "v2 listener roomtone RMS is outside the approved envelope"
+        if not (
+            _A2_ROOMTONE_PEAK_ENVELOPE[0]
+            <= levels["peak"]
+            <= _A2_ROOMTONE_PEAK_ENVELOPE[1]
+        ):
+            return "v2 listener roomtone peak is outside the approved envelope"
+        with wave.open(io.BytesIO(first), "rb") as wav:
+            if (
+                wav.getnchannels() != 1
+                or wav.getframerate() != _A2_PCM_SAMPLE_RATE
+                or wav.getsampwidth() != 2
+                or wav.getnframes() != frame_count
+                or not any(wav.readframes(frame_count))
+            ):
+                return "v2 listener roomtone PCM contract is unavailable"
+    except Exception as exc:
+        return f"v2 listener roomtone self-check failed: {exc}"
+    return None
+
+
+def check_infinitetalk_readiness(
+    *,
+    require_two_person: bool = False,
+    require_roomtone_v2: bool = False,
+) -> InfiniteTalkReadiness:
     """Check the A1/A2 graph's actual Comfy classes, files, and wav2vec imports.
 
     A declared capability is intentionally insufficient: custom nodes load only
@@ -235,8 +299,11 @@ def check_infinitetalk_readiness(*, require_two_person: bool = False) -> Infinit
     this worker process's venv.
     """
 
+    if require_roomtone_v2:
+        require_two_person = True
     missing_files = _required_files()
     multi_checkpoint_error = _multi_checkpoint_error() if require_two_person else None
+    roomtone_contract_error = _roomtone_v2_contract_error() if require_roomtone_v2 else None
     python = _comfy_python()
     wav2vec_error: str | None = None
     if not python.is_file():
@@ -282,6 +349,7 @@ def check_infinitetalk_readiness(*, require_two_person: bool = False) -> Infinit
             or wav2vec_error
             or multitalk_contract_error
             or multi_checkpoint_error
+            or roomtone_contract_error
             or comfy_error
         ),
         missing_files=missing_files,
@@ -289,6 +357,7 @@ def check_infinitetalk_readiness(*, require_two_person: bool = False) -> Infinit
         wav2vec_dependency_error=wav2vec_error,
         multitalk_contract_error=multitalk_contract_error,
         multi_checkpoint_error=multi_checkpoint_error,
+        roomtone_contract_error=roomtone_contract_error,
         comfy_error=comfy_error,
     )
 
@@ -574,6 +643,11 @@ def _validate_a2_graph_shape(
         raise ValueError("A2 graph requires exact 25 fps audio conditioning")
     if image_to_video.get("mode") != "multitalk":
         raise ValueError("A2 graph requires multitalk sampling mode")
+    if (
+        routing.schema_version == _A2_V2_ROUTING_SCHEMA
+        and image_to_video.get("frame_window_size") != _A2_FRAME_WINDOW_SIZE
+    ):
+        raise ValueError("v2 graph requires the exact 81-frame MultiTalk window")
     if image_to_video.get("start_image") != [_A2_NODE_IDS["still"], 0]:
         raise ValueError("A2 graph start image is not the attested still")
     try:
@@ -721,9 +795,207 @@ def _silent_pcm_wav_bytes(frame_count: int) -> bytes:
     with wave.open(output, "wb") as wav:
         wav.setnchannels(1)
         wav.setsampwidth(2)
-        wav.setframerate(16_000)
+        wav.setframerate(_A2_PCM_SAMPLE_RATE)
         wav.writeframes(b"\0\0" * frame_count)
     return output.getvalue()
+
+
+def _requested_video_frames(duration_sec: float, *, lead_in_frames: int = 0) -> int:
+    raw_frames = max(1, math.ceil(duration_sec * _A2_FPS) + lead_in_frames)
+    return raw_frames + ((1 - raw_frames) % 4)
+
+
+def _effective_video_frames(requested_frames: int) -> int:
+    """Return the wrapper's fixed-point output cadence for a requested count."""
+
+    if requested_frames <= _A2_FRAME_WINDOW_SIZE:
+        return _A2_FRAME_WINDOW_SIZE
+    windows = math.ceil(
+        (requested_frames - _A2_FRAME_WINDOW_SIZE) / _A2_FRAME_WINDOW_STRIDE
+    )
+    return _A2_FRAME_WINDOW_SIZE + windows * _A2_FRAME_WINDOW_STRIDE
+
+
+def _deterministic_signed_words(seed: bytes):
+    counter = 0
+    while True:
+        block = hashlib.sha256(seed + counter.to_bytes(8, "big")).digest()
+        counter += 1
+        for offset in range(0, len(block), 2):
+            yield int.from_bytes(block[offset:offset + 2], "big") - 32_768
+
+
+def _pink_roomtone_pcm_samples(
+    frame_count: int,
+    *,
+    authority_sha256: str,
+    slot: int,
+) -> list[int]:
+    """Generate deterministic fixed-point Voss pink roomtone at A3's level."""
+
+    if frame_count <= 0:
+        raise ValueError("v2 listener roomtone requires a positive frame count")
+    try:
+        authority = bytes.fromhex(authority_sha256)
+    except ValueError as exc:
+        raise ValueError("v2 listener roomtone authority digest is invalid") from exc
+    if len(authority) != 32:
+        raise ValueError("v2 listener roomtone authority digest is invalid")
+    if slot not in (1, 2):
+        raise ValueError("v2 roomtone slot must be exactly 1 or 2")
+    words = _deterministic_signed_words(
+        b"filmforge-deterministic-pink-roomtone-pcm-v1\0"
+        + authority
+        + bytes((slot,))
+    )
+    rows = [next(words) for _ in range(_A2_ROOMTONE_ROWS)]
+    mixed: list[int] = []
+    total = 0
+    for index in range(frame_count):
+        counter = index + 1
+        row = min((counter & -counter).bit_length() - 1, _A2_ROOMTONE_ROWS - 1)
+        rows[row] = next(words)
+        value = sum(rows) + next(words)
+        mixed.append(value)
+        total += value
+    center = round(total / frame_count)
+    centered = [value - center for value in mixed]
+    maximum = max(abs(value) for value in centered)
+    if maximum <= 0:
+        # A one-frame clip has no meaningful spectrum, but must remain nonzero
+        # and fail-closed within the same bounded roomtone contract.
+        return [_A2_ROOMTONE_PEAK_PCM]
+
+    def scale(value: int) -> int:
+        magnitude = (abs(value) * _A2_ROOMTONE_PEAK_PCM + maximum // 2) // maximum
+        return magnitude if value >= 0 else -magnitude
+
+    samples = [scale(value) for value in centered]
+    if not any(samples):
+        raise RuntimeError("v2 listener roomtone unexpectedly became all-zero PCM")
+    return samples
+
+
+def _pcm_level_evidence(samples: list[int]) -> dict[str, float]:
+    if not samples:
+        raise ValueError("v2 listener roomtone has no PCM samples")
+    peak = max(abs(sample) for sample in samples) / 32_768.0
+    rms = math.sqrt(sum(sample * sample for sample in samples) / len(samples)) / 32_768.0
+    if not (
+        _A2_ROOMTONE_RMS_ENVELOPE[0]
+        <= rms
+        <= _A2_ROOMTONE_RMS_ENVELOPE[1]
+        and _A2_ROOMTONE_PEAK_ENVELOPE[0]
+        <= peak
+        <= _A2_ROOMTONE_PEAK_ENVELOPE[1]
+        and rms <= peak
+    ):
+        raise RuntimeError("v2 listener roomtone levels exceed the approved envelope")
+    return {"rms": rms, "peak": peak}
+
+
+def _pink_roomtone_pcm_wav_bytes(
+    frame_count: int,
+    *,
+    authority_sha256: str,
+    slot: int,
+) -> tuple[bytes, dict[str, float]]:
+    samples = _pink_roomtone_pcm_samples(
+        frame_count,
+        authority_sha256=authority_sha256,
+        slot=slot,
+    )
+    pcm = bytearray()
+    for sample in samples:
+        pcm.extend(struct.pack("<h", sample))
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(_A2_PCM_SAMPLE_RATE)
+        wav.writeframes(bytes(pcm))
+    return output.getvalue(), _pcm_level_evidence(samples)
+
+
+def _zero_tailed_pcm_wav_bytes(
+    source: bytes,
+    *,
+    target_frame_count: int,
+) -> tuple[bytes, int]:
+    try:
+        with wave.open(io.BytesIO(source), "rb") as wav:
+            if (
+                wav.getnchannels() != 1
+                or wav.getframerate() != _A2_PCM_SAMPLE_RATE
+                or wav.getsampwidth() != 2
+                or wav.getcomptype() != "NONE"
+                or wav.getnframes() <= 0
+            ):
+                raise ValueError("v2 speaker audio is not exact 16 kHz mono s16 PCM")
+            source_frame_count = wav.getnframes()
+            frames = wav.readframes(source_frame_count)
+    except (OSError, wave.Error) as exc:
+        raise ValueError("v2 speaker audio is not a readable PCM WAV") from exc
+    if source_frame_count > target_frame_count:
+        raise ValueError("v2 speaker audio exceeds the frozen effective output window")
+    if len(frames) != source_frame_count * 2:
+        raise ValueError("v2 speaker PCM payload is truncated")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(_A2_PCM_SAMPLE_RATE)
+        wav.writeframes(frames + b"\0\0" * (target_frame_count - source_frame_count))
+    return output.getvalue(), source_frame_count
+
+
+def _speaker_conditioning_wav_bytes(
+    source: bytes,
+    *,
+    roomtone_wav: bytes,
+    target_frame_count: int,
+    overlay_start_sample: int,
+) -> tuple[bytes, int]:
+    """Overlay the approved take on its slot-specific full-window pink bed."""
+
+    try:
+        with wave.open(io.BytesIO(source), "rb") as speaker:
+            if (
+                speaker.getnchannels() != 1
+                or speaker.getframerate() != _A2_PCM_SAMPLE_RATE
+                or speaker.getsampwidth() != 2
+                or speaker.getcomptype() != "NONE"
+                or speaker.getnframes() <= 0
+            ):
+                raise ValueError("v2 speaker audio is not exact 16 kHz mono s16 PCM")
+            source_frame_count = speaker.getnframes()
+            source_pcm = speaker.readframes(source_frame_count)
+        with wave.open(io.BytesIO(roomtone_wav), "rb") as roomtone:
+            if (
+                roomtone.getnchannels() != 1
+                or roomtone.getframerate() != _A2_PCM_SAMPLE_RATE
+                or roomtone.getsampwidth() != 2
+                or roomtone.getcomptype() != "NONE"
+                or roomtone.getnframes() != target_frame_count
+            ):
+                raise ValueError("v2 speaker roomtone bed violates the exact PCM contract")
+            roomtone_pcm = bytearray(roomtone.readframes(target_frame_count))
+    except (OSError, wave.Error) as exc:
+        raise ValueError("v2 speaker conditioning source is not readable PCM") from exc
+    if overlay_start_sample < 0 or overlay_start_sample + source_frame_count > target_frame_count:
+        raise ValueError("v2 approved speaker take does not fit the delivered output window")
+    for index, (sample,) in enumerate(struct.iter_unpack("<h", source_pcm)):
+        offset = (overlay_start_sample + index) * 2
+        bed_sample = struct.unpack_from("<h", roomtone_pcm, offset)[0]
+        mixed = max(-32_768, min(32_767, bed_sample + sample))
+        struct.pack_into("<h", roomtone_pcm, offset, mixed)
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(_A2_PCM_SAMPLE_RATE)
+        wav.writeframes(bytes(roomtone_pcm))
+    return output.getvalue(), source_frame_count
 
 
 def _observer_only(spec: ComfyInputFile) -> ComfyInputFile:
@@ -735,6 +1007,42 @@ def _observer_only(spec: ComfyInputFile) -> ComfyInputFile:
             "subfolder": "",
         }
     )
+
+
+def _v2_normalized_speaker_bytes(
+    source_specs: list[ComfyInputFile],
+    *,
+    job_id: str,
+) -> tuple[bytes, str]:
+    source_speaker = next(
+        (
+            spec
+            for spec in source_specs
+            if (spec.node_id, spec.input_name)
+            == (_A2_NODE_IDS["speaker_audio"], "audio")
+        ),
+        None,
+    )
+    source_sha256 = str(source_speaker.expected_sha256 or "") if source_speaker else ""
+    if (
+        source_speaker is None
+        or source_speaker.content_type != "audio/mpeg"
+        or len(source_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in source_sha256)
+    ):
+        raise RuntimeError("v2 approved speaker source receipt is incomplete")
+    input_root = Path(get_settings().comfy_input_dir).expanduser().resolve(strict=False)
+    normalized = ensure_no_symlink_path(
+        input_root,
+        normalized_audio_path_for_source(source_sha256, job_id=job_id),
+        require_leaf=True,
+        require_regular_file=True,
+        action="v2 normalized speaker audio",
+    )
+    normalized_bytes = normalized.read_bytes()
+    if not normalized_bytes:
+        raise RuntimeError("v2 normalized speaker audio is empty")
+    return normalized_bytes, source_sha256
 
 
 def prepare_two_person_routing_inputs(
@@ -807,7 +1115,7 @@ def prepare_two_person_routing_inputs(
         action="A2 normalized speaker audio",
     )
     frame_count = _pcm_wav_frame_count(speaker_wav_path)
-    duration_sec = frame_count / 16_000
+    duration_sec = frame_count / _A2_PCM_SAMPLE_RATE
     # Backend probe authority is rounded to milliseconds and MPEG decoding may
     # expose bounded padding.  The listener is still derived from the exact
     # normalized PCM frame count below; this tolerance is only for the frozen
@@ -817,8 +1125,37 @@ def prepare_two_person_routing_inputs(
     # The backend authored the graph from its frozen, millisecond-rounded
     # duration. Validate that same authority here; using decoded padding for
     # this guard can cross a 4n+1 bucket and reject an otherwise valid take.
-    raw_frames = max(1, math.ceil(routing.expected_duration_sec * _A2_FPS))
-    expected_video_frames = raw_frames + ((1 - raw_frames) % 4)
+    routing_v2 = routing.schema_version == _A2_V2_ROUTING_SCHEMA
+    if routing_v2:
+        requested_video_frames = _requested_video_frames(
+            routing.expected_duration_sec,
+            lead_in_frames=_A2_CONDITIONING_LEAD_IN_FRAMES,
+        )
+        expected_video_frames = _effective_video_frames(requested_video_frames)
+        if routing.effective_video_frames != expected_video_frames:
+            raise ValueError("v2 effective frame authority does not match wrapper cadence")
+        if not math.isclose(
+            routing.effective_duration_sec or 0.0,
+            expected_video_frames / _A2_FPS,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("v2 effective duration authority does not match wrapper cadence")
+        expected_delivered_frames = (
+            expected_video_frames - _A2_CONDITIONING_LEAD_IN_FRAMES
+        )
+        if routing.delivered_video_frames != expected_delivered_frames:
+            raise ValueError("v2 delivered frame authority does not match lead-in trim")
+        if not math.isclose(
+            routing.delivered_duration_sec or 0.0,
+            expected_delivered_frames / _A2_FPS,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("v2 delivered duration authority does not match lead-in trim")
+    else:
+        requested_video_frames = _requested_video_frames(routing.expected_duration_sec)
+        expected_video_frames = requested_video_frames
     embeds = comfy_payload[_A2_NODE_IDS["embeds"]]["inputs"]
     if embeds.get("num_frames") != expected_video_frames:
         raise ValueError("A2 graph frame guard does not match the exact speaker duration")
@@ -842,15 +1179,54 @@ def prepare_two_person_routing_inputs(
         height=height,
         background_of=(slot_1_box, slot_2_box),
     )
-    silence_wav = _silent_pcm_wav_bytes(frame_count)
+    listener_name = "listener_silence.wav"
+    listener_wav = _silent_pcm_wav_bytes(frame_count)
+    speaker_conditioning_wav: bytes | None = None
+    if routing_v2:
+        expected_speaker_wav_sha256 = str(speaker_wav_spec.expected_sha256 or "")
+        speaker_wav_bytes = speaker_wav_path.read_bytes()
+        if hashlib.sha256(speaker_wav_bytes).hexdigest() != expected_speaker_wav_sha256:
+            raise RuntimeError("v2 normalized speaker digest changed before padding")
+        conditioning_frame_count = expected_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+        speaker_roomtone_wav, _speaker_levels = _pink_roomtone_pcm_wav_bytes(
+            conditioning_frame_count,
+            authority_sha256=routing.spatial_authority_sha256,
+            slot=routing.speaker_slot,
+        )
+        speaker_conditioning_wav, observed_source_frames = _speaker_conditioning_wav_bytes(
+            speaker_wav_bytes,
+            roomtone_wav=speaker_roomtone_wav,
+            target_frame_count=conditioning_frame_count,
+            overlay_start_sample=_A2_CONDITIONING_LEAD_IN_SAMPLES,
+        )
+        if observed_source_frames != frame_count:
+            raise RuntimeError("v2 normalized speaker frame count changed before padding")
+        listener_wav, _levels = _pink_roomtone_pcm_wav_bytes(
+            conditioning_frame_count,
+            authority_sha256=routing.spatial_authority_sha256,
+            slot=routing.listener_slot,
+        )
+        listener_name = "listener_pink_roomtone.wav"
 
     generated: list[ComfyInputFile] = []
-    for node_id, filename, data, content_type, input_name in (
-        (_A2_NODE_IDS["listener_audio"], "listener_silence.wav", silence_wav, "audio/wav", "audio"),
+    generated_inputs = [
+        (_A2_NODE_IDS["listener_audio"], listener_name, listener_wav, "audio/wav", "audio"),
         (_A2_NODE_IDS["slot_1_mask"], "slot_1_mask.png", slot_1_mask, "image/png", "image"),
         (_A2_NODE_IDS["slot_2_mask"], "slot_2_mask.png", slot_2_mask, "image/png", "image"),
         (_A2_NODE_IDS["background_mask"], "background_mask.png", background_mask, "image/png", "image"),
-    ):
+    ]
+    if speaker_conditioning_wav is not None:
+        generated_inputs.insert(
+            0,
+            (
+                _A2_NODE_IDS["speaker_audio"],
+                "speaker_conditioning.wav",
+                speaker_conditioning_wav,
+                "audio/wav",
+                "audio",
+            ),
+        )
+    for node_id, filename, data, content_type, input_name in generated_inputs:
         generated.append(
             ComfyInputFile(
                 node_id=node_id,
@@ -862,12 +1238,23 @@ def prepare_two_person_routing_inputs(
             )
         )
     prepared = apply_comfy_input_files(comfy_payload, generated)
+    if routing_v2:
+        effective_specs = [
+            spec
+            for spec in effective_specs
+            if (spec.node_id, spec.input_name)
+            != (_A2_NODE_IDS["speaker_audio"], "audio")
+        ]
     return prepared, [*effective_specs, *(_observer_only(spec) for spec in generated)]
 
 
 def build_two_person_routing_receipt(
     routing: InfiniteTalkTwoPersonRouting | None,
     staged_receipts: list[dict[str, str]],
+    *,
+    source_specs: list[ComfyInputFile] | None = None,
+    job_id: str | None = None,
+    postprocess_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Bind the frozen authority to the three effective mask observations."""
 
@@ -890,7 +1277,7 @@ def build_two_person_routing_receipt(
         for digest in mask_sha256.values()
     ):
         raise RuntimeError("A2 effective mask receipts are incomplete")
-    return {
+    receipt: dict[str, Any] = {
         "schema_version": "infinitetalk_two_person_routing_receipt_v1",
         "spatial_authority_sha256": routing.spatial_authority_sha256,
         "source_still_sha256": routing.source_still_sha256,
@@ -899,4 +1286,384 @@ def build_two_person_routing_receipt(
         "mode": routing.mode,
         "multi_audio_type": routing.multi_audio_type,
         "mask_sha256": mask_sha256,
+    }
+    if routing.schema_version != _A2_V2_ROUTING_SCHEMA:
+        return receipt
+
+    if (
+        routing.effective_video_frames is None
+        or routing.effective_duration_sec is None
+        or routing.delivered_video_frames is None
+        or routing.delivered_duration_sec is None
+        or routing.conditioning_lead_in_frames != _A2_CONDITIONING_LEAD_IN_FRAMES
+        or not job_id
+    ):
+        raise RuntimeError("v2 routing receipt lacks effective duration authority")
+    conditioning_frame_count = (
+        routing.effective_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+    )
+    listener_sha256 = by_key.get((_A2_NODE_IDS["listener_audio"], "audio"), "")
+    speaker_sha256 = by_key.get((_A2_NODE_IDS["speaker_audio"], "audio"), "")
+    normalized_speaker, source_sha256 = _v2_normalized_speaker_bytes(
+        source_specs or [],
+        job_id=job_id,
+    )
+    digests = (listener_sha256, speaker_sha256, source_sha256)
+    if any(
+        len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        for digest in digests
+    ):
+        raise RuntimeError("v2 effective audio receipts are incomplete")
+    expected_listener_wav, levels = _pink_roomtone_pcm_wav_bytes(
+        conditioning_frame_count,
+        authority_sha256=routing.spatial_authority_sha256,
+        slot=routing.listener_slot,
+    )
+    if hashlib.sha256(expected_listener_wav).hexdigest() != listener_sha256:
+        raise RuntimeError("v2 listener conditioning receipt does not match frozen authority")
+    speaker_roomtone_wav, _speaker_levels = _pink_roomtone_pcm_wav_bytes(
+        conditioning_frame_count,
+        authority_sha256=routing.spatial_authority_sha256,
+        slot=routing.speaker_slot,
+    )
+    expected_speaker_wav, overlay_frame_count = _speaker_conditioning_wav_bytes(
+        normalized_speaker,
+        roomtone_wav=speaker_roomtone_wav,
+        target_frame_count=conditioning_frame_count,
+        overlay_start_sample=_A2_CONDITIONING_LEAD_IN_SAMPLES,
+    )
+    if hashlib.sha256(expected_speaker_wav).hexdigest() != speaker_sha256:
+        raise RuntimeError("v2 speaker conditioning receipt does not match approved source")
+    delivered_audio_wav, final_source_frames = _zero_tailed_pcm_wav_bytes(
+        normalized_speaker,
+        target_frame_count=(
+            routing.delivered_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+        ),
+    )
+    if final_source_frames != overlay_frame_count:
+        raise RuntimeError("v2 final audio source span changed after conditioning")
+    expected_final_wav_sha256 = hashlib.sha256(delivered_audio_wav).hexdigest()
+    expected_postprocess = {
+        "final_audio_canonical_wav_sha256": expected_final_wav_sha256,
+        "final_audio_frame_count": routing.delivered_video_frames
+        * _A2_SAMPLES_PER_VIDEO_FRAME,
+        "source_sha256": source_sha256,
+        "delivered_video_frames": routing.delivered_video_frames,
+        "delivered_duration_sec": routing.delivered_duration_sec,
+    }
+    if not isinstance(postprocess_evidence, dict) or any(
+        postprocess_evidence.get(key) != value
+        for key, value in expected_postprocess.items()
+    ):
+        raise RuntimeError("v2 postprocess evidence is missing or does not match authority")
+    decoded_tail_rms = postprocess_evidence.get("decoded_tail_rms")
+    if (
+        not isinstance(decoded_tail_rms, (int, float))
+        or isinstance(decoded_tail_rms, bool)
+        or not math.isfinite(float(decoded_tail_rms))
+        or not 0.0 <= float(decoded_tail_rms) <= 0.00010
+    ):
+        raise RuntimeError("v2 decoded audible-tail evidence exceeds the approved envelope")
+    delivered_path = Path(str(postprocess_evidence.get("delivered_path") or ""))
+    try:
+        _probe_exact_av_output(
+            delivered_path,
+            expected_video_frames=routing.delivered_video_frames,
+            expected_duration_sec=routing.delivered_duration_sec,
+            require_audio=True,
+        )
+    except RuntimeError:
+        safe_unlink(delivered_path)
+        raise
+    receipt.update(
+        {
+            "schema_version": "infinitetalk_two_person_routing_receipt_v2",
+            "conditioning_lead_in_frames": routing.conditioning_lead_in_frames,
+            "effective_video_frames": routing.effective_video_frames,
+            "effective_duration_sec": routing.effective_duration_sec,
+            "delivered_video_frames": routing.delivered_video_frames,
+            "delivered_duration_sec": routing.delivered_duration_sec,
+            "speaker_conditioning": {
+                "sha256": speaker_sha256,
+                "source_sha256": source_sha256,
+                "roomtone_sha256": hashlib.sha256(speaker_roomtone_wav).hexdigest(),
+                "frame_count": conditioning_frame_count,
+                "sample_rate": _A2_PCM_SAMPLE_RATE,
+                "channels": 1,
+                "overlay_start_sample": _A2_CONDITIONING_LEAD_IN_SAMPLES,
+                "overlay_frame_count": overlay_frame_count,
+                "kind": "approved_take_over_deterministic_pink_roomtone_pcm_s16le_16000_mono_v1",
+            },
+            "listener_conditioning": {
+                "sha256": listener_sha256,
+                "frame_count": conditioning_frame_count,
+                "sample_rate": _A2_PCM_SAMPLE_RATE,
+                "channels": 1,
+                "kind": _A2_V2_LISTENER_KIND,
+                "usage": "conditioning_only_not_audible",
+                **levels,
+            },
+            "postprocess": {
+                "video_policy": "trim_exact_conditioning_lead_in_frames_v1",
+                "audio_policy": "approved_take_pcm_then_silence_tail_remux_v1",
+            },
+            "final_audio": {
+                "source_sha256": source_sha256,
+                "canonical_wav_sha256": expected_final_wav_sha256,
+                "frame_count": routing.delivered_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME,
+                "sample_rate": _A2_PCM_SAMPLE_RATE,
+                "channels": 1,
+                "kind": "approved_take_canonical_wav_s16le_16000_mono_zero_tail_v1",
+                "decoded_tail_rms": float(decoded_tail_rms),
+            },
+        }
+    )
+    return receipt
+
+
+def _probe_exact_av_output(
+    path: Path,
+    *,
+    expected_video_frames: int,
+    expected_duration_sec: float,
+    require_audio: bool,
+) -> None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-count_frames",
+                "-show_entries", "stream=codec_type,nb_read_frames,duration,sample_rate,channels",
+                "-of", "json",
+                str(path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        payload = json.loads(result.stdout) if result.returncode == 0 else {}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"v2 delivered media could not be probed: {exc}") from exc
+    streams = payload.get("streams") if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        raise RuntimeError("v2 delivered media probe returned no streams")
+    video = next(
+        (stream for stream in streams if stream.get("codec_type") == "video"),
+        None,
+    )
+    try:
+        frame_count = int(video["nb_read_frames"])
+        duration_sec = float(video["duration"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("v2 delivered media lacks exact video evidence") from exc
+    if frame_count != expected_video_frames:
+        raise RuntimeError("v2 delivered media frame count does not match frozen authority")
+    if abs(duration_sec - expected_duration_sec) > 1 / _A2_FPS:
+        raise RuntimeError("v2 delivered media duration does not match frozen authority")
+    audio = next(
+        (stream for stream in streams if stream.get("codec_type") == "audio"),
+        None,
+    )
+    if require_audio and (
+        not isinstance(audio, dict)
+        or str(audio.get("sample_rate")) != str(_A2_PCM_SAMPLE_RATE)
+        or int(audio.get("channels") or 0) != 1
+    ):
+        raise RuntimeError("v2 delivered media lacks exact mono 16 kHz audible audio")
+    if require_audio:
+        try:
+            audio_duration_sec = float(audio["duration"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("v2 delivered media lacks audible audio duration evidence") from exc
+        if abs(audio_duration_sec - expected_duration_sec) > 1 / _A2_FPS:
+            raise RuntimeError("v2 audible audio duration does not match delivered authority")
+
+
+def _verify_delivered_audio_tail(
+    path: Path,
+    *,
+    source_frame_count: int,
+    delivered_frame_count: int,
+) -> float:
+    """Prove conditioning roomtone did not leak into the audible AAC tail."""
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+                "-map", "0:a:0", "-f", "s16le", "-ac", "1", "-ar", "16000",
+                "pipe:1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"v2 delivered audio could not be decoded: {exc}") from exc
+    if len(result.stdout) % 2:
+        raise RuntimeError("v2 delivered audio decoded to truncated PCM")
+    samples = [sample[0] for sample in struct.iter_unpack("<h", result.stdout)]
+    # AAC may expose one bounded encoder frame beyond the timestamped stream.
+    if not delivered_frame_count <= len(samples) <= delivered_frame_count + 1_024:
+        raise RuntimeError("v2 delivered audio decoded length exceeds the remux envelope")
+    tail_start = min(source_frame_count + 1_024, delivered_frame_count)
+    tail = samples[tail_start:delivered_frame_count]
+    if tail:
+        tail_rms = math.sqrt(sum(sample * sample for sample in tail) / len(tail)) / 32_768.0
+        if tail_rms > 0.00010:
+            raise RuntimeError("v2 conditioning roomtone leaked into audible output")
+    else:
+        tail_rms = 0.0
+    return tail_rms
+
+
+def postprocess_two_person_v2_outputs(
+    output_paths: list[str],
+    *,
+    routing: InfiniteTalkTwoPersonRouting | None,
+    source_specs: list[ComfyInputFile],
+    observer_specs: list[ComfyInputFile],
+    job_id: str,
+) -> tuple[list[str], dict[str, Any] | None]:
+    """Trim conditioning pre-roll and remux only the approved audible take."""
+
+    if routing is None or routing.schema_version != _A2_V2_ROUTING_SCHEMA:
+        return output_paths, None
+    if (
+        routing.effective_video_frames is None
+        or routing.effective_duration_sec is None
+        or routing.delivered_video_frames is None
+        or routing.delivered_duration_sec is None
+    ):
+        raise RuntimeError("v2 output postprocess lacks frozen temporal authority")
+    video_candidates = [
+        Path(path).expanduser()
+        for path in output_paths
+        if Path(path).suffix.lower() in {".mp4", ".mov", ".webm"}
+    ]
+    if any(path.is_symlink() for path in video_candidates):
+        raise RuntimeError("v2 Comfy output may not be a symlink")
+    videos = [path.resolve(strict=False) for path in video_candidates]
+    if len(videos) != 1:
+        raise RuntimeError("v2 output postprocess requires exactly one Comfy video")
+    source_video = videos[0]
+    if source_video.is_symlink() or not source_video.is_file() or source_video.stat().st_size <= 0:
+        raise RuntimeError("v2 Comfy output is missing or unsafe")
+    _probe_exact_av_output(
+        source_video,
+        expected_video_frames=routing.effective_video_frames,
+        expected_duration_sec=routing.effective_duration_sec,
+        require_audio=False,
+    )
+
+    normalized_speaker, _source_sha256 = _v2_normalized_speaker_bytes(
+        source_specs,
+        job_id=job_id,
+    )
+    conditioning_frame_count = (
+        routing.effective_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+    )
+    speaker_roomtone, _levels = _pink_roomtone_pcm_wav_bytes(
+        conditioning_frame_count,
+        authority_sha256=routing.spatial_authority_sha256,
+        slot=routing.speaker_slot,
+    )
+    expected_conditioning, _overlay_frames = _speaker_conditioning_wav_bytes(
+        normalized_speaker,
+        roomtone_wav=speaker_roomtone,
+        target_frame_count=conditioning_frame_count,
+        overlay_start_sample=_A2_CONDITIONING_LEAD_IN_SAMPLES,
+    )
+    conditioning_spec = next(
+        (
+            spec
+            for spec in observer_specs
+            if (spec.node_id, spec.input_name)
+            == (_A2_NODE_IDS["speaker_audio"], "audio")
+        ),
+        None,
+    )
+    if (
+        conditioning_spec is None
+        or hashlib.sha256(expected_conditioning).hexdigest()
+        != conditioning_spec.expected_sha256
+    ):
+        raise RuntimeError("v2 speaker conditioning changed before delivered-output remux")
+    delivered_audio, _source_frames = _zero_tailed_pcm_wav_bytes(
+        normalized_speaker,
+        target_frame_count=(
+            routing.delivered_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+        ),
+    )
+    token = hashlib.sha256(delivered_audio).hexdigest()[:16]
+    delivered = source_video.with_name(f"{source_video.stem}.filmforge-v2-{token}.mp4")
+    temporary_video = delivered.with_name(f".{delivered.name}.part.mp4")
+    temporary_audio = delivered.with_name(f".{delivered.stem}.audible.wav")
+    safe_unlink(temporary_video)
+    safe_unlink(temporary_audio)
+    try:
+        temporary_audio.write_bytes(delivered_audio)
+        subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-v", "error", "-y",
+                "-i", str(source_video),
+                "-i", str(temporary_audio),
+                "-filter_complex",
+                (
+                    "[0:v]trim=start_frame="
+                    f"{_A2_CONDITIONING_LEAD_IN_FRAMES}:end_frame="
+                    f"{routing.effective_video_frames},setpts=PTS-STARTPTS[v]"
+                ),
+                "-map", "[v]", "-map", "1:a:0",
+                "-frames:v", str(routing.delivered_video_frames),
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-threads", "1",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "16000", "-ac", "1",
+                "-map_metadata", "-1", "-movflags", "+faststart",
+                str(temporary_video),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        if temporary_video.is_symlink() or not temporary_video.is_file() or temporary_video.stat().st_size <= 0:
+            raise RuntimeError("v2 delivered media postprocess produced no output")
+        temporary_video.replace(delivered)
+        _probe_exact_av_output(
+            delivered,
+            expected_video_frames=routing.delivered_video_frames,
+            expected_duration_sec=routing.delivered_duration_sec,
+            require_audio=True,
+        )
+        decoded_tail_rms = _verify_delivered_audio_tail(
+            delivered,
+            source_frame_count=_source_frames,
+            delivered_frame_count=(
+                routing.delivered_video_frames * _A2_SAMPLES_PER_VIDEO_FRAME
+            ),
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        safe_unlink(delivered)
+        raise RuntimeError(f"v2 delivered media postprocess failed: {exc}") from exc
+    finally:
+        safe_unlink(temporary_video)
+        safe_unlink(temporary_audio)
+
+    delivered_text = str(delivered)
+    processed_paths = [
+        delivered_text if Path(path).expanduser().resolve(strict=False) == source_video else path
+        for path in output_paths
+    ]
+    return processed_paths, {
+        "delivered_path": delivered_text,
+        "final_audio_canonical_wav_sha256": hashlib.sha256(delivered_audio).hexdigest(),
+        "final_audio_frame_count": routing.delivered_video_frames
+        * _A2_SAMPLES_PER_VIDEO_FRAME,
+        "source_sha256": _source_sha256,
+        "delivered_video_frames": routing.delivered_video_frames,
+        "delivered_duration_sec": routing.delivered_duration_sec,
+        "decoded_tail_rms": decoded_tail_rms,
     }

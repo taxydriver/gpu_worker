@@ -236,7 +236,7 @@ def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
         rewait = script.index("wait_comfy_healthy", restart)
         materialize = script.index("result = ensure_asset_group(asset_group)", rewait)
         readiness = script.index(
-            "readiness = check_infinitetalk_readiness(require_two_person=require_two_person)",
+            "readiness = check_infinitetalk_readiness(",
             materialize,
         )
         seal = script.index("immutable worker candidate failed pre-cutover seal", readiness)
@@ -246,8 +246,11 @@ def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
         assert "ensure_asset_group(asset_group)" not in script[gate:]
         assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
         assert '*,infinitetalk_two_person_v1,*' in script
+        assert '*,infinitetalk_two_person_v2,*' in script
         assert '_infinitetalk_asset_group="infinitetalk_two_person_v1"' in script
+        assert '_infinitetalk_asset_group="infinitetalk_two_person_v2"' in script
         assert 'INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"' in script
+        assert 'INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2"' in script
         assert 'COMFY_BASE_URL="http://127.0.0.1:${_infinitetalk_comfy_port}"' in script
         assert 'COMFY_DIR="$COMFY_ROOT"' in script
         assert 'PYTHONDONTWRITEBYTECODE=1' in script[materialize - 500:materialize]
@@ -264,12 +267,29 @@ def test_two_person_infinitetalk_preflight_is_strict_and_precedes_staged_receipt
     group_env = script.index('INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group"', a1_case)
     strict_env = script.index('INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"', group_env)
     strict_readiness = script.index(
-        "check_infinitetalk_readiness(require_two_person=require_two_person)",
+        "check_infinitetalk_readiness(",
         strict_env,
     )
     gate = _provision_only_exit(script)
 
     assert a2_case < a1_case < group_env < strict_env < strict_readiness < gate
+
+
+def test_v2_infinitetalk_preflight_selects_exact_roomtone_readiness() -> None:
+    script = _script(None)
+    v2_case = script.index("*,infinitetalk_two_person_v2,*")
+    v1_case = script.index("*,infinitetalk_two_person_v1,*", v2_case)
+    group = script.index('_infinitetalk_asset_group="infinitetalk_two_person_v2"', v2_case)
+    strict = script.index('_infinitetalk_require_two_person="1"', group)
+    roomtone = script.index('_infinitetalk_require_roomtone_v2="1"', strict)
+    roomtone_env = script.index(
+        'INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2"',
+        v1_case,
+    )
+    readiness = script.index("require_roomtone_v2=require_roomtone_v2", roomtone_env)
+    gate = _provision_only_exit(script)
+
+    assert v2_case < group < strict < roomtone < v1_case < roomtone_env < readiness < gate
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:

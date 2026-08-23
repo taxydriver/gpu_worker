@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import math
 from pathlib import Path
 import struct
+import subprocess
 from types import SimpleNamespace
 import wave
 import zlib
@@ -16,7 +18,12 @@ from gpu_worker import app
 from gpu_worker import asset_manager
 from gpu_worker import comfy_client
 from gpu_worker import infinitetalk as runtime
-from gpu_worker.schemas import ComfyInputFile, InfiniteTalkTwoPersonRouting, RunRequest
+from gpu_worker.schemas import (
+    ComfyInputFile,
+    InfiniteTalkRoutingReceiptV2,
+    InfiniteTalkTwoPersonRouting,
+    RunRequest,
+)
 
 
 PNG_BYTES = (
@@ -128,6 +135,7 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
         "wav2vec_dependency_error": None,
         "multitalk_contract_error": None,
         "multi_checkpoint_error": None,
+        "roomtone_contract_error": None,
         "comfy_error": None,
     }
 
@@ -160,6 +168,39 @@ def test_a2_capability_is_withheld_without_strict_readiness_but_a1_remains(monke
     assert capabilities == ["infinitetalk_v1"]
     assert details["ready"] is False
     assert details["multitalk_contract_error"] == "missing explicit-mask schema"
+
+
+def test_v2_capability_requires_roomtone_readiness_and_v1_cannot_claim_it(monkeypatch):
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(
+            resolved_capabilities=lambda: [
+                "infinitetalk_two_person_v1",
+                "infinitetalk_two_person_v2",
+            ]
+        ),
+    )
+    checks = []
+
+    def readiness(*, require_two_person=False, require_roomtone_v2=False):
+        checks.append((require_two_person, require_roomtone_v2))
+        return runtime.InfiniteTalkReadiness(
+            ready=not require_roomtone_v2,
+            roomtone_contract_error=("roomtone unavailable" if require_roomtone_v2 else None),
+        )
+
+    monkeypatch.setattr(app, "check_infinitetalk_readiness", readiness)
+
+    capabilities, details = app._advertised_capabilities()
+
+    assert checks == [(True, False), (True, True)]
+    assert capabilities == ["infinitetalk_two_person_v1"]
+    assert details["roomtone_contract_error"] == "roomtone unavailable"
+
+
+def test_v2_roomtone_readiness_self_check_is_deterministic_and_bounded():
+    assert runtime._roomtone_v2_contract_error() is None
 
 
 def test_a2_object_info_requires_audio2_masks_and_para_schema():
@@ -439,13 +480,13 @@ def test_a2_wrapper_readiness_requires_pinned_commit_and_positive_patch(monkeypa
     assert "not positively verified" in runtime._wrapper_patch_error()
 
 
-def _write_pcm_wav(path: Path, *, seconds: float = 2.0) -> None:
+def _write_pcm_wav(path: Path, *, seconds: float = 2.0, sample_value: int = 0) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16_000)
-        output.writeframes(b"\0\0" * int(16_000 * seconds))
+        output.writeframes(struct.pack("<h", sample_value) * int(16_000 * seconds))
 
 
 def _infinitetalk_request() -> tuple[RunRequest, bytes, bytes]:
@@ -524,6 +565,7 @@ def _a2_graph(*, speaker_slot: int, num_frames: int = 53) -> dict:
         "12": {"class_type": "WanVideoImageToVideoMultiTalk", "inputs": {
             "width": 832,
             "height": 480,
+            "frame_window_size": 81,
             "mode": "multitalk",
             "start_image": ["6", 0],
         }},
@@ -541,7 +583,13 @@ def _a2_graph(*, speaker_slot: int, num_frames: int = 53) -> dict:
     }
 
 
-def _a2_request(*, speaker_slot: int, job_id: str = "scene23-b0") -> RunRequest:
+def _a2_request(
+    *,
+    speaker_slot: int,
+    job_id: str = "scene23-b0",
+    routing_version: int = 1,
+    duration_sec: float = 2.0,
+) -> RunRequest:
     still = _gray_png(1024, 576)
     mpeg = b"approved-mpeg" * 100
     still_digest = hashlib.sha256(still).hexdigest()
@@ -551,8 +599,23 @@ def _a2_request(*, speaker_slot: int, job_id: str = "scene23-b0") -> RunRequest:
         (0.58, 0.16, 0.92, 0.94),
     )
     listener_slot = 1 if speaker_slot == 2 else 2
+    routing_kwargs = {}
+    if routing_version == 2:
+        requested = runtime._requested_video_frames(
+            duration_sec,
+            lead_in_frames=runtime._A2_CONDITIONING_LEAD_IN_FRAMES,
+        )
+        effective = runtime._effective_video_frames(requested)
+        delivered = effective - runtime._A2_CONDITIONING_LEAD_IN_FRAMES
+        routing_kwargs = {
+            "conditioning_lead_in_frames": runtime._A2_CONDITIONING_LEAD_IN_FRAMES,
+            "effective_video_frames": effective,
+            "effective_duration_sec": effective / 25.0,
+            "delivered_video_frames": delivered,
+            "delivered_duration_sec": delivered / 25.0,
+        }
     routing = InfiniteTalkTwoPersonRouting(
-        schema_version="infinitetalk_two_person_routing_v1",
+        schema_version=f"infinitetalk_two_person_routing_v{routing_version}",
         mode="two_person_parallel",
         multi_audio_type="para",
         speaker_slot=speaker_slot,
@@ -564,13 +627,25 @@ def _a2_request(*, speaker_slot: int, job_id: str = "scene23-b0") -> RunRequest:
         source_still_sha256=still_digest,
         source_dimensions={"width": 1024, "height": 576},
         spatial_authority_sha256=hashlib.sha256(f"authority-{job_id}".encode()).hexdigest(),
-        expected_duration_sec=2.0,
-        listener_audio_kind="silence_pcm",
+        expected_duration_sec=duration_sec,
+        listener_audio_kind=(
+            "silence_pcm"
+            if routing_version == 1
+            else "deterministic_pink_roomtone_pcm_s16le_16000_mono_v1"
+        ),
+        **routing_kwargs,
     )
     return RunRequest(
         job_id=job_id,
-        asset_group="infinitetalk_two_person_v1",
-        comfy_payload=_a2_graph(speaker_slot=speaker_slot),
+        asset_group=f"infinitetalk_two_person_v{routing_version}",
+        comfy_payload=_a2_graph(
+            speaker_slot=speaker_slot,
+            num_frames=(
+                routing.effective_video_frames
+                if routing_version == 2
+                else runtime._requested_video_frames(duration_sec)
+            ),
+        ),
         comfy_input_files=[
             ComfyInputFile(
                 node_id="6",
@@ -593,13 +668,19 @@ def _a2_request(*, speaker_slot: int, job_id: str = "scene23-b0") -> RunRequest:
     )
 
 
-def _configure_a2_runtime(monkeypatch, input_root: Path) -> None:
+def _configure_a2_runtime(
+    monkeypatch,
+    input_root: Path,
+    *,
+    seconds: float = 2.0,
+    sample_value: int = 0,
+) -> None:
     _configure_input_root(monkeypatch, input_root)
 
     def normalize(source: Path, *, job_id: str) -> Path:
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
         destination = runtime.normalized_audio_path_for_source(digest, job_id=job_id)
-        _write_pcm_wav(destination, seconds=2.0)
+        _write_pcm_wav(destination, seconds=seconds, sample_value=sample_value)
         return destination
 
     monkeypatch.setattr(app, "normalize_approved_mpeg_to_wav", normalize)
@@ -663,6 +744,227 @@ def test_a2_materializes_slot_order_background_and_exact_silence(monkeypatch, tm
     )
 
 
+@pytest.mark.parametrize(
+    ("requested_frames", "effective_frames"),
+    [(37, 81), (175, 225), (197, 225), (531, 585)],
+)
+def test_v2_wrapper_fixed_point_cadence(requested_frames, effective_frames):
+    assert runtime._effective_video_frames(requested_frames) == effective_frames
+    assert runtime._effective_video_frames(effective_frames) == effective_frames
+
+
+def test_v2_materializes_full_window_slot_specific_pink_conditioning(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(
+        monkeypatch,
+        input_root,
+        seconds=1.36,
+        sample_value=2_000,
+    )
+    request = _a2_request(
+        speaker_slot=1,
+        job_id="scene23-b1-v2",
+        routing_version=2,
+        duration_sec=1.36,
+    )
+
+    payload, observer_specs = app._prepare_comfy_inputs(request)
+    receipts = comfy_client.observe_staged_input_receipts(payload, observer_specs)
+    receipt_by_node = {receipt["node_id"]: receipt for receipt in receipts}
+
+    assert payload["11"]["inputs"]["num_frames"] == 81
+    assert request.infinitetalk_routing.delivered_video_frames == 78
+    assert set(receipt_by_node) == {"6", "10", "16", "90", "91", "94"}
+    speaker_path = input_root / payload["10"]["inputs"]["audio"]
+    listener_path = input_root / payload["16"]["inputs"]["audio"]
+    with wave.open(str(speaker_path), "rb") as speaker:
+        assert speaker.getnframes() == 51_840
+        speaker_pcm = speaker.readframes(speaker.getnframes())
+    with wave.open(str(listener_path), "rb") as listener:
+        assert listener.getnframes() == 51_840
+        listener_pcm = listener.readframes(listener.getnframes())
+    assert any(speaker_pcm) and any(listener_pcm)
+    assert speaker_pcm != listener_pcm
+    assert receipt_by_node["10"]["content_sha256"] != receipt_by_node["16"]["content_sha256"]
+
+    speaker_roomtone, _ = runtime._pink_roomtone_pcm_wav_bytes(
+        51_840,
+        authority_sha256=request.infinitetalk_routing.spatial_authority_sha256,
+        slot=1,
+    )
+    with wave.open(runtime.io.BytesIO(speaker_roomtone), "rb") as bed:
+        bed_pcm = bed.readframes(bed.getnframes())
+    lead_bytes = runtime._A2_CONDITIONING_LEAD_IN_SAMPLES * 2
+    assert speaker_pcm[:lead_bytes] == bed_pcm[:lead_bytes]
+    assert speaker_pcm[lead_bytes:lead_bytes + 2] != bed_pcm[lead_bytes:lead_bytes + 2]
+
+    listener_samples = [sample[0] for sample in struct.iter_unpack("<h", listener_pcm)]
+    levels = runtime._pcm_level_evidence(listener_samples)
+    assert 0.00020 <= levels["rms"] <= 0.00035
+    assert 0.00080 <= levels["peak"] <= 0.00130
+    power = sum(sample * sample for sample in listener_samples) / len(listener_samples)
+    difference_power = sum(
+        (right - left) ** 2
+        for left, right in zip(listener_samples, listener_samples[1:])
+    ) / (len(listener_samples) - 1)
+    assert difference_power / power < 0.75  # correlated low-frequency pink spectrum
+
+
+@pytest.mark.parametrize(("duration_sec", "source_samples"), [(1.36, 21_760), (3.04, 48_640)])
+def test_v2_short_proofs_fill_the_exact_81_frame_window(
+    monkeypatch,
+    tmp_path,
+    duration_sec,
+    source_samples,
+):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root, seconds=duration_sec, sample_value=1_000)
+    request = _a2_request(
+        speaker_slot=2,
+        job_id=f"duration-{duration_sec}",
+        routing_version=2,
+        duration_sec=duration_sec,
+    )
+    payload, _specs = app._prepare_comfy_inputs(request)
+
+    with wave.open(str(input_root / payload["10"]["inputs"]["audio"]), "rb") as speaker:
+        assert speaker.getnframes() == 51_840
+        assert source_samples + runtime._A2_CONDITIONING_LEAD_IN_SAMPLES <= speaker.getnframes()
+    with wave.open(str(input_root / payload["16"]["inputs"]["audio"]), "rb") as listener:
+        assert listener.getnframes() == 51_840
+
+
+def test_v2_listener_tamper_fails_and_old_capabilities_are_ineligible(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root, seconds=1.36, sample_value=1_000)
+    request = _a2_request(
+        speaker_slot=1,
+        routing_version=2,
+        duration_sec=1.36,
+    )
+    payload, specs = app._prepare_comfy_inputs(request)
+    listener = input_root / payload["16"]["inputs"]["audio"]
+    listener.write_bytes(listener.read_bytes()[:-2] + b"\0\0")
+    with pytest.raises(RuntimeError, match="Observed staged input digest mismatch"):
+        comfy_client.observe_staged_input_receipts(payload, specs)
+
+    monkeypatch.setattr(
+        app,
+        "get_settings",
+        lambda: SimpleNamespace(resolved_capabilities=lambda: ["infinitetalk_two_person_v1"]),
+    )
+    assert app._asset_group_allowed("infinitetalk_two_person_v2") is False
+
+
+def test_v2_postprocess_trims_preroll_and_receipt_binds_applied_audio(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root, seconds=1.36, sample_value=2_000)
+    request = _a2_request(
+        speaker_slot=1,
+        job_id="postprocess-v2",
+        routing_version=2,
+        duration_sec=1.36,
+    )
+    payload, observer_specs = app._prepare_comfy_inputs(request)
+    staged_receipts = comfy_client.observe_staged_input_receipts(payload, observer_specs)
+    raw_video = tmp_path / "raw.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=3.24",
+            "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono:d=3.24",
+            "-frames:v", "81", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "16000", "-ac", "1", str(raw_video),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    outputs, evidence = runtime.postprocess_two_person_v2_outputs(
+        [str(raw_video)],
+        routing=request.infinitetalk_routing,
+        source_specs=request.comfy_input_files,
+        observer_specs=observer_specs,
+        job_id=request.job_id,
+    )
+    assert outputs != [str(raw_video)]
+    delivered = Path(outputs[0])
+    assert delivered.is_file()
+    runtime._probe_exact_av_output(
+        delivered,
+        expected_video_frames=78,
+        expected_duration_sec=3.12,
+        require_audio=True,
+    )
+    receipt = runtime.build_two_person_routing_receipt(
+        request.infinitetalk_routing,
+        staged_receipts,
+        source_specs=request.comfy_input_files,
+        job_id=request.job_id,
+        postprocess_evidence=evidence,
+    )
+    assert receipt["schema_version"] == "infinitetalk_two_person_routing_receipt_v2"
+    assert receipt["conditioning_lead_in_frames"] == 3
+    assert receipt["effective_video_frames"] == 81
+    assert receipt["delivered_video_frames"] == 78
+    assert receipt["speaker_conditioning"]["overlay_start_sample"] == 1_920
+    assert receipt["speaker_conditioning"]["overlay_frame_count"] == 21_760
+    assert receipt["speaker_conditioning"]["roomtone_sha256"] != receipt["listener_conditioning"]["sha256"]
+    assert receipt["listener_conditioning"]["usage"] == "conditioning_only_not_audible"
+    assert receipt["postprocess"] == {
+        "video_policy": "trim_exact_conditioning_lead_in_frames_v1",
+        "audio_policy": "approved_take_pcm_then_silence_tail_remux_v1",
+    }
+    assert receipt["final_audio"]["canonical_wav_sha256"] == evidence["final_audio_canonical_wav_sha256"]
+    assert receipt["final_audio"]["source_sha256"] == request.comfy_input_files[1].expected_sha256
+    assert receipt["final_audio"]["decoded_tail_rms"] == evidence["decoded_tail_rms"]
+    assert evidence["decoded_tail_rms"] <= 0.00010
+    assert InfiniteTalkRoutingReceiptV2.model_validate(receipt).model_dump() == receipt
+
+
+def test_v2_failed_postreplace_probe_removes_delivered_artifact(monkeypatch, tmp_path):
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    _configure_a2_runtime(monkeypatch, input_root, seconds=1.36, sample_value=2_000)
+    request = _a2_request(
+        speaker_slot=1,
+        job_id="postprocess-failure-v2",
+        routing_version=2,
+        duration_sec=1.36,
+    )
+    _payload, observer_specs = app._prepare_comfy_inputs(request)
+    raw_video = tmp_path / "raw.mp4"
+    raw_video.write_bytes(b"raw-comfy-video")
+    probes = []
+
+    def probe(path, **_kwargs):
+        probes.append(path)
+        if len(probes) == 2:
+            raise RuntimeError("post-replace probe failed")
+
+    def fake_run(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"candidate-delivered-video")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(runtime, "_probe_exact_av_output", probe)
+    monkeypatch.setattr(runtime.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="post-replace probe failed"):
+        runtime.postprocess_two_person_v2_outputs(
+            [str(raw_video)],
+            routing=request.infinitetalk_routing,
+            source_specs=request.comfy_input_files,
+            observer_specs=observer_specs,
+            job_id=request.job_id,
+        )
+
+    assert list(tmp_path.glob("*.filmforge-v2-*.mp4")) == []
+
+
 def test_scene23_speaker_swap_changes_audio_slot_not_authored_mask_order(monkeypatch, tmp_path):
     input_root = tmp_path / "input"
     input_root.mkdir()
@@ -703,8 +1005,13 @@ def test_a2_effective_mask_and_silence_tampering_fail_before_submit(monkeypatch,
         comfy_client.observe_staged_input_receipts(payload, specs)
 
 
-def test_a2_retry_reobserves_all_effective_graph_inputs(monkeypatch):
-    request = _a2_request(speaker_slot=2, job_id="retry-a2")
+def test_v2_oom_is_terminal_after_one_attested_comfy_submission(monkeypatch):
+    request = _a2_request(
+        speaker_slot=2,
+        job_id="retry-v2",
+        routing_version=2,
+        duration_sec=1.36,
+    )
     sentinel_specs = [
         ComfyInputFile(
             node_id=node_id,
@@ -715,6 +1022,8 @@ def test_a2_retry_reobserves_all_effective_graph_inputs(monkeypatch):
         for node_id in ("6", "10", "16", "90", "91", "94")
     ]
     observations = []
+    submissions = []
+    restarts = []
     monkeypatch.setattr(app, "_asset_group_allowed", lambda _group: True)
     monkeypatch.setattr(app, "_effective_vram_floor", lambda _group: None)
     monkeypatch.setattr(app, "_free_vram_on_group_switch", lambda _group: None)
@@ -728,14 +1037,16 @@ def test_a2_retry_reobserves_all_effective_graph_inputs(monkeypatch):
 
     def observe(_payload, specs):
         observations.append([spec.node_id for spec in specs])
-        if len(observations) == 2:
-            raise RuntimeError("Observed staged input digest mismatch")
         return []
 
+    def submit(_payload):
+        submissions.append("submitted")
+        raise app.ComfyExecutionError("CUDA out of memory", is_oom=True)
+
     monkeypatch.setattr(app, "observe_staged_input_receipts", observe)
-    monkeypatch.setattr(app, "submit_prompt", lambda _payload: (_ for _ in ()).throw(RuntimeError("Comfy stopped")))
+    monkeypatch.setattr(app, "submit_prompt", submit)
     monkeypatch.setattr(app, "is_comfy_healthy", lambda: False)
-    monkeypatch.setattr(app, "restart_comfy", lambda: 0.0)
+    monkeypatch.setattr(app, "restart_comfy", lambda: restarts.append("restarted") or 0.0)
     monkeypatch.setattr(app, "_send_heartbeat_now", lambda: None)
     monkeypatch.setattr(
         app,
@@ -745,13 +1056,12 @@ def test_a2_retry_reobserves_all_effective_graph_inputs(monkeypatch):
 
     result = app._execute_run(request)
 
-    assert observations == [
-        ["6", "10", "16", "90", "91", "94"],
-        ["6", "10", "16", "90", "91", "94"],
-    ]
+    assert observations == [["6", "10", "16", "90", "91", "94"]]
+    assert submissions == ["submitted"]
+    assert restarts == []
     assert result.ok is False
-    assert result.restart_performed is True
-    assert result.error == "Observed staged input digest mismatch"
+    assert result.restart_performed is False
+    assert result.error == "CUDA out of memory"
 
 
 def test_success_response_exposes_top_level_a2_routing_receipt(monkeypatch):

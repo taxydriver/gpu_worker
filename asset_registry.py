@@ -245,6 +245,11 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
 ASSET_REGISTRY["infinitetalk_two_person_v1"] = deepcopy(
     ASSET_REGISTRY["infinitetalk_v1"]
 )
+# v2 shares the same pinned checkpoint/custom-node bytes.  Its distinct broker
+# capability means a v1 worker can never receive the full-window roomtone graph.
+ASSET_REGISTRY["infinitetalk_two_person_v2"] = deepcopy(
+    ASSET_REGISTRY["infinitetalk_v1"]
+)
 
 
 # Provisioner-backed groups: capability declared -> deploy runs this script instead of
@@ -256,6 +261,7 @@ PROVISIONERS: dict[str, str] = {
     # the graphs need. Weights stay with asset_manager so they cache on the data volume.
     "infinitetalk_v1": "gpu_worker/provision_infinitetalk.sh",
     "infinitetalk_two_person_v1": "gpu_worker/provision_infinitetalk.sh",
+    "infinitetalk_two_person_v2": "gpu_worker/provision_infinitetalk.sh",
     # Same shape as infinitetalk: file downloads above + the WanVideoWrapper custom node.
     "recammaster_v1": "gpu_worker/provision_recammaster.sh",
 }
@@ -300,6 +306,7 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "multitalk": ["infinitetalk_v1"],
     "infinitetalk_v1": ["infinitetalk_v1"],
     "infinitetalk_two_person_v1": ["infinitetalk_two_person_v1"],
+    "infinitetalk_two_person_v2": ["infinitetalk_two_person_v2"],
     # Opt-in: ReCamMaster parametric camera re-shoot (video→video, Wan 2.1 1.3B).
     # Deliberately NOT implied by wan_i2v — a separate Wan 2.1 weight set.
     "recammaster": ["recammaster_v1"],

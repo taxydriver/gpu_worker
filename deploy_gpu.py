@@ -3727,7 +3727,14 @@ wait_comfy_healthy
 _infinitetalk_wanted=""
 _infinitetalk_asset_group="infinitetalk_v1"
 _infinitetalk_require_two_person="0"
+_infinitetalk_require_roomtone_v2="0"
 case ",${{WORKER_CAPABILITIES:-}}," in
+  *,infinitetalk_two_person_v2,*)
+    _infinitetalk_wanted=1
+    _infinitetalk_asset_group="infinitetalk_two_person_v2"
+    _infinitetalk_require_two_person="1"
+    _infinitetalk_require_roomtone_v2="1"
+    ;;
   *,infinitetalk_two_person_v1,*)
     _infinitetalk_wanted=1
     _infinitetalk_asset_group="infinitetalk_two_person_v1"
@@ -3771,6 +3778,7 @@ if test -n "$_infinitetalk_wanted"; then
   COMFY_DIR="$COMFY_ROOT" \
   INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group" \
   INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person" \
+  INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2" \
   PYTHONDONTWRITEBYTECODE=1 \
   PYTHONPATH="$WORKER_MODULE_DIR" \
     "$WORKER_ROOT/.venv/bin/python" - <<'PY'
@@ -3781,8 +3789,12 @@ from gpu_worker.infinitetalk import check_infinitetalk_readiness
 
 asset_group = os.environ["INFINITETALK_PREFLIGHT_GROUP"]
 require_two_person = os.environ["INFINITETALK_REQUIRE_TWO_PERSON"] == "1"
+require_roomtone_v2 = os.environ["INFINITETALK_REQUIRE_ROOMTONE_V2"] == "1"
 result = ensure_asset_group(asset_group)
-readiness = check_infinitetalk_readiness(require_two_person=require_two_person)
+readiness = check_infinitetalk_readiness(
+    require_two_person=require_two_person,
+    require_roomtone_v2=require_roomtone_v2,
+)
 if not readiness.ready:
     raise SystemExit(
         "InfiniteTalk readiness failed before secure cutover: "

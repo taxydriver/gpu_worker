@@ -55,10 +55,12 @@ from gpu_worker.config import get_settings
 from gpu_worker.infinitetalk import (
     INFINITETALK_ASSET_GROUP,
     INFINITETALK_TWO_PERSON_ASSET_GROUP,
+    INFINITETALK_TWO_PERSON_V2_ASSET_GROUP,
     build_two_person_routing_receipt,
     check_infinitetalk_readiness,
     normalize_approved_mpeg_to_wav,
     normalized_audio_path_for_source,
+    postprocess_two_person_v2_outputs,
     prepare_two_person_routing_inputs,
 )
 from gpu_worker.keyframes import extract_keyframes_b64, is_video_output
@@ -141,6 +143,7 @@ _VIDEO_ASSET_GROUPS = {
     "wan_i2v_v1",
     INFINITETALK_ASSET_GROUP,
     INFINITETALK_TWO_PERSON_ASSET_GROUP,
+    INFINITETALK_TWO_PERSON_V2_ASSET_GROUP,
 }
 _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0
@@ -297,6 +300,14 @@ def _advertised_capabilities() -> tuple[list[str], dict | None]:
         infinitetalk_readiness = readiness.as_dict()
         if not readiness.ready:
             capabilities.remove(INFINITETALK_TWO_PERSON_ASSET_GROUP)
+    if INFINITETALK_TWO_PERSON_V2_ASSET_GROUP in capabilities:
+        readiness = check_infinitetalk_readiness(
+            require_two_person=True,
+            require_roomtone_v2=True,
+        )
+        infinitetalk_readiness = readiness.as_dict()
+        if not readiness.ready:
+            capabilities.remove(INFINITETALK_TWO_PERSON_V2_ASSET_GROUP)
     return capabilities, infinitetalk_readiness
 
 
@@ -306,6 +317,7 @@ def _ensure_runtime_provisioned(asset_group: str) -> bool:
     if canonical_asset_group(asset_group) not in {
         INFINITETALK_ASSET_GROUP,
         INFINITETALK_TWO_PERSON_ASSET_GROUP,
+        INFINITETALK_TWO_PERSON_V2_ASSET_GROUP,
     }:
         return False
     # A1 and A2 share one pinned wrapper install; track the provisioner once.
@@ -391,16 +403,37 @@ def _prepare_comfy_inputs(request: RunRequest) -> tuple[dict, list[ComfyInputFil
     if canonical_group in {
         INFINITETALK_ASSET_GROUP,
         INFINITETALK_TWO_PERSON_ASSET_GROUP,
+        INFINITETALK_TWO_PERSON_V2_ASSET_GROUP,
     }:
-        if canonical_group == INFINITETALK_ASSET_GROUP and request.infinitetalk_routing is not None:
-            raise ValueError("Two-person routing requires infinitetalk_two_person_v1")
-        if canonical_group == INFINITETALK_TWO_PERSON_ASSET_GROUP and request.infinitetalk_routing is None:
-            raise ValueError("infinitetalk_two_person_v1 requires frozen routing authority")
+        routing_schema = (
+            request.infinitetalk_routing.schema_version
+            if request.infinitetalk_routing is not None
+            else None
+        )
+        expected_routing_schema = {
+            INFINITETALK_TWO_PERSON_ASSET_GROUP: "infinitetalk_two_person_routing_v1",
+            INFINITETALK_TWO_PERSON_V2_ASSET_GROUP: "infinitetalk_two_person_routing_v2",
+        }.get(canonical_group)
+        if canonical_group == INFINITETALK_ASSET_GROUP and routing_schema is not None:
+            required_group = (
+                INFINITETALK_TWO_PERSON_V2_ASSET_GROUP
+                if routing_schema == "infinitetalk_two_person_routing_v2"
+                else INFINITETALK_TWO_PERSON_ASSET_GROUP
+            )
+            raise ValueError(f"Two-person routing requires {required_group}")
+        if expected_routing_schema is not None and routing_schema != expected_routing_schema:
+            raise ValueError(
+                f"{canonical_group} requires frozen routing authority {expected_routing_schema}"
+            )
         prepared_payload, observer_specs = _normalize_infinitetalk_audio_inputs(
             prepared_payload,
             request.comfy_input_files,
             job_id=request.job_id,
         )
+        if routing_schema == "infinitetalk_two_person_routing_v2":
+            # Bind the normalized intermediate before node 10 is replaced by
+            # its full-window, slot-specific roomtone conditioning derivative.
+            observe_staged_input_receipts(prepared_payload, observer_specs)
         prepared_payload, observer_specs = prepare_two_person_routing_inputs(
             prepared_payload,
             request.comfy_input_files,
@@ -1574,8 +1607,16 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             )
             progress.video_expected_sec = expected_prompt_sec if prompt_stage == "generating_video" else None
 
-        # Attempt the ComfyUI run; on OOM or crash, restart and retry once.
-        for attempt in range(2):
+        # The paid v2 proof is exactly one Comfy submission.  Legacy groups
+        # retain the established single recovery retry, but v2 must return a
+        # terminal failure so neither worker nor broker can silently spend on
+        # a second render under the same authority.
+        max_attempts = (
+            1
+            if canonical_group == INFINITETALK_TWO_PERSON_V2_ASSET_GROUP
+            else 2
+        )
+        for attempt in range(max_attempts):
             try:
                 comfy_started = time.monotonic()
                 staged_input_receipts = observe_staged_input_receipts(
@@ -1611,7 +1652,11 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
                 is_restart_detected = isinstance(exc, ComfyRestartDetectedError)
                 needs_restart = is_oom or is_restart_detected or not is_comfy_healthy()
 
-                if attempt == 0 and needs_restart and get_settings().comfy_start_cmd:
+                if (
+                    attempt + 1 < max_attempts
+                    and needs_restart
+                    and get_settings().comfy_start_cmd
+                ):
                     reason = "OOM" if is_oom else ("ComfyUI restart detected" if is_restart_detected else type(exc).__name__)
                     LOGGER.warning(
                         "job_id=%s attempt %d failed (%s) — restarting ComfyUI and retrying",
@@ -1685,6 +1730,14 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
 
         outputs = collect_output_paths(history)
         output_files = build_output_files(outputs)
+        outputs, postprocess_evidence = postprocess_two_person_v2_outputs(
+            [output.path for output in output_files],
+            routing=request.infinitetalk_routing,
+            source_specs=request.comfy_input_files,
+            observer_specs=observer_specs,
+            job_id=request.job_id,
+        )
+        output_files = build_output_files(outputs)
 
         # Extract observation keyframes here (the worker has the video on disk +
         # ffmpeg) so the backend never re-downloads + ffmpeg-decodes the clip.
@@ -1722,6 +1775,9 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         routing_receipt = build_two_person_routing_receipt(
             request.infinitetalk_routing,
             staged_input_receipts,
+            source_specs=request.comfy_input_files,
+            job_id=request.job_id,
+            postprocess_evidence=postprocess_evidence,
         )
 
         return RunResponse(
