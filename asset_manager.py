@@ -642,6 +642,12 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
             timeout=get_settings().model_download_timeout_sec,
         ):
             if is_non_empty_file(target_path):
+                if checksum:
+                    # Another process may have completed this download while
+                    # we waited for the lock.  Treat it exactly like every
+                    # other warm pinned asset: verify and register its current
+                    # identity before returning it to readiness callers.
+                    verify_asset_checksum(target_path, checksum)
                 LOGGER.info("Asset became available while waiting for lock: %s", target_path)
                 return None
 

@@ -282,6 +282,121 @@ def test_warm_a2_ensure_hashes_once_then_enables_strict_readiness(monkeypatch, t
     assert not checkpoint.exists()
 
 
+@pytest.mark.parametrize("matching", [True, False])
+def test_concurrent_pinned_asset_completion_is_verified_inside_lock(monkeypatch, tmp_path, matching):
+    target = tmp_path / "multi.safetensors"
+    approved_bytes = b"approved-multi-checkpoint"
+    expected_sha256 = hashlib.sha256(approved_bytes).hexdigest()
+    completed_bytes = approved_bytes if matching else b"corrupt-multi-checkpoint"
+
+    class CompletingLock:
+        def __enter__(self):
+            target.write_bytes(completed_bytes)
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(asset_manager.portalocker, "Lock", lambda *args, **kwargs: CompletingLock())
+    monkeypatch.setattr(
+        asset_manager,
+        "_download_to_path",
+        lambda *args, **kwargs: pytest.fail("concurrent completion must not redownload"),
+    )
+    asset_manager._VERIFIED_CHECKSUM_FACTS.clear()
+    asset = {
+        "name": "infinitetalk_multi",
+        "path": str(target),
+        "url": "https://example.invalid/multi.safetensors",
+        "sha256": expected_sha256,
+    }
+
+    if matching:
+        assert asset_manager._ensure_single_asset(asset) is None
+        assert asset_manager.asset_checksum_is_verified(target, expected_sha256) is True
+        assert target.read_bytes() == approved_bytes
+    else:
+        with pytest.raises(RuntimeError, match="Checksum mismatch"):
+            asset_manager._ensure_single_asset(asset)
+        assert not target.exists()
+
+
+def test_activated_worker_preload_rebuilds_a2_checksum_before_heartbeat(monkeypatch, tmp_path):
+    header = b'{"tensor":{"dtype":"U8","shape":[4],"data_offsets":[0,4]}}'
+    checkpoint = tmp_path / "multi.safetensors"
+    checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"ABCD")
+    approved = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_PATH", checkpoint)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_BYTES", checkpoint.stat().st_size)
+    monkeypatch.setattr(runtime, "_MULTITALK_MODEL_SHA256", approved)
+    monkeypatch.setattr(
+        asset_manager,
+        "get_asset_group",
+        lambda _group: [{
+            "name": "infinitetalk_multi",
+            "path": str(checkpoint),
+            "url": "https://example.invalid/multi.safetensors",
+            "sha256": approved,
+        }],
+    )
+    settings = SimpleNamespace(
+        worker_vram_gb=80.0,
+        worker_provider="verda",
+        worker_instance_id="instance-a2",
+        worker_gpu_name="H100 80GB",
+        worker_vision_base_url=None,
+        comfy_base_url="http://127.0.0.1:8188",
+        resolved_capabilities=lambda: ["infinitetalk_two_person_v1"],
+        resolved_worker_public_url=lambda: "https://worker.example",
+        resolved_backend_url=lambda: "https://backend.example",
+        resolved_worker_id=lambda: "00000000-0000-0000-0000-000000000001",
+        resolved_worker_name=lambda: "a2-worker",
+        resolved_max_concurrent_jobs=lambda: 1,
+        resolved_input_url_allowed_hosts=lambda: {"storage.example"},
+    )
+    monkeypatch.setattr(app, "get_settings", lambda: settings)
+    monkeypatch.setattr(app, "_worker_api_auth_ready", lambda: True)
+    monkeypatch.setattr(app, "_broker_headers", lambda: {})
+    monkeypatch.setattr(app, "_free_vram_mib", lambda: 80 * 1024)
+    monkeypatch.setattr(app, "comfy_queue_depth", lambda: None)
+    monkeypatch.setattr(app, "is_comfy_healthy", lambda: True)
+    monkeypatch.setattr(app, "_performance_snapshot", lambda: {})
+    monkeypatch.setattr(app, "_preload_asset_groups", lambda: ["infinitetalk_two_person_v1"])
+    monkeypatch.setattr(app, "_ensure_runtime_provisioned", lambda _group: False)
+    monkeypatch.setattr(app, "_WARMED_GROUPS", set())
+
+    def readiness(*, require_two_person=False):
+        assert require_two_person is True
+        error = runtime._multi_checkpoint_error()
+        return runtime.InfiniteTalkReadiness(
+            ready=error is None,
+            multi_checkpoint_error=error,
+        )
+
+    monkeypatch.setattr(app, "check_infinitetalk_readiness", readiness)
+    heartbeats = []
+    monkeypatch.setattr(
+        app.requests,
+        "post",
+        lambda _url, *, json, **_kwargs: (
+            heartbeats.append(json.copy())
+            or SimpleNamespace(raise_for_status=lambda: None)
+        ),
+    )
+    asset_manager._VERIFIED_CHECKSUM_FACTS.clear()
+
+    app._send_heartbeat_now()
+    assert heartbeats[-1]["capabilities"] == []
+    assert heartbeats[-1]["metadata"]["infinitetalk_readiness"]["ready"] is False
+
+    app._preflight_download_all()
+    assert asset_manager.asset_checksum_is_verified(checkpoint, approved) is True
+
+    app._send_heartbeat_now()
+    assert heartbeats[-1]["capabilities"] == ["infinitetalk_two_person_v1"]
+    assert heartbeats[-1]["metadata"]["infinitetalk_readiness"]["ready"] is True
+
+
 def test_a2_wrapper_readiness_requires_pinned_commit_and_positive_patch(monkeypatch, tmp_path):
     wrapper = tmp_path / "custom_nodes" / "ComfyUI-WanVideoWrapper"
     wrapper.mkdir(parents=True)
