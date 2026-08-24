@@ -14,6 +14,7 @@ from gpu_worker.comfy_client import (
     observe_staged_input_receipts,
 )
 from gpu_worker.schemas import ComfyInputFile
+from gpu_worker.schemas import RunRequest
 
 
 PNG_BYTES = (
@@ -191,3 +192,53 @@ def test_protected_cached_input_is_replaced_then_rehashed_before_graph(monkeypat
     destination.write_bytes(stale_bytes)
     with pytest.raises(RuntimeError, match="Observed staged input"):
         observe_staged_input_receipts(patched, [spec])
+
+
+def test_infinitetalk_observes_approved_mpeg_before_job_scoped_wav_normalization(
+    monkeypatch, tmp_path: Path
+):
+    from gpu_worker import app as worker_app
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    monkeypatch.setattr("gpu_worker.comfy_client.comfy_input_dir", lambda: input_dir)
+    monkeypatch.setattr(
+        worker_app,
+        "get_settings",
+        lambda: type("Settings", (), {"comfy_input_dir": str(input_dir)})(),
+    )
+    audio = b"ID3" + b"approved-mpeg" * 8
+    digest = hashlib.sha256(audio).hexdigest()
+    normalized = input_dir / "normalized" / "job.wav"
+
+    def fake_normalize(source: Path, *, job_id: str) -> Path:
+        assert source.read_bytes() == audio
+        assert job_id == "g90-contract"
+        normalized.parent.mkdir()
+        normalized.write_bytes(b"RIFF" + b"normalized-wav")
+        return normalized
+
+    monkeypatch.setattr(worker_app, "normalize_approved_mpeg_to_wav", fake_normalize)
+    request = RunRequest(
+        job_id="g90-contract",
+        asset_group="infinitetalk_v1",
+        comfy_payload={"10": {"class_type": "LoadAudio", "inputs": {"audio": "old.mp3"}}},
+        comfy_input_files=[
+            ComfyInputFile(
+                node_id="10",
+                input_name="audio",
+                filename="approved_take.mp3",
+                source_data=base64.b64encode(audio).decode("ascii"),
+                expected_sha256=digest,
+                content_type="audio/mpeg",
+            )
+        ],
+    )
+
+    prepared, receipts, was_normalized = worker_app._prepare_comfy_inputs(request)
+
+    assert was_normalized is True
+    assert receipts == [
+        {"node_id": "10", "input_name": "audio", "content_sha256": digest}
+    ]
+    assert prepared["10"]["inputs"]["audio"] == "normalized/job.wav"

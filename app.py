@@ -341,6 +341,30 @@ def _normalize_infinitetalk_audio_inputs(
     return comfy_payload
 
 
+def _prepare_comfy_inputs(
+    request: RunRequest,
+) -> tuple[dict, list[dict[str, str]], bool]:
+    """Stage attested inputs and prepare an executable graph.
+
+    InfiniteTalk converts the approved MPEG to a job-scoped WAV after staging.
+    Observe the caller-attested MPEG before that deterministic conversion;
+    otherwise the generic observer compares the WAV bytes with the MPEG hash
+    and rejects every valid protected talking-shot request.
+    """
+
+    prepared = apply_comfy_input_files(request.comfy_payload, request.comfy_input_files)
+    is_infinitetalk = canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP
+    receipts: list[dict[str, str]] = []
+    if is_infinitetalk:
+        receipts = observe_staged_input_receipts(prepared, request.comfy_input_files)
+        prepared = _normalize_infinitetalk_audio_inputs(
+            prepared,
+            request.comfy_input_files,
+            job_id=request.job_id,
+        )
+    return prepared, receipts, is_infinitetalk
+
+
 def _note_job_completed() -> None:
     """Bump the monotonic completed-jobs counter (once per finished job)."""
     global _JOBS_COMPLETED
@@ -1494,13 +1518,9 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
             timings.restart_sec = restart_comfy()
             restart_performed = True
 
-        prepared_payload = apply_comfy_input_files(request.comfy_payload, request.comfy_input_files)
-        if canonical_asset_group(request.asset_group) == INFINITETALK_ASSET_GROUP:
-            prepared_payload = _normalize_infinitetalk_audio_inputs(
-                prepared_payload,
-                request.comfy_input_files,
-                job_id=request.job_id,
-            )
+        prepared_payload, staged_input_receipts, protected_input_was_normalized = (
+            _prepare_comfy_inputs(request)
+        )
         expected_prompt_sec = _initial_prompt_eta_sec(request.asset_group, resolution_bucket)
         stage_started = time.monotonic()
         if progress is not None:
@@ -1516,10 +1536,11 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
         for attempt in range(2):
             try:
                 comfy_started = time.monotonic()
-                staged_input_receipts = observe_staged_input_receipts(
-                    prepared_payload,
-                    request.comfy_input_files,
-                )
+                if not protected_input_was_normalized:
+                    staged_input_receipts = observe_staged_input_receipts(
+                        prepared_payload,
+                        request.comfy_input_files,
+                    )
                 prompt_id = submit_prompt(prepared_payload)
                 history = poll_for_completion(
                     prompt_id=prompt_id,

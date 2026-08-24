@@ -230,11 +230,14 @@ def _provision_only_exit(script: str) -> int:
 
 
 def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
-    script = _script(PLAN)
-    provision = script.index("bash provision_infinitetalk.sh")
-    restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
-    assert provision < restart
-    assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_infinitetalk.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        rewait = script.index("wait_comfy_healthy", restart)
+        gate = _provision_only_exit(script)
+        assert provision < restart < rewait < gate
+        assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
 
 
 def test_comfy_provisioners_run_before_the_provision_only_exit() -> None:
