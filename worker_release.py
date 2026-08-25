@@ -3246,6 +3246,190 @@ def rollback_secure_profile(
     )
 
 
+def _release_for_managed_target(
+    path: Path,
+    *,
+    expected_name: str | None,
+    layout: SecureProfileLayout,
+) -> Path:
+    """Resolve one managed symlink to its exact secure-profile release."""
+
+    if not path.is_symlink():
+        if path.exists():
+            raise WorkerReleaseError(
+                "rehydrated secure-profile repair found an unmanaged path"
+            )
+        raise WorkerReleaseError(
+            "rehydrated secure-profile repair found a missing managed link"
+        )
+    target = path.resolve()
+    release_dir = target if expected_name is None else target.parent
+    if expected_name is not None and target.name != expected_name:
+        raise WorkerReleaseError(
+            "rehydrated secure-profile repair found an unexpected link target"
+        )
+    if (
+        release_dir.parent.resolve() != layout.releases_root.resolve()
+        or not _SAFE_ID.fullmatch(release_dir.name)
+    ):
+        raise WorkerReleaseError(
+            "rehydrated secure-profile repair found a target outside managed releases"
+        )
+    return release_dir
+
+
+@_locked_profile_operation
+def retire_rehydrated_secure_profile(
+    *,
+    worker_unit: str,
+    layout: SecureProfileLayout = SecureProfileLayout(),
+    controller: ServiceController | None = None,
+) -> str | None:
+    """Retire the secure profile carried by a reused OS volume.
+
+    A power loss during ``stage_secure_profile`` can leave the prior active
+    profile intact while one shared tunnel link already names the new,
+    never-cut-over release. Ordinary rollback correctly rejects that mixed
+    compare-and-swap state. Rehydration is the one place where the old VM is
+    known dead, so repair only this narrowly proven pre-cutover displacement,
+    then run the ordinary journaled rollback.
+    """
+
+    if not _SAFE_UNIT.fullmatch(worker_unit):
+        raise WorkerReleaseError("invalid rehydrated worker unit")
+    active_pointer = layout.state_root / "active" / worker_unit
+    if not active_pointer.exists() and not active_pointer.is_symlink():
+        return None
+    active_release = _release_for_managed_target(
+        active_pointer,
+        expected_name=None,
+        layout=layout,
+    )
+    active_data = _stage_data(active_release)
+    if active_data.get("worker_unit") != worker_unit:
+        raise WorkerReleaseError(
+            "rehydrated active pointer names a profile for another worker"
+        )
+    _verify_staged_release(active_release, active_data)
+
+    tunnel_unit = str(active_data["tunnel_unit"])
+    worker_dropin = (
+        layout.systemd_root / f"{worker_unit}.d" / PROFILE_DROPIN_NAME
+    )
+    tunnel_dropin = (
+        layout.systemd_root / f"{tunnel_unit}.d" / PROFILE_DROPIN_NAME
+    )
+    tunnel_unit_path = layout.systemd_root / tunnel_unit
+    worker_owner = _release_for_managed_target(
+        worker_dropin,
+        expected_name="worker-secure-profile.conf",
+        layout=layout,
+    )
+    if worker_owner != active_release:
+        raise WorkerReleaseError(
+            "rehydrated secure-profile repair refuses a displaced worker profile"
+        )
+
+    shared_links: list[tuple[str, Path, str]] = [
+        ("tunnel profile", tunnel_dropin, "tunnel-secure-profile.conf"),
+        ("tunnel unit", tunnel_unit_path, "filmforge-worker-tunnel.service"),
+    ]
+    if active_data.get("profile_mode") == "first-install":
+        shared_links.append(
+            (
+                "first-install guard",
+                worker_dropin.parent / STAGED_GUARD_DROPIN_NAME,
+                "worker-staged-guard.conf",
+            )
+        )
+        for unit in _stage_indexed_units(active_data):
+            shared_links.append(
+                (
+                    f"indexed guard {unit}",
+                    layout.systemd_root / f"{unit}.d" / STAGED_GUARD_DROPIN_NAME,
+                    "worker-staged-guard.conf",
+                )
+            )
+
+    foreign_releases: set[Path] = set()
+    displaced: list[tuple[str, Path, str, Path]] = []
+    for label, path, artifact in shared_links:
+        owner = _release_for_managed_target(
+            path,
+            expected_name=artifact,
+            layout=layout,
+        )
+        if owner != active_release:
+            foreign_releases.add(owner)
+            displaced.append((label, path, artifact, owner))
+
+    if foreign_releases:
+        if len(foreign_releases) != 1:
+            raise WorkerReleaseError(
+                "rehydrated secure-profile repair found multiple foreign releases"
+            )
+        foreign_release = next(iter(foreign_releases))
+        foreign_data = _stage_data(foreign_release)
+        _verify_staged_release(foreign_release, foreign_data)
+        if (
+            foreign_data.get("worker_unit") != worker_unit
+            or foreign_data.get("tunnel_unit") != tunnel_unit
+            or foreign_data.get("cutover_performed") is not False
+            or foreign_data.get("cutover_state") is not None
+            or foreign_data.get("rollback_state") is not None
+            or (foreign_release / "cutover-authorized").exists()
+            or (foreign_release / "boot-authorized").exists()
+        ):
+            raise WorkerReleaseError(
+                "rehydrated secure-profile repair refuses a foreign release that reached cutover"
+            )
+        active_data["rehydrated_link_repair"] = {
+            "foreign_release_id": foreign_release.name,
+            "displaced_links": [label for label, *_rest in displaced],
+            "state": "in_progress",
+        }
+        _write_text(
+            active_release / "stage-receipt.json",
+            json.dumps(active_data, sort_keys=True, indent=2) + "\n",
+            mode=0o600,
+        )
+        for _label, path, artifact, _owner in displaced:
+            _atomic_symlink(active_release / artifact, path)
+        staged_pointer = layout.state_root / "staged" / worker_unit
+        if staged_pointer.is_symlink():
+            staged_owner = _release_for_managed_target(
+                staged_pointer,
+                expected_name=None,
+                layout=layout,
+            )
+            if staged_owner == foreign_release:
+                staged_pointer.unlink()
+            elif staged_owner != active_release:
+                raise WorkerReleaseError(
+                    "rehydrated secure-profile repair found an unrelated staged pointer"
+                )
+        elif staged_pointer.exists():
+            raise WorkerReleaseError(
+                "rehydrated secure-profile repair found an unmanaged staged pointer"
+            )
+        active_data = _stage_data(active_release)
+        repair = dict(active_data["rehydrated_link_repair"])
+        repair["state"] = "complete"
+        active_data["rehydrated_link_repair"] = repair
+        _write_text(
+            active_release / "stage-receipt.json",
+            json.dumps(active_data, sort_keys=True, indent=2) + "\n",
+            mode=0o600,
+        )
+
+    _rollback_secure_profile_unlocked(
+        release_id=active_release.name,
+        layout=layout,
+        controller=controller,
+    )
+    return active_release.name
+
+
 @_locked_profile_operation
 def rollback_secure_profiles(
     *,
@@ -3358,6 +3542,7 @@ __all__ = [
     "build_worker_release_bundle",
     "cutover_secure_profile",
     "prepare_secure_profile",
+    "retire_rehydrated_secure_profile",
     "rollback_secure_profile",
     "rollback_secure_profiles",
     "stage_secure_profile",

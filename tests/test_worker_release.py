@@ -25,6 +25,7 @@ from gpu_worker.worker_release import (
     build_worker_release_bundle,
     cutover_secure_profile,
     prepare_secure_profile,
+    retire_rehydrated_secure_profile,
     rollback_secure_profile,
     stage_secure_profile,
     worker_release_install_script,
@@ -1596,6 +1597,112 @@ def test_profile_rollback_is_compare_and_swap_guarded(tmp_path: Path) -> None:
             release_id=first.release_id,
             layout=layout,
             controller=_Controller(override),
+        )
+
+
+def test_rehydrated_retirement_repairs_interrupted_pre_cutover_tunnel_link(
+    tmp_path: Path,
+) -> None:
+    contract, layout = _fixture(
+        tmp_path,
+        with_override=False,
+        profile_mode="first-install",
+    )
+    active = stage_secure_profile(contract, layout)
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    controller = _Controller(override)
+    now = 1_800_000_000
+    _prepare(active, contract, layout, controller, now=now)
+    cutover_secure_profile(
+        release_id=contract.release_id,
+        receipt_path=_first_install_receipt(
+            active, tmp_path / "active-receipt.json", now=now
+        ),
+        layout=layout,
+        controller=controller,
+        now_epoch=now,
+    )
+
+    foreign_contract = replace(contract, release_id="release-2026-08-10-b")
+    active_pointer = layout.state_root / "active" / contract.worker_unit
+    active_pointer.unlink()
+    active.worker_dropin.unlink()
+    foreign = stage_secure_profile(foreign_contract, layout)
+    # Recreate the historical crash point: stage replaced only the shared
+    # tunnel unit before power loss; the active and worker CAS still name A.
+    active_pointer.unlink(missing_ok=True)
+    active_pointer.symlink_to(active.release_dir)
+    active.worker_dropin.symlink_to(
+        active.release_dir / "worker-secure-profile.conf"
+    )
+    tunnel_dropin = (
+        layout.systemd_root
+        / f"{contract.tunnel_unit}.d"
+        / PROFILE_DROPIN_NAME
+    )
+    tunnel_dropin.unlink()
+    tunnel_dropin.symlink_to(active.release_dir / "tunnel-secure-profile.conf")
+    guard = active.worker_dropin.parent / "00-filmforge-staged-guard.conf"
+    guard.unlink()
+    guard.symlink_to(active.release_dir / "worker-staged-guard.conf")
+    staged_pointer = layout.state_root / "staged" / contract.worker_unit
+    staged_pointer.unlink(missing_ok=True)
+
+    retired = retire_rehydrated_secure_profile(
+        worker_unit=contract.worker_unit,
+        layout=layout,
+        controller=controller,
+    )
+
+    assert retired == contract.release_id
+    assert not active_pointer.exists()
+    assert not active.worker_dropin.exists()
+    assert not (layout.systemd_root / contract.tunnel_unit).exists()
+    repair = json.loads(active.stage_receipt.read_text())["rehydrated_link_repair"]
+    assert repair == {
+        "foreign_release_id": foreign.release_id,
+        "displaced_links": ["tunnel unit"],
+        "state": "complete",
+    }
+
+
+def test_rehydrated_retirement_refuses_foreign_release_that_reached_cutover(
+    tmp_path: Path,
+) -> None:
+    contract, layout = _fixture(
+        tmp_path,
+        with_override=False,
+        profile_mode="first-install",
+    )
+    active = stage_secure_profile(contract, layout)
+    active_pointer = layout.state_root / "active" / contract.worker_unit
+    active_pointer.parent.mkdir(parents=True, exist_ok=True)
+    active_pointer.symlink_to(active.release_dir)
+    active.worker_dropin.symlink_to(
+        active.release_dir / "worker-secure-profile.conf"
+    )
+    foreign_contract = replace(contract, release_id="release-2026-08-10-b")
+    active_pointer.unlink()
+    active.worker_dropin.unlink()
+    foreign = stage_secure_profile(foreign_contract, layout)
+    active_pointer.unlink(missing_ok=True)
+    active_pointer.symlink_to(active.release_dir)
+    active.worker_dropin.symlink_to(
+        active.release_dir / "worker-secure-profile.conf"
+    )
+    foreign_data = json.loads(foreign.stage_receipt.read_text())
+    foreign_data["cutover_state"] = "in_progress"
+    _write_0600(foreign.stage_receipt, json.dumps(foreign_data))
+
+    with pytest.raises(WorkerReleaseError, match="reached cutover"):
+        retire_rehydrated_secure_profile(
+            worker_unit=contract.worker_unit,
+            layout=layout,
+            controller=_Controller(
+                layout.systemd_root
+                / f"{contract.worker_unit}.d"
+                / PUBLIC_OVERRIDE_NAME
+            ),
         )
 
 

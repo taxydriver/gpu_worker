@@ -755,7 +755,14 @@ def _retire_rehydrated_profile(
     _remote_run(
         runner,
         ssh_cmd,
-        [python, "-B", manage, "rollback", "--release-id", fossil_id],
+        [
+            python,
+            "-B",
+            manage,
+            "retire-rehydrated",
+            "--worker-unit",
+            worker_unit,
+        ],
         timeout=360,
     )
 

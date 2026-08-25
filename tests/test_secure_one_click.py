@@ -600,10 +600,10 @@ def test_rehydrated_fossil_profile_is_retired_before_stage() -> None:
         python="/opt/rel/.venv/bin/python",
         manage="/opt/rel/gpu_worker/manage_worker_release.py",
     )
-    rollback = [c for c in runner.commands if "rollback" in c]
-    assert len(rollback) == 1
-    assert "--release-id" in rollback[0]
-    assert "auto-1786000000-dead-gpu0" in rollback[0]
+    retirement = [c for c in runner.commands if "retire-rehydrated" in c]
+    assert len(retirement) == 1
+    assert "--worker-unit" in retirement[0]
+    assert "filmforge-worker-gpu0.service" in retirement[0]
 
 
 def test_virgin_volume_skips_profile_retirement() -> None:

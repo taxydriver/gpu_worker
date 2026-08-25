@@ -23,6 +23,7 @@ try:
         build_cutover_receipt_template,
         cutover_secure_profile,
         prepare_secure_profile,
+        retire_rehydrated_secure_profile,
         rollback_secure_profile,
         stage_secure_profile,
     )
@@ -35,6 +36,7 @@ except ModuleNotFoundError:  # direct execution from the gpu_worker checkout
         build_cutover_receipt_template,
         cutover_secure_profile,
         prepare_secure_profile,
+        retire_rehydrated_secure_profile,
         rollback_secure_profile,
         stage_secure_profile,
     )
@@ -193,6 +195,26 @@ def _rollback(args: argparse.Namespace) -> int:
     return 0
 
 
+def _retire_rehydrated(args: argparse.Namespace) -> int:
+    release_id = retire_rehydrated_secure_profile(
+        worker_unit=args.worker_unit,
+        layout=_layout(args),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "operation": "retire-rehydrated",
+                "release_id": release_id,
+                "worker_unit": args.worker_unit,
+                "worker_profile_active": False,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -280,6 +302,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     rollback.add_argument("--release-id", required=True)
     rollback.set_defaults(handler=_rollback)
+    retire = subparsers.add_parser(
+        "retire-rehydrated",
+        help="retire the verified secure profile carried by a reused OS volume",
+    )
+    retire.add_argument("--worker-unit", required=True)
+    retire.set_defaults(handler=_retire_rehydrated)
     return parser.parse_args(argv)
 
 
