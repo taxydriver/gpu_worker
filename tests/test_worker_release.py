@@ -1666,6 +1666,46 @@ def test_rehydrated_retirement_repairs_interrupted_pre_cutover_tunnel_link(
     }
 
 
+def test_rehydrated_retirement_accepts_hashed_legacy_tunnel_unit_filename(
+    tmp_path: Path,
+) -> None:
+    contract, layout = _fixture(
+        tmp_path,
+        with_override=False,
+        profile_mode="first-install",
+    )
+    active = stage_secure_profile(contract, layout)
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    controller = _Controller(override)
+    now = 1_800_000_000
+    _prepare(active, contract, layout, controller, now=now)
+    cutover_secure_profile(
+        release_id=contract.release_id,
+        receipt_path=_first_install_receipt(
+            active, tmp_path / "legacy-receipt.json", now=now
+        ),
+        layout=layout,
+        controller=controller,
+        now_epoch=now,
+    )
+    canonical = active.release_dir / "filmforge-worker-tunnel.service"
+    legacy = active.release_dir / contract.tunnel_unit
+    canonical.rename(legacy)
+    tunnel_unit_path = layout.systemd_root / contract.tunnel_unit
+    tunnel_unit_path.unlink()
+    tunnel_unit_path.symlink_to(legacy)
+
+    retired = retire_rehydrated_secure_profile(
+        worker_unit=contract.worker_unit,
+        layout=layout,
+        controller=controller,
+    )
+
+    assert retired == contract.release_id
+    assert not tunnel_unit_path.exists()
+    assert json.loads(active.stage_receipt.read_text())["rollback_state"] == "complete"
+
+
 def test_rehydrated_retirement_refuses_foreign_release_that_reached_cutover(
     tmp_path: Path,
 ) -> None:

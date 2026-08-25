@@ -2247,8 +2247,39 @@ _STAGED_ARTIFACTS: dict[str, tuple[str, int]] = {
 }
 
 
-def _staged_artifacts(stage_data: dict[str, object]) -> dict[str, tuple[str, int]]:
+def _tunnel_unit_artifact(
+    release_dir: Path,
+    stage_data: dict[str, object],
+) -> Path:
+    """Resolve the tunnel unit filename used by this immutable receipt.
+
+    Early Caddy releases stored the unit under its concrete systemd unit name
+    (for example ``filmforge-worker-edge-gpu0.service``). New releases use the
+    provider-neutral ``filmforge-worker-tunnel.service`` filename. The receipt
+    hash is authoritative in both cases; this only restores the missing
+    filename convention needed to locate those archived bytes.
+    """
+
+    canonical = release_dir / "filmforge-worker-tunnel.service"
+    if canonical.is_file() and not canonical.is_symlink():
+        return canonical
+    legacy_name = str(stage_data.get("tunnel_unit") or "")
+    if _SAFE_UNIT.fullmatch(legacy_name):
+        legacy = release_dir / legacy_name
+        if legacy.is_file() and not legacy.is_symlink():
+            return legacy
+    return canonical
+
+
+def _staged_artifacts(
+    stage_data: dict[str, object],
+    release_dir: Path,
+) -> dict[str, tuple[str, int]]:
     artifacts = dict(_STAGED_ARTIFACTS)
+    artifacts["tunnel_unit_sha256"] = (
+        _tunnel_unit_artifact(release_dir, stage_data).name,
+        0o644,
+    )
     if stage_data.get("edge_provider") == "caddy":
         for field in ("tunnel_secret_sha256", "tunnel_config_sha256", "tunnel_credential_sha256", "tunnel_exec_sha256", "tunnel_binary_sha256"):
             artifacts.pop(field)
@@ -2279,7 +2310,9 @@ def _verify_staged_release(
     release_dir: Path,
     stage_data: dict[str, object],
 ) -> None:
-    for field, (relative, expected_mode) in _staged_artifacts(stage_data).items():
+    for field, (relative, expected_mode) in _staged_artifacts(
+        stage_data, release_dir
+    ).items():
         path = release_dir / relative
         if path.is_symlink() or not path.is_file():
             raise WorkerReleaseError(f"staged secure-profile artifact is missing: {relative}")
@@ -2314,7 +2347,7 @@ def _assert_active_profile_links(
     tunnel_unit_path = layout.systemd_root / tunnel_unit
     expected = {
         tunnel_dropin: release_dir / "tunnel-secure-profile.conf",
-        tunnel_unit_path: release_dir / "filmforge-worker-tunnel.service",
+        tunnel_unit_path: _tunnel_unit_artifact(release_dir, stage_data),
     }
     indexed_dropins = {
         layout.systemd_root / f"{unit}.d" / PROFILE_DROPIN_NAME:
@@ -3084,7 +3117,7 @@ def _rollback_secure_profile_unlocked(
         ),
         "tunnel unit": _assert_managed_link_or_absent(
             tunnel_unit_path,
-            release_dir / "filmforge-worker-tunnel.service",
+            _tunnel_unit_artifact(release_dir, stage_data),
             label="tunnel unit",
         ),
         "active profile": _assert_managed_link_or_absent(
@@ -3332,7 +3365,11 @@ def retire_rehydrated_secure_profile(
 
     shared_links: list[tuple[str, Path, str]] = [
         ("tunnel profile", tunnel_dropin, "tunnel-secure-profile.conf"),
-        ("tunnel unit", tunnel_unit_path, "filmforge-worker-tunnel.service"),
+        (
+            "tunnel unit",
+            tunnel_unit_path,
+            _tunnel_unit_artifact(active_release, active_data).name,
+        ),
     ]
     if active_data.get("profile_mode") == "first-install":
         shared_links.append(
