@@ -164,6 +164,31 @@ def test_preflight_refuses_tls_tunnel_cardinality_and_port_drift() -> None:
         )
 
 
+def test_one_secure_edge_can_protect_multiple_workers() -> None:
+    env_vars = [
+        "WORKER_TUNNEL_UNITS=filmforge-worker-edge-gpu0.service"
+        if item.startswith("WORKER_TUNNEL_UNITS=")
+        else (
+            "WORKER_SECURITY_STAGE_RECEIPTS=/etc/filmforge/worker-security/"
+            "releases/profile-gpu0/stage-receipt.json"
+            if item.startswith("WORKER_SECURITY_STAGE_RECEIPTS=")
+            else item
+        )
+        for item in _complete_contract(count=2)
+    ]
+
+    result = deploy_gpu._preflight_complete_worker_contract(
+        env_vars,
+        worker_port=9000,
+        expected_worker_count=2,
+    )
+
+    assert len(result["public_urls"]) == 2
+    remote_gate = deploy_gpu.worker_security_stage_gate_script()
+    assert "shared_edge = len(receipt_paths) == 1 and len(tunnel_units) == 1" in remote_gate
+    assert "len(public_urls) != len(local_urls)" in remote_gate
+
+
 def test_h100_dirty_checkout_can_never_be_pulled_or_tolerated_again() -> None:
     """Regression for a526cb5 + local edits/untracked 915de05 on /opt."""
 

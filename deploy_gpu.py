@@ -1297,8 +1297,17 @@ code_release_id = sys.argv[6]
 edge_provider = sys.argv[7]
 if edge_provider not in {"cloudflared", "caddy"}:
     raise SystemExit("invalid worker edge provider")
-if not receipt_paths or not (
-    len(receipt_paths) == len(public_urls) == len(local_urls) == len(tunnel_units)
+shared_edge = len(receipt_paths) == 1 and len(tunnel_units) == 1
+if (
+    not receipt_paths
+    or len(public_urls) != len(local_urls)
+    or (
+        not shared_edge
+        and (
+            len(receipt_paths) != len(public_urls)
+            or len(tunnel_units) != len(public_urls)
+        )
+    )
 ):
     raise SystemExit("prepared secure-profile receipt cardinality mismatch")
 if deploy_phase == "stage-code":
