@@ -224,42 +224,84 @@ def test_audio_still_triggers_on_capabilities_without_a_plan() -> None:
 
 
 def _provision_only_exit(script: str) -> int:
-    # The rehydrate body's provision-only gate (not the security stage gate at
-    # the top of the script, which also echoes WORKER_RELEASE_STAGED_ONLY).
+    # Select the rehydrate body's provision-only gate, not the earlier security
+    # stage gate which emits the same receipt token.
     return script.index("WORKER_RELEASE_STAGED_ONLY=", script.index("wait_comfy_healthy()"))
 
 
-def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
+def test_infinitetalk_assets_and_readiness_precede_secure_cutover() -> None:
     for script in (_script(PLAN), _script(None)):
         provision = script.index("bash provision_infinitetalk.sh")
         restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
         rewait = script.index("wait_comfy_healthy", restart)
+        materialize = script.index("result = ensure_asset_group(asset_group)", rewait)
+        readiness = script.index(
+            "readiness = check_infinitetalk_readiness(",
+            materialize,
+        )
+        seal = script.index("immutable worker candidate failed pre-cutover seal", readiness)
         gate = _provision_only_exit(script)
-        assert provision < restart < rewait < gate
+        assert provision < restart < rewait < materialize < readiness < seal < gate
         assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert "ensure_asset_group(asset_group)" not in script[gate:]
         assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+        assert '*,infinitetalk_two_person_v1,*' in script
+        assert '*,infinitetalk_two_person_v2,*' in script
+        assert '_infinitetalk_asset_group="infinitetalk_two_person_v1"' in script
+        assert '_infinitetalk_asset_group="infinitetalk_two_person_v2"' in script
+        assert 'INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"' in script
+        assert 'INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2"' in script
+        assert 'COMFY_BASE_URL="http://127.0.0.1:${_infinitetalk_comfy_port}"' in script
+        assert 'COMFY_DIR="$COMFY_ROOT"' in script
+        assert 'PYTHONDONTWRITEBYTECODE=1' in script[materialize - 500:materialize]
+        assert 'PYTHONPATH="$WORKER_MODULE_DIR"' in script
+        assert '"$WORKER_ROOT/.venv/bin/python" -' in script
+        assert "InfiniteTalk readiness failed before secure cutover" in script
+        assert "worker release candidate is incomplete; refusing staged receipt" in script
+
+
+def test_two_person_infinitetalk_preflight_is_strict_and_precedes_staged_receipt() -> None:
+    script = _script(None)
+    a2_case = script.index("*,infinitetalk_two_person_v1,*")
+    a1_case = script.index("*,infinitetalk,*|*,infinitetalk_v1,*", a2_case)
+    group_env = script.index('INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group"', a1_case)
+    strict_env = script.index('INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person"', group_env)
+    strict_readiness = script.index(
+        "check_infinitetalk_readiness(",
+        strict_env,
+    )
+    gate = _provision_only_exit(script)
+
+    assert a2_case < a1_case < group_env < strict_env < strict_readiness < gate
+
+
+def test_v2_infinitetalk_preflight_selects_exact_roomtone_readiness() -> None:
+    script = _script(None)
+    v2_case = script.index("*,infinitetalk_two_person_v2,*")
+    v1_case = script.index("*,infinitetalk_two_person_v1,*", v2_case)
+    group = script.index('_infinitetalk_asset_group="infinitetalk_two_person_v2"', v2_case)
+    strict = script.index('_infinitetalk_require_two_person="1"', group)
+    roomtone = script.index('_infinitetalk_require_roomtone_v2="1"', strict)
+    roomtone_env = script.index(
+        'INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2"',
+        v1_case,
+    )
+    readiness = script.index("require_roomtone_v2=require_roomtone_v2", roomtone_env)
+    gate = _provision_only_exit(script)
+
+    assert v2_case < group < strict < roomtone < v1_case < roomtone_env < readiness < gate
 
 
 def test_comfy_provisioners_run_before_the_provision_only_exit() -> None:
-    # The secure one-click runs the rehydrate script twice: the provision-only
-    # pass exits at the gate, and the cutover pass is answered by the security
-    # stage gate before the body runs. Until 2026-08-22 both provisioner blocks
-    # sat AFTER the gate — dead code on the Rent button's path — and a box
-    # rented with flux_ipadapter carried the weights and 400d every render
-    # with missing_node_type. Provisioners are GPU-stack work: before the gate,
-    # followed by a Comfy restart and a second health wait.
+    # Both provisioners install classes Comfy discovers only at startup. They
+    # must run before one shared restart and before the secure staging receipt.
     for script in (_script(PLAN), _script(None)):
         gate = _provision_only_exit(script)
         infinitetalk = script.index("bash provision_infinitetalk.sh")
         flux_ipadapter = script.index("bash provision_flux_ipadapter.sh")
-        assert infinitetalk < gate and flux_ipadapter < gate
         restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', flux_ipadapter)
         rewait = script.index("wait_comfy_healthy", restart)
-        assert flux_ipadapter < restart < rewait < gate
-        # Neither Comfy-node provisioner survives after the gate. (The audio
-        # department block still does — provision_tts.sh / provision_sa3.sh —
-        # the same dead-code shape for an audio box on the secure path; logged,
-        # not moved here: it also installs resident systemd services.)
+        assert infinitetalk < flux_ipadapter < restart < rewait < gate
         assert "bash provision_infinitetalk.sh" not in script[gate:]
         assert "bash provision_flux_ipadapter.sh" not in script[gate:]
 
@@ -274,6 +316,11 @@ def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> N
     # The mutating clone path is strictly after the lock acquisition, so both
     # rehydrate and asset-manager ensure calls use the same filesystem lock.
     assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
+    assert "WAN_WRAPPER_COMMIT=088128b224242e110d3906c6750e9a3a348a659b" in source
+    assert 'git -C "$d" checkout --detach "$approved_commit"' in source
+    assert "FATAL: mask-patch site not found in approved wrapper" in source
+    assert "WARN: mask-patch site not found" not in source
+    assert "two-speaker mask patch was not positively verified" in source
 
 
 def test_flux_ipadapter_provisioning_precedes_generation_comfy_restart() -> None:

@@ -151,6 +151,59 @@ def _verify_sha256(path: Path, expected_sha256: str) -> None:
     )
 
 
+_VERIFIED_CHECKSUM_FACTS_LOCK = Lock()
+_VERIFIED_CHECKSUM_FACTS: set[tuple[str, int, int, int, int, int, str]] = set()
+
+
+def _checksum_fact(path: Path, expected_sha256: str) -> tuple[str, int, int, int, int, int, str]:
+    stat = path.stat()
+    return (
+        str(path.resolve(strict=False)),
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+        expected_sha256.lower(),
+    )
+
+
+def verify_asset_checksum(path: Path, expected_sha256: str) -> None:
+    """Hash once per unchanged on-disk file identity in this worker process."""
+
+    fact = _checksum_fact(path, expected_sha256)
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if fact in _VERIFIED_CHECKSUM_FACTS:
+            return
+    _verify_sha256(path, expected_sha256)
+    observed_fact = _checksum_fact(path, expected_sha256)
+    if observed_fact != fact:
+        raise RuntimeError(f"Asset changed during checksum verification: {path}")
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if len(_VERIFIED_CHECKSUM_FACTS) >= 128:
+            _VERIFIED_CHECKSUM_FACTS.clear()
+        _VERIFIED_CHECKSUM_FACTS.add(fact)
+
+
+def _register_verified_checksum(path: Path, expected_sha256: str) -> None:
+    fact = _checksum_fact(path, expected_sha256)
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        if len(_VERIFIED_CHECKSUM_FACTS) >= 128:
+            _VERIFIED_CHECKSUM_FACTS.clear()
+        _VERIFIED_CHECKSUM_FACTS.add(fact)
+
+
+def asset_checksum_is_verified(path: Path, expected_sha256: str) -> bool:
+    """Fast readiness query; full hashing belongs to background asset ensure."""
+
+    try:
+        fact = _checksum_fact(path, expected_sha256)
+    except OSError:
+        return False
+    with _VERIFIED_CHECKSUM_FACTS_LOCK:
+        return fact in _VERIFIED_CHECKSUM_FACTS
+
+
 def _aria2c_available() -> bool:
     """Return True if aria2c is installed on this system."""
     import shutil
@@ -572,6 +625,8 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
     checksum = asset.get("sha256")
 
     if is_non_empty_file(target_path):
+        if checksum:
+            verify_asset_checksum(target_path, checksum)
         LOGGER.info("Asset already present: %s -> %s", asset_name, target_path)
         return None
 
@@ -587,14 +642,24 @@ def _ensure_single_asset(asset: dict[str, str]) -> str | None:
             timeout=get_settings().model_download_timeout_sec,
         ):
             if is_non_empty_file(target_path):
+                if checksum:
+                    # Another process may have completed this download while
+                    # we waited for the lock.  Treat it exactly like every
+                    # other warm pinned asset: verify and register its current
+                    # identity before returning it to readiness callers.
+                    verify_asset_checksum(target_path, checksum)
                 LOGGER.info("Asset became available while waiting for lock: %s", target_path)
                 return None
 
             safe_unlink(temp_path)
             _download_to_path(url, temp_path, asset_name=asset_name)
             if checksum:
-                _verify_sha256(temp_path, checksum)
+                verify_asset_checksum(temp_path, checksum)
             os.replace(temp_path, target_path)
+            if checksum:
+                # The atomic rename changes path and ctime facts; register the
+                # final immutable-looking identity without hashing 5 GB twice.
+                _register_verified_checksum(target_path, checksum)
             LOGGER.info("Downloaded asset: %s", target_path)
             return str(target_path)
     except requests.RequestException as exc:
@@ -639,7 +704,13 @@ def ensure_asset_group(asset_group: str) -> EnsureAssetsResult:
 
     for asset in assets:
         check_started = time.monotonic()
-        already_present = is_non_empty_file(Path(asset["path"]).expanduser())
+        target_path = Path(asset["path"]).expanduser()
+        already_present = is_non_empty_file(target_path)
+        if already_present and asset.get("sha256"):
+            # Readiness consumes this same-process proof for very large pinned
+            # assets.  Do not let the warm-file fast path bypass the exact
+            # digest verification performed by _ensure_single_asset().
+            verify_asset_checksum(target_path, asset["sha256"])
         asset_check_sec += time.monotonic() - check_started
         if already_present:
             LOGGER.info("Asset already present: %s", asset["path"])

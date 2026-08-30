@@ -50,6 +50,15 @@ The intended flow is:
 - `infinitetalk_v1` is opt-in and is advertised only when every registered weight exists, all
   required Comfy node classes are loaded, the wav2vec Python imports succeed, and Comfy answers.
   A capability string by itself is not readiness.
+- `infinitetalk_two_person_v1` is the separate A2 capability. It additionally requires the
+  pinned wrapper/patch, exact Multi checkpoint digest, `audio_2`/`ref_target_masks`/`para`
+  object schema, explicit slot masks plus background, and exact-length worker-owned silence.
+  Old `infinitetalk_v1` workers are never eligible for A2 jobs.
+- `infinitetalk_two_person_v2` is the listener-stability capability. It keeps the same pinned
+  MultiTalk assets and mask authority, but requires deterministic slot-specific pink-roomtone
+  conditioning across the wrapper's full 81+72k frame cadence, a three-frame conditioning
+  lead-in, and a verified trim/remux that returns only the approved take as audible audio.
+  Neither A1 nor A2-v1 workers are eligible for v2 jobs.
 - The provisioner installs the InfiniteTalk/MultiTalk custom-node stack and serializes concurrent
   provision attempts. Asset downloads still come from the ordinary asset registry.
 - Approved InfiniteTalk input is currently a compatibility-proof contract: `audio/mpeg` only,
@@ -78,7 +87,8 @@ The worker reads these env vars:
 - `COMFY_INPUT_DIR` default: `/workspace/ComfyUI/input`
 - `COMFY_DIR` default: `/workspace/ComfyUI` (used for the Comfy venv/readiness check)
 - `WORKER_CAPABILITIES` comma-separated opt-in capabilities; use canonical
-  `infinitetalk_v1` for talking-shot compatibility
+  `infinitetalk_v1` for A1, `infinitetalk_two_person_v1` for strict A2-v1 routing, or
+  `infinitetalk_two_person_v2` for full-window roomtone conditioning and output trim/remux
 - `INFINITETALK_PROVISION_LOCK_TIMEOUT_SEC` default: `1800`
 
 ## Important Setup Notes
@@ -274,6 +284,8 @@ Returns:
     "missing_files": [],
     "missing_node_classes": [],
     "wav2vec_dependency_error": null,
+    "multitalk_contract_error": null,
+    "multi_checkpoint_error": null,
     "comfy_error": null
   }
 }

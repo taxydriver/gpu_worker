@@ -390,6 +390,18 @@ def test_finalize_holds_profile_lock_while_revalidating_and_promoting(
     assert '"systemctl", "is-active", "--quiet"' in script
     assert "worker health identity changed before code finalization" in script
     assert 'health.get("code_release_id") != failed_release_id' in script
+    assert '"tunnel_unit_artifact" in receipt' in script
+    assert "profile_dir / tunnel_unit_artifact" in script
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_secure_deploy_gate_binds_exact_tunnel_unit_artifact() -> None:
+    script = deploy_gpu.worker_security_stage_gate_script()
+
+    assert '"tunnel_unit_artifact" in data' in script
+    assert "tunnel_unit_artifact != tunnel_units[index]" in script
+    assert 'receipt_artifacts["tunnel_unit_sha256"]' in script
+    assert "release / tunnel_unit_artifact" in script
     subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
 

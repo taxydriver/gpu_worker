@@ -905,6 +905,16 @@ for raw_path in receipt_paths:
         profile_release_id, worker_unit, tunnel_unit
     )):
         raise SystemExit("secure-profile identity is invalid")
+    tunnel_unit_artifact = receipt.get(
+        "tunnel_unit_artifact", "filmforge-worker-tunnel.service"
+    )
+    if (
+        not isinstance(tunnel_unit_artifact, str)
+        or not tunnel_unit_artifact.endswith(".service")
+        or "/" in tunnel_unit_artifact
+        or ("tunnel_unit_artifact" in receipt and tunnel_unit_artifact != tunnel_unit)
+    ):
+        raise SystemExit("secure-profile tunnel unit artifact identity is invalid")
     profile_dir = receipt_path.parent
     active = pathlib.Path("/etc/filmforge/worker-security/active") / worker_unit
     worker_dropin_dir = pathlib.Path("/etc/systemd/system") / f"{{worker_unit}}.d"
@@ -913,7 +923,7 @@ for raw_path in receipt_paths:
         active: profile_dir,
         worker_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "worker-secure-profile.conf",
         tunnel_dropin_dir / "20-filmforge-secure-profile.conf": profile_dir / "tunnel-secure-profile.conf",
-        pathlib.Path("/etc/systemd/system") / tunnel_unit: profile_dir / "filmforge-worker-tunnel.service",
+        pathlib.Path("/etc/systemd/system") / tunnel_unit: profile_dir / tunnel_unit_artifact,
     }}
     for managed, expected in expected_links.items():
         if not managed.is_symlink() or managed.resolve() != expected.resolve():
@@ -1325,7 +1335,6 @@ artifacts = {
     "tunnel_binary_sha256": ("cloudflared", 0o755),
     "worker_dropin_sha256": ("worker-secure-profile.conf", 0o644),
     "tunnel_dropin_sha256": ("tunnel-secure-profile.conf", 0o644),
-    "tunnel_unit_sha256": ("filmforge-worker-tunnel.service", 0o644),
     "worker_guard_sha256": ("worker-staged-guard.conf", 0o644),
 }
 all_cutover = True
@@ -1397,7 +1406,22 @@ for index, raw_path in enumerate(receipt_paths):
     if any(data.get(key) != value for key, value in expected):
         raise SystemExit("secure-profile stage receipt does not match deploy contract")
     release = path.parent
-    for field, (relative, expected_mode) in artifacts.items():
+    tunnel_unit_artifact = data.get(
+        "tunnel_unit_artifact", "filmforge-worker-tunnel.service"
+    )
+    if (
+        not isinstance(tunnel_unit_artifact, str)
+        or not tunnel_unit_artifact.endswith(".service")
+        or "/" in tunnel_unit_artifact
+        or (
+            "tunnel_unit_artifact" in data
+            and tunnel_unit_artifact != tunnel_units[index]
+        )
+    ):
+        raise SystemExit("secure-profile tunnel unit artifact identity is invalid")
+    receipt_artifacts = dict(artifacts)
+    receipt_artifacts["tunnel_unit_sha256"] = (tunnel_unit_artifact, 0o644)
+    for field, (relative, expected_mode) in receipt_artifacts.items():
         artifact = release / relative
         if artifact.is_symlink() or not artifact.is_file():
             raise SystemExit("secure-profile staged artifact is missing")
@@ -1407,7 +1431,7 @@ for index, raw_path in enumerate(receipt_paths):
             raise SystemExit("secure-profile staged artifact drifted")
     worker_unit = data["worker_unit"]
     managed = {
-        pathlib.Path("/etc/systemd/system") / tunnel_units[index]: release / "filmforge-worker-tunnel.service",
+        pathlib.Path("/etc/systemd/system") / tunnel_units[index]: release / tunnel_unit_artifact,
         pathlib.Path("/etc/systemd/system") / f"{tunnel_units[index]}.d/20-filmforge-secure-profile.conf": release / "tunnel-secure-profile.conf",
     }
     worker_profile = pathlib.Path("/etc/systemd/system") / f"{worker_unit}.d/20-filmforge-secure-profile.conf"
@@ -3718,8 +3742,24 @@ _provisioned_any=""
 # InfiniteTalk / MultiTalk: its Wan 2.1 weights are handled by the worker asset
 # manager; this provisioner installs the custom nodes and wav2vec Python path.
 _infinitetalk_wanted=""
+_infinitetalk_asset_group="infinitetalk_v1"
+_infinitetalk_require_two_person="0"
+_infinitetalk_require_roomtone_v2="0"
 case ",${{WORKER_CAPABILITIES:-}}," in
-  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*) _infinitetalk_wanted=1 ;;
+  *,infinitetalk_two_person_v2,*)
+    _infinitetalk_wanted=1
+    _infinitetalk_asset_group="infinitetalk_two_person_v2"
+    _infinitetalk_require_two_person="1"
+    _infinitetalk_require_roomtone_v2="1"
+    ;;
+  *,infinitetalk_two_person_v1,*)
+    _infinitetalk_wanted=1
+    _infinitetalk_asset_group="infinitetalk_two_person_v1"
+    _infinitetalk_require_two_person="1"
+    ;;
+  *,infinitetalk,*|*,infinitetalk_v1,*|*,talking_shot,*|*,multitalk,*)
+    _infinitetalk_wanted=1
+    ;;
 esac
 if test -n "$_infinitetalk_wanted"; then
   echo "[infinitetalk] provisioning Comfy talking-shot runtime"
@@ -3750,6 +3790,123 @@ if test -n "$_provisioned_any"; then
     systemctl restart "comfyui-gpu${{idx}}.service"
   done
   wait_comfy_healthy
+fi
+
+if test -n "$_infinitetalk_wanted"; then
+  # Secure one-click confirms the advertised capability immediately after the
+  # staged receipt. Download the exact canonical group now, then prove the
+  # restarted Comfy runtime can actually load its nodes and audio dependencies.
+  # A fresh box therefore fails closed before broker registration/cutover rather
+  # than advertising a capability that is still warming in the background.
+  _infinitetalk_comfy_port=""
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    test "$dept" = "generation" || continue
+    _infinitetalk_comfy_port=$((COMFY_PORT_BASE + idx))
+    break
+  done
+  if test -z "$_infinitetalk_comfy_port"; then
+    echo "InfiniteTalk requires at least one generation worker" >&2
+    exit 1
+  fi
+  echo "[infinitetalk] materializing exact talking-shot asset group before cutover"
+  cd "$WORKER_MODULE_DIR"
+  COMFY_BASE_URL="http://127.0.0.1:${{_infinitetalk_comfy_port}}" \
+  COMFY_DIR="$COMFY_ROOT" \
+  INFINITETALK_PREFLIGHT_GROUP="$_infinitetalk_asset_group" \
+  INFINITETALK_REQUIRE_TWO_PERSON="$_infinitetalk_require_two_person" \
+  INFINITETALK_REQUIRE_ROOMTONE_V2="$_infinitetalk_require_roomtone_v2" \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PYTHONPATH="$WORKER_MODULE_DIR" \
+    "$WORKER_ROOT/.venv/bin/python" - <<'PY'
+import os
+
+from gpu_worker.asset_manager import ensure_asset_group
+from gpu_worker.infinitetalk import check_infinitetalk_readiness
+
+asset_group = os.environ["INFINITETALK_PREFLIGHT_GROUP"]
+require_two_person = os.environ["INFINITETALK_REQUIRE_TWO_PERSON"] == "1"
+require_roomtone_v2 = os.environ["INFINITETALK_REQUIRE_ROOMTONE_V2"] == "1"
+result = ensure_asset_group(asset_group)
+readiness = check_infinitetalk_readiness(
+    require_two_person=require_two_person,
+    require_roomtone_v2=require_roomtone_v2,
+)
+if not readiness.ready:
+    raise SystemExit(
+        "InfiniteTalk readiness failed before secure cutover: "
+        + str(readiness.as_dict())
+    )
+print(
+    "[infinitetalk] exact asset group " + asset_group
+    + " ready before secure cutover; downloaded="
+    + str(len(result.downloaded_assets))
+)
+PY
+fi
+
+# Provision-only code executes as root, which can bypass the immutable
+# candidate's read-only directory modes.  Prove that no runtime import or
+# provisioner dirtied the candidate before emitting the receipt cutover trusts.
+if ! python3 - "$WORKER_MODULE_DIR" "$WORKER_CODE_RELEASE_ID" <<'PY'
+import hashlib
+import itertools
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+release_id = sys.argv[2]
+problems = []
+
+ready = root / ".ready"
+source_marker = root / ".source-sha256"
+dependency_freeze = root / ".dependency-freeze.txt"
+dependency_marker = root / ".dependency-freeze.sha256"
+
+def regular_file(path):
+    return not path.is_symlink() and path.is_file()
+
+try:
+    ready_mode = stat.S_IMODE(ready.lstat().st_mode)
+except OSError:
+    ready_mode = None
+if not regular_file(ready) or ready_mode != 0o444:
+    problems.append("readiness marker missing or mode drifted")
+
+source_digest = source_marker.read_text().strip() if regular_file(source_marker) else ""
+if not source_digest or release_id != "sha256-" + source_digest[:24]:
+    problems.append("source marker does not match release id")
+elif regular_file(ready) and ready.read_text().strip() != source_digest:
+    problems.append("readiness marker does not match source digest")
+
+if regular_file(dependency_freeze) and regular_file(dependency_marker):
+    dependency_digest = hashlib.sha256(dependency_freeze.read_bytes()).hexdigest()
+    recorded_dependency_digest = dependency_marker.read_text().strip()
+else:
+    dependency_digest = ""
+    recorded_dependency_digest = ""
+if not dependency_digest or recorded_dependency_digest != dependency_digest:
+    problems.append("dependency snapshot missing or drifted")
+
+writable = next(
+    (
+        path
+        for path in itertools.chain((root,), root.rglob("*"))
+        if not path.is_symlink()
+        and stat.S_IMODE(path.lstat().st_mode) & 0o222
+    ),
+    None,
+)
+if writable is not None:
+    problems.append("writable path present: " + str(writable.relative_to(root) or "."))
+
+if problems:
+    raise SystemExit("immutable worker candidate failed pre-cutover seal: " + "; ".join(problems))
+PY
+then
+  echo "worker release candidate is incomplete; refusing staged receipt" >&2
+  exit 1
 fi
 
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then

@@ -209,16 +209,30 @@ def test_infinitetalk_observes_approved_mpeg_before_job_scoped_wav_normalization
     )
     audio = b"ID3" + b"approved-mpeg" * 8
     digest = hashlib.sha256(audio).hexdigest()
-    normalized = input_dir / "normalized" / "job.wav"
+    normalized = input_dir / "infinitetalk" / "g90-contract" / f"{digest}.wav"
+    monkeypatch.setattr(
+        worker_app,
+        "normalized_audio_path_for_source",
+        lambda source_digest, *, job_id: normalized,
+    )
 
     def fake_normalize(source: Path, *, job_id: str) -> Path:
         assert source.read_bytes() == audio
         assert job_id == "g90-contract"
-        normalized.parent.mkdir()
+        normalized.parent.mkdir(parents=True)
         normalized.write_bytes(b"RIFF" + b"normalized-wav")
         return normalized
 
     monkeypatch.setattr(worker_app, "normalize_approved_mpeg_to_wav", fake_normalize)
+    real_observe = worker_app.observe_staged_input_receipts
+    observed = []
+
+    def observe(payload, specs):
+        receipts = real_observe(payload, specs)
+        observed.append(receipts)
+        return receipts
+
+    monkeypatch.setattr(worker_app, "observe_staged_input_receipts", observe)
     request = RunRequest(
         job_id="g90-contract",
         asset_group="infinitetalk_v1",
@@ -235,10 +249,13 @@ def test_infinitetalk_observes_approved_mpeg_before_job_scoped_wav_normalization
         ],
     )
 
-    prepared, receipts, was_normalized = worker_app._prepare_comfy_inputs(request)
+    prepared, observer_specs = worker_app._prepare_comfy_inputs(request)
 
-    assert was_normalized is True
-    assert receipts == [
+    assert observed[0] == [
         {"node_id": "10", "input_name": "audio", "content_sha256": digest}
     ]
-    assert prepared["10"]["inputs"]["audio"] == "normalized/job.wav"
+    assert prepared["10"]["inputs"]["audio"] == str(normalized.relative_to(input_dir))
+    assert observer_specs[0].content_type == "audio/wav"
+    assert observer_specs[0].expected_sha256 == hashlib.sha256(
+        normalized.read_bytes()
+    ).hexdigest()

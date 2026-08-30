@@ -50,6 +50,14 @@ def test_flux_ipadapter_weights_are_named_for_the_xlabs_graph():
     )
 
 
+def test_two_person_infinitetalk_is_a_distinct_exact_capability():
+    assert canonical_asset_group("infinitetalk_v1") == "infinitetalk_v1"
+    assert canonical_asset_group("infinitetalk_two_person_v1") == "infinitetalk_two_person_v1"
+    assert canonical_asset_group("infinitetalk_two_person_v2") == "infinitetalk_two_person_v2"
+    assert ASSET_REGISTRY["infinitetalk_two_person_v1"] == ASSET_REGISTRY["infinitetalk_v1"]
+    assert ASSET_REGISTRY["infinitetalk_two_person_v2"] == ASSET_REGISTRY["infinitetalk_v1"]
+
+
 def test_retired_stable_audio1_aliases_are_unknown():
     # The legacy Stable Audio 1 ComfyUI path is retired (SA3 is the audio engine).
     assert canonical_asset_group("stable_audio") is None
