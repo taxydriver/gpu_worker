@@ -25,7 +25,9 @@ def test_vast_offer_gpu_count_handles_common_payload_shapes() -> None:
     assert deploy_gpu._vast_offer_gpu_count({"gpu_name": "NVIDIA RTX A6000 x2"}) == 2
     assert deploy_gpu._vast_offer_gpu_count({"gpu_name": "2x RTX A4000"}) == 2
     assert deploy_gpu._vast_offer_gpu_count({"gpu_ram": 24, "gpu_total_ram": 48}) == 2
-    assert deploy_gpu._vast_offer_gpu_count({"gpu_name": "RTX 4090"}) == 1
+    # A model name alone is not authoritative proof of count; secure deploys
+    # must refuse rather than guess one before provider mutation.
+    assert deploy_gpu._vast_offer_gpu_count({"gpu_name": "RTX 4090"}) == 0
 
 
 def test_select_vast_offer_prefers_requested_multi_gpu_offer(monkeypatch) -> None:
@@ -109,7 +111,7 @@ def test_legacy_single_worker_script_does_not_start_comfy() -> None:
     """Regression guard: the legacy remote_script never starts ComfyUI (it only
     waits for one) and pins a single worker — must NOT be used for multi-GPU."""
     script = deploy_gpu.remote_script("/workspace/filmforge_gpu_worker", 9000)
-    assert "filmforge-worker-gpu" not in script  # no per-GPU systemd units
+    assert 'cat > "/etc/systemd/system/filmforge-worker-gpu' not in script
     assert "PHYSICAL_GPU_COUNT" not in script  # not GPU-aware
 
 

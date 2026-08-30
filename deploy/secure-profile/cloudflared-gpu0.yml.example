@@ -1,0 +1,7 @@
+# Copy outside the repository, replace placeholders, and chmod 0600.
+tunnel: <stable-named-tunnel-id>
+credentials-file: /etc/filmforge/secrets/cloudflared-gpu0.json
+ingress:
+  - hostname: gpu0.example.invalid
+    service: http://127.0.0.1:9000
+  - service: http_status:404

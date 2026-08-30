@@ -223,12 +223,45 @@ def test_audio_still_triggers_on_capabilities_without_a_plan() -> None:
     assert "*,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;" in _script(None)
 
 
+def _provision_only_exit(script: str) -> int:
+    # The rehydrate body's provision-only gate (not the security stage gate at
+    # the top of the script, which also echoes WORKER_RELEASE_STAGED_ONLY).
+    return script.index("WORKER_RELEASE_STAGED_ONLY=", script.index("wait_comfy_healthy()"))
+
+
 def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
-    script = _script(PLAN)
-    provision = script.index("bash provision_infinitetalk.sh")
-    restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
-    assert provision < restart
-    assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_infinitetalk.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        rewait = script.index("wait_comfy_healthy", restart)
+        gate = _provision_only_exit(script)
+        assert provision < restart < rewait < gate
+        assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
+
+
+def test_comfy_provisioners_run_before_the_provision_only_exit() -> None:
+    # The secure one-click runs the rehydrate script twice: the provision-only
+    # pass exits at the gate, and the cutover pass is answered by the security
+    # stage gate before the body runs. Until 2026-08-22 both provisioner blocks
+    # sat AFTER the gate — dead code on the Rent button's path — and a box
+    # rented with flux_ipadapter carried the weights and 400d every render
+    # with missing_node_type. Provisioners are GPU-stack work: before the gate,
+    # followed by a Comfy restart and a second health wait.
+    for script in (_script(PLAN), _script(None)):
+        gate = _provision_only_exit(script)
+        infinitetalk = script.index("bash provision_infinitetalk.sh")
+        flux_ipadapter = script.index("bash provision_flux_ipadapter.sh")
+        assert infinitetalk < gate and flux_ipadapter < gate
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', flux_ipadapter)
+        rewait = script.index("wait_comfy_healthy", restart)
+        assert flux_ipadapter < restart < rewait < gate
+        # Neither Comfy-node provisioner survives after the gate. (The audio
+        # department block still does — provision_tts.sh / provision_sa3.sh —
+        # the same dead-code shape for an audio box on the secure path; logged,
+        # not moved here: it also installs resident systemd services.)
+        assert "bash provision_infinitetalk.sh" not in script[gate:]
+        assert "bash provision_flux_ipadapter.sh" not in script[gate:]
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:
@@ -241,6 +274,24 @@ def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> N
     # The mutating clone path is strictly after the lock acquisition, so both
     # rehydrate and asset-manager ensure calls use the same filesystem lock.
     assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
+
+
+def test_flux_ipadapter_provisioning_precedes_generation_comfy_restart() -> None:
+    # The node is only discovered at ComfyUI start, so the restart must follow
+    # the provisioner (and sit before the provision-only gate — see above).
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_flux_ipadapter.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        assert provision < restart < _provision_only_exit(script)
+        assert "*,flux_ipadapter,*|*,flux_ipadapter_v1,*|*,flux2_ipadapter,*" in script
+
+
+def test_flux_ipadapter_provisioner_is_lockstepped_and_lints() -> None:
+    provisioner = Path(deploy_gpu.__file__).with_name("provision_flux_ipadapter.sh")
+    source = provisioner.read_text()
+    subprocess.run(["bash", "-n", str(provisioner)], check=True)
+    assert 'LOCK_FILE="$COMFY/.filmforge_flux_ipadapter.provision.lock"' in source
+    assert source.index("flock -w") < source.index("node x-flux-comfyui")
 
 
 def test_hf_token_is_injected_for_a_plan_with_audio(monkeypatch, tmp_path: Path) -> None:

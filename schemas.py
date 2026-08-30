@@ -33,10 +33,12 @@ class HealthResponse(BaseModel):
     worker_name: str | None = None
     provider: str = "dedicated_worker"
     public_url: str | None = None
+    code_release_id: str | None = None
     gpu_name: str | None = None
     vram_gb: float | None = None
     capabilities: list[str] = Field(default_factory=list)
     infinitetalk_readiness: dict[str, Any] | None = None
+    flux_ipadapter_readiness: dict[str, Any] | None = None
     active_jobs: int = 0
     max_concurrent_jobs: int = 1
     download_status: dict[str, Any] | None = None
@@ -145,10 +147,24 @@ class ComfyInputFile(BaseModel):
     input_name: str = "image"
     source_path: str | None = None
     source_url: str | None = None
-    source_data: str | None = None  # base64-encoded file bytes (used when URL is not remotely reachable)
+    # Base64 bytes. Required as the sole source whenever expected_sha256 is set.
+    source_data: str | None = None
+    expected_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="Exact bytes that must be staged before prompt submission.",
+    )
     content_type: str | None = None
     type: str = "input"
     subfolder: str = ""
+
+
+class StagedInputReceipt(BaseModel):
+    """Locator-free observation of bytes actually staged for one graph input."""
+
+    node_id: str
+    input_name: str
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class ClipKeyframe(BaseModel):
@@ -178,6 +194,7 @@ class RunResponse(BaseModel):
     comfy_prompt_id: str | None
     outputs: list[str]
     output_files: list[OutputFile] = Field(default_factory=list)
+    staged_input_receipts: list[StagedInputReceipt] = Field(default_factory=list)
     # Worker-extracted keyframes for any video outputs (inline base64). The
     # backend uses these for observation instead of re-downloading + ffmpeg.
     keyframes: list[ClipKeyframes] = Field(default_factory=list)

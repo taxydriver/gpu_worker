@@ -45,6 +45,22 @@ The intended flow is:
 - Prompt completion is detected from `/history/{prompt_id}` when outputs exist or ComfyUI marks the prompt complete.
 - Errors return `ok=false` with partial timing/debug data instead of depending on exception-shaped HTTP behavior.
 
+### InfiniteTalk and concurrent-output hardening (2026-08-08)
+
+- `infinitetalk_v1` is opt-in and is advertised only when every registered weight exists, all
+  required Comfy node classes are loaded, the wav2vec Python imports succeed, and Comfy answers.
+  A capability string by itself is not readiness.
+- The provisioner installs the InfiniteTalk/MultiTalk custom-node stack and serializes concurrent
+  provision attempts. Asset downloads still come from the ordinary asset registry.
+- Approved InfiniteTalk input is currently a compatibility-proof contract: `audio/mpeg` only,
+  at most 2 MiB and 15 seconds. It is normalized to deterministic 16 kHz mono PCM WAV under a
+  losslessly encoded, bounded, job-owned input directory.
+- WAN SaveVideo output prefixes now derive from the durable backend Job namespace. This prevents
+  concurrent Comfy processes sharing `/workspace/ComfyUI/output` from returning one another's
+  media—the failure observed on S3 Jobs `7763d0e8-…` and `e2ea4ca5-…`.
+- These are worker compatibility and isolation guarantees. They do not expose a FilmForge
+  talking-shot product route; that missing backend/MCP seam is G90.
+
 ## Environment Variables
 
 The worker reads these env vars:
@@ -60,6 +76,10 @@ The worker reads these env vars:
 - `COMFY_OUTPUT_DIR` default: `/workspace/ComfyUI/output`
 - `COMFY_TEMP_DIR` optional additional served root for temp outputs
 - `COMFY_INPUT_DIR` default: `/workspace/ComfyUI/input`
+- `COMFY_DIR` default: `/workspace/ComfyUI` (used for the Comfy venv/readiness check)
+- `WORKER_CAPABILITIES` comma-separated opt-in capabilities; use canonical
+  `infinitetalk_v1` for talking-shot compatibility
+- `INFINITETALK_PROVISION_LOCK_TIMEOUT_SEC` default: `1800`
 
 ## Important Setup Notes
 
@@ -73,7 +93,7 @@ The worker reads these env vars:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r gpu_worker/requirements.txt
+pip install -r gpu_worker/requirements.lock
 ```
 
 ## Deploy To Vast
@@ -247,7 +267,15 @@ Returns:
   "worker_ok": true,
   "comfy_reachable": true,
   "comfy_base_url": "http://127.0.0.1:8188",
-  "known_asset_groups": ["flux_stills_v1", "juggernaut_stills_v1", "stable_audio_v1", "wan_i2v_v1"]
+  "known_asset_groups": ["flux_stills_v1", "infinitetalk_v1", "juggernaut_stills_v1", "stable_audio_v1", "wan_i2v_v1"],
+  "capabilities": ["infinitetalk_v1"],
+  "infinitetalk_readiness": {
+    "ready": true,
+    "missing_files": [],
+    "missing_node_classes": [],
+    "wav2vec_dependency_error": null,
+    "comfy_error": null
+  }
 }
 ```
 
@@ -376,6 +404,8 @@ Optional request field for remote WAN or other worker-staged inputs:
 - Rich output typing beyond best-effort file path extraction.
 - Production-grade ComfyUI lifecycle management through systemd, Docker, Kubernetes, or supervisor.
 - Workflow validation or any FilmForge cinematic/planning logic.
+- A backend/MCP `render_talking_shot` action, G88/G87 dialogue-line validation, or FilmForge
+  artifact approval. Those belong above the worker and are tracked as G90.
 
 ## Remote Worker Output Bridge
 

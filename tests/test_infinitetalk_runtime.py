@@ -45,7 +45,7 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
         lambda: runtime.InfiniteTalkReadiness(ready=False, missing_files=("missing",)),
     )
 
-    capabilities, readiness = app._advertised_capabilities()
+    capabilities, readiness, flux_ipadapter_readiness = app._advertised_capabilities()
 
     assert capabilities == ["wan_i2v_v1"]
     assert readiness == {
@@ -55,6 +55,7 @@ def test_unready_infinitetalk_is_withheld_from_advertisement(monkeypatch):
         "wav2vec_dependency_error": None,
         "comfy_error": None,
     }
+    assert flux_ipadapter_readiness is None  # not declared → not probed
 
 
 def _write_pcm_wav(path: Path, *, seconds: float = 2.0) -> None:

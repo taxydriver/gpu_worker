@@ -200,6 +200,39 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
     # I/O: 81 frames in, 832x480 out. An OPTION, never the default (director ruling
     # 2026-07-24: slight degradation vs the master; WAN-native prompt keeps full master
     # resolution for depth-axis moves). URLs verified 302 on HF 2026-08-10.
+    # Flux2 IPAdapter — the reference path that conditions on a FACE rather than
+    # on composition. A SEPARATE group from flux_stills_v1 on purpose: these
+    # weights and the XLabs custom node are an opt-in capability, and folding
+    # them into flux_stills would make every stills box carry them.
+    #
+    # This group exists because `flux2_ipadapter` used to resolve to
+    # flux_stills_v1, so the backend believed the capability was present on any
+    # stills box and routed to it — and the render 400d with `missing_node_type`
+    # because the node had never been provisioned anywhere. An asset group must
+    # mean "this box can actually do this".
+    #
+    # v2 of the adapter: the v1 path (XLabs-AI/flux-ip-adapter/flux-ip-adapter
+    # .safetensors) 404s as of 2026-08-22; v2 verified 200 the same day.
+    #
+    # The on-disk FILENAMES are a contract with the backend graph
+    # (backend app/workflows/flux2_stills_xlabs_ipa.json, node LoadFluxIPAdapter):
+    # ComfyUI lists this directory and the graph names a file in it, so a
+    # rename on either side is a `value not in list` 400 on the first render.
+    # The encoder must be OpenAI CLIP ViT-L/14: XLabs' FluxClipViT loads the
+    # file against a hard-coded ViT-L config, and its projection model takes
+    # 768-dim image embeds — a bigG file (1280-dim) cannot feed it.
+    "flux_ipadapter_v1": [
+        {
+            "name": "flux_ip_adapter_v2",
+            "path": "/workspace/ComfyUI/models/xlabs/ipadapters/flux-ip-adapter-v2.safetensors",
+            "url": "https://huggingface.co/XLabs-AI/flux-ip-adapter-v2/resolve/main/ip_adapter.safetensors",
+        },
+        {
+            "name": "clip_vision_large",
+            "path": "/workspace/ComfyUI/models/clip_vision/clip-vit-large-patch14.safetensors",
+            "url": "https://huggingface.co/openai/clip-vit-large-patch14/resolve/main/model.safetensors",
+        },
+    ],
     "recammaster_v1": [
         {
             "name": "recammaster_1_3b",
@@ -247,6 +280,8 @@ PROVISIONERS: dict[str, str] = {
     "infinitetalk_v1": "gpu_worker/provision_infinitetalk.sh",
     # Same shape as infinitetalk: file downloads above + the WanVideoWrapper custom node.
     "recammaster_v1": "gpu_worker/provision_recammaster.sh",
+    # Weights above + the XLabs custom node that provides LoadFluxIPAdapter.
+    "flux_ipadapter_v1": "gpu_worker/provision_flux_ipadapter.sh",
 }
 
 
@@ -293,6 +328,16 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "recammaster": ["recammaster_v1"],
     "reshoot_camera": ["recammaster_v1"],
     "recammaster_v1": ["recammaster_v1"],
+    # Opt-in: XLabs Flux IPAdapter (reference conditioning on a FACE).
+    # Deliberately NOT implied by flux2_stills — separate weights plus a custom
+    # node. This alias row is load-bearing: the worker canonicalises
+    # WORKER_CAPABILITIES through this table, so without it the token the
+    # backend emits for the rent selection was dropped and the box advertised
+    # only flux_stills_v1 — the group sat in known_asset_groups and never in
+    # capabilities (observed 2026-08-22).
+    "flux_ipadapter": ["flux_ipadapter_v1"],
+    "flux2_ipadapter": ["flux_ipadapter_v1"],
+    "flux_ipadapter_v1": ["flux_ipadapter_v1"],
 }
 
 

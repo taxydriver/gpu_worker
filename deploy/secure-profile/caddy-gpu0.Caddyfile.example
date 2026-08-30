@@ -1,0 +1,4 @@
+# Copy outside the repository, replace only the hostname, and chmod 0600.
+gpu-worker.anapana.ai {
+    reverse_proxy http://127.0.0.1:9000
+}

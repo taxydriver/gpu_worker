@@ -3,16 +3,23 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
+import hashlib
+import ipaddress
 import logging
 import os
 from pathlib import Path
+import secrets
 import shutil
+import socket
 import time
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlsplit
 
 import requests
+from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.util import Timeout
 
 from gpu_worker.config import get_settings
 from gpu_worker.schemas import ComfyInputFile, OutputFile
@@ -23,6 +30,236 @@ LOGGER = logging.getLogger(__name__)
 PROMPT_LOGGER = logging.getLogger("gpu_worker.prompts")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_MAX_PROTECTED_INPUT_BYTES = 20 * 1024 * 1024
+_MAX_REMOTE_INPUT_BYTES = 64 * 1024 * 1024
+_REMOTE_INPUT_CONNECT_TIMEOUT_SEC = 5
+_REMOTE_INPUT_READ_TIMEOUT_SEC = 30
+_REMOTE_IMAGE_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+}
+_REMOTE_AUDIO_TYPES = {
+    "audio/mpeg",
+    "audio/wav",
+    "audio/x-wav",
+}
+_REMOTE_VIDEO_TYPES = {
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+}
+_REMOTE_INPUT_TYPES = _REMOTE_IMAGE_TYPES | _REMOTE_AUDIO_TYPES | _REMOTE_VIDEO_TYPES
+_BLOCKED_METADATA_HOSTS = {
+    "metadata",
+    "metadata.google.internal",
+    "instance-data",
+    "instance-data.ec2.internal",
+}
+
+
+class _RemoteInputRejected(RuntimeError):
+    """Locator-free failure for a rejected or failed remote input fetch."""
+
+
+@dataclass(frozen=True)
+class _ValidatedRemoteTarget:
+    """A URL bound to one DNS-vetted public connect address."""
+
+    scheme: str
+    hostname: str
+    port: int
+    connect_ip: str
+    host_header: str
+    request_target: str
+
+
+def _reject_remote_input(reason: str) -> None:
+    LOGGER.warning("Remote input rejected reason=%s", reason)
+    raise _RemoteInputRejected(f"Remote input rejected: {reason}") from None
+
+
+def _normalized_allowed_input_hosts() -> set[str]:
+    settings = get_settings()
+    resolver = getattr(settings, "resolved_input_url_allowed_hosts", None)
+    if callable(resolver):
+        raw_hosts = resolver()
+    else:
+        raw_hosts = {
+            value.strip().lower().rstrip(".")
+            for value in str(
+                getattr(settings, "worker_input_url_allowed_hosts", "") or ""
+            ).split(",")
+            if value.strip().rstrip(".")
+        }
+    normalized: set[str] = set()
+    for raw_host in raw_hosts:
+        try:
+            normalized.add(str(raw_host).encode("idna").decode("ascii").lower())
+        except (UnicodeError, ValueError):
+            continue
+    return normalized
+
+
+def _validate_remote_input_url(source_url: str) -> _ValidatedRemoteTarget:
+    """Validate one allowlisted public URL before opening any connection."""
+
+    try:
+        parsed = urlsplit(str(source_url or ""))
+        port = parsed.port
+    except (TypeError, ValueError):
+        _reject_remote_input("invalid_url")
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        _reject_remote_input("invalid_scheme")
+    if parsed.username is not None or parsed.password is not None:
+        _reject_remote_input("userinfo_forbidden")
+    if parsed.fragment:
+        _reject_remote_input("fragment_forbidden")
+    if not parsed.hostname:
+        _reject_remote_input("hostname_required")
+
+    try:
+        host = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except (UnicodeError, ValueError):
+        _reject_remote_input("invalid_hostname")
+    if not host or host in _BLOCKED_METADATA_HOSTS:
+        _reject_remote_input("blocked_hostname")
+    if "%" in host or ":" in host:
+        _reject_remote_input("ip_literal_forbidden")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        _reject_remote_input("ip_literal_forbidden")
+
+    labels = host.split(".")
+    if (
+        len(host) > 253
+        or not any(character.isalpha() for character in host)
+        or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not label.replace("-", "").isalnum()
+            for label in labels
+        )
+    ):
+        _reject_remote_input("invalid_hostname")
+    if host not in _normalized_allowed_input_hosts():
+        _reject_remote_input("host_not_allowed")
+
+    resolved_port = port or (443 if parsed.scheme.lower() == "https" else 80)
+    if not 1 <= resolved_port <= 65535:
+        _reject_remote_input("invalid_port")
+    try:
+        address_info = socket.getaddrinfo(
+            host,
+            resolved_port,
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, UnicodeError):
+        _reject_remote_input("dns_failed")
+    if not address_info:
+        _reject_remote_input("dns_failed")
+    vetted_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for _family, _socktype, _proto, _canonname, sockaddr in address_info:
+        address_text = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            _reject_remote_input("dns_invalid_address")
+        mapped = getattr(address, "ipv4_mapped", None)
+        if not address.is_global or (mapped is not None and not mapped.is_global):
+            _reject_remote_input("dns_non_public_address")
+        vetted_addresses.append(address)
+    connect_address = min(
+        set(vetted_addresses),
+        key=lambda address: (address.version, int(address)),
+    )
+    scheme = parsed.scheme.lower()
+    default_port = 443 if scheme == "https" else 80
+    host_header = host if resolved_port == default_port else f"{host}:{resolved_port}"
+    request_target = parsed.path or "/"
+    if parsed.query:
+        request_target = f"{request_target}?{parsed.query}"
+    return _ValidatedRemoteTarget(
+        scheme=scheme,
+        hostname=host,
+        port=resolved_port,
+        connect_ip=str(connect_address),
+        host_header=host_header,
+        request_target=request_target,
+    )
+
+
+def _pinned_http_timeout(connect_timeout: float, read_timeout: float) -> Timeout:
+    return Timeout(connect=connect_timeout, read=read_timeout)
+
+
+def _open_pinned_http_pool(
+    target: _ValidatedRemoteTarget,
+    *,
+    connect_timeout: float,
+    read_timeout: float,
+):
+    """Open a direct pool whose socket target cannot trigger another DNS lookup."""
+
+    timeout = _pinned_http_timeout(connect_timeout, read_timeout)
+    common = {
+        "port": target.port,
+        "timeout": timeout,
+        "maxsize": 1,
+        "block": True,
+    }
+    if target.scheme == "https":
+        return HTTPSConnectionPool(
+            target.connect_ip,
+            assert_hostname=target.hostname,
+            server_hostname=target.hostname,
+            cert_reqs="CERT_REQUIRED",
+            ca_certs=requests.certs.where(),
+            **common,
+        )
+    return HTTPConnectionPool(target.connect_ip, **common)
+
+
+def _allowed_remote_content_types(file_spec: ComfyInputFile) -> set[str]:
+    declared = str(file_spec.content_type or "").split(";", 1)[0].strip().lower()
+    if declared:
+        return {declared} if declared in _REMOTE_INPUT_TYPES else set()
+    if _requires_image_validation(file_spec):
+        return _REMOTE_IMAGE_TYPES
+    suffix = Path(str(file_spec.filename or "")).suffix.lower()
+    if suffix in {".mp3"} or str(file_spec.input_name).lower() == "audio":
+        return _REMOTE_AUDIO_TYPES
+    if suffix in {".mp4", ".mov", ".webm"} or str(file_spec.input_name).lower() == "video":
+        return _REMOTE_VIDEO_TYPES
+    return _REMOTE_INPUT_TYPES
+
+
+def _open_private_staging_file(destination: Path):
+    """Create a private, non-following temporary file beside destination."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for _attempt in range(8):
+        temporary = destination.parent / (
+            f".filmforge-input-{secrets.token_hex(16)}.part"
+        )
+        try:
+            descriptor = os.open(temporary, flags, 0o600)
+        except FileExistsError:
+            continue
+        return temporary, os.fdopen(descriptor, "wb")
+    raise RuntimeError("Could not create private input staging file")
 
 
 def _comfy_url(path: str) -> str:
@@ -400,29 +637,102 @@ def _resolve_local_input_source(source_path: str) -> Path:
     raise ValueError(f"Input source path is outside allowed roots: {candidate}")
 
 
-def _download_input_source(source_url: str, destination: Path) -> None:
-    """Download an external file into the ComfyUI input directory."""
+def _download_input_source(
+    source_url: str,
+    destination: Path,
+    file_spec: ComfyInputFile,
+) -> None:
+    """Fetch one allowlisted public media input with bounded streaming."""
 
-    parsed = urlparse(source_url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError(f"Unsupported input source URL: {source_url}")
+    target = _validate_remote_input_url(source_url)
+    allowed_content_types = _allowed_remote_content_types(file_spec)
+    if not allowed_content_types:
+        _reject_remote_input("content_type_not_allowed")
 
-    temp_path = Path(f"{destination}.part")
-    safe_unlink(temp_path)
+    temp_path: Path | None = None
+    handle = None
+    pool = None
+    response = None
     try:
-        with requests.get(source_url, stream=True, timeout=(10, 300)) as response:
-            response.raise_for_status()
-            with temp_path.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=get_settings().download_chunk_size):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
+        pool = _open_pinned_http_pool(
+            target,
+            connect_timeout=_REMOTE_INPUT_CONNECT_TIMEOUT_SEC,
+            read_timeout=_REMOTE_INPUT_READ_TIMEOUT_SEC,
+        )
+        response = pool.request(
+            "GET",
+            target.request_target,
+            headers={"Host": target.host_header},
+            redirect=False,
+            retries=False,
+            preload_content=False,
+        )
+        if 300 <= response.status < 400:
+            _reject_remote_input("redirect_forbidden")
+        if not 200 <= response.status < 300:
+            _reject_remote_input("http_status")
+
+        response_content_type = str(
+            response.headers.get("Content-Type") or ""
+        ).split(";", 1)[0].strip().lower()
+        if response_content_type not in allowed_content_types:
+            _reject_remote_input("content_type_mismatch")
+        content_encoding = str(
+            response.headers.get("Content-Encoding") or "identity"
+        ).strip().lower()
+        if content_encoding not in {"", "identity"}:
+            _reject_remote_input("content_encoding_forbidden")
+
+        content_length = str(response.headers.get("Content-Length") or "").strip()
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                _reject_remote_input("invalid_content_length")
+            if declared_length < 0 or declared_length > _MAX_REMOTE_INPUT_BYTES:
+                _reject_remote_input("body_too_large")
+
+        temp_path, handle = _open_private_staging_file(destination)
+        total_bytes = 0
+        chunk_size = min(max(1, get_settings().download_chunk_size), 1024 * 1024)
+        for chunk in response.stream(amt=chunk_size, decode_content=False):
+            if not chunk:
+                continue
+            total_bytes += len(chunk)
+            if total_bytes > _MAX_REMOTE_INPUT_BYTES:
+                _reject_remote_input("body_too_large")
+            handle.write(chunk)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        handle = None
         if not is_non_empty_file(temp_path):
-            raise RuntimeError(f"Downloaded input file is empty: {destination.name}")
+            _reject_remote_input("empty_body")
+        _ensure_valid_staged_input(temp_path, file_spec, "Downloaded")
         os.replace(temp_path, destination)
-    except Exception:
-        safe_unlink(temp_path)
+        temp_path = None
+    except _RemoteInputRejected:
         raise
+    except Exception:
+        raise _RemoteInputRejected("Remote input fetch failed") from None
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        if pool is not None:
+            try:
+                pool.close()
+            except Exception:
+                pass
+        if temp_path is not None:
+            safe_unlink(temp_path)
 
 
 def _is_supported_image_file(path: Path) -> bool:
@@ -454,17 +764,28 @@ def _requires_image_validation(file_spec: ComfyInputFile) -> bool:
 
 
 def _is_valid_staged_input(path: Path, file_spec: ComfyInputFile) -> bool:
-    if not _requires_image_validation(file_spec):
-        return is_non_empty_file(path)
-    return _is_supported_image_file(path)
+    valid_container = (
+        _is_supported_image_file(path)
+        if _requires_image_validation(file_spec)
+        else is_non_empty_file(path)
+    )
+    if not valid_container:
+        return False
+    expected = str(file_spec.expected_sha256 or "").strip().lower()
+    if not expected:
+        return True
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest() == expected
+    except OSError:
+        return False
 
 
 def _ensure_valid_staged_input(path: Path, file_spec: ComfyInputFile, action: str) -> None:
     if _is_valid_staged_input(path, file_spec):
         return
     if _requires_image_validation(file_spec):
-        raise RuntimeError(f"{action} input file is not a valid image: {path.name}")
-    raise RuntimeError(f"{action} input file is empty: {path.name}")
+        raise RuntimeError(f"{action} input file is not a valid image")
+    raise RuntimeError(f"{action} input file is empty")
 
 
 def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) -> Path:
@@ -483,10 +804,51 @@ def _resolve_input_destination(file_spec: ComfyInputFile, staged_filename: str) 
     return destination_dir / staged_filename
 
 
+def _decode_inline_source_data(source_data: str) -> bytes:
+    import base64 as _base64
+
+    try:
+        encoded = source_data.encode("ascii", errors="strict")
+    except UnicodeError:
+        raise RuntimeError("Decoded source_data is invalid") from None
+    max_encoded = ((_MAX_PROTECTED_INPUT_BYTES + 2) // 3) * 4 + 4
+    if len(encoded) > max_encoded:
+        raise RuntimeError("Decoded source_data exceeds protected input byte limit")
+    try:
+        decoded = _base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise RuntimeError("Decoded source_data is invalid") from None
+    if len(decoded) > _MAX_PROTECTED_INPUT_BYTES:
+        raise RuntimeError("Decoded source_data exceeds protected input byte limit")
+    return decoded
+
+
 def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
     """Stage one file into ComfyUI input and return the LoadImage path."""
 
-    staged_filename = Path(file_spec.filename).name
+    original_filename = Path(file_spec.filename).name
+    expected = str(file_spec.expected_sha256 or "").strip().lower()
+    if expected and (
+        not file_spec.source_data
+        or file_spec.source_url
+        or file_spec.source_path
+    ):
+        raise RuntimeError("Attested input requires inline source_data only")
+    decoded_inline = (
+        _decode_inline_source_data(file_spec.source_data)
+        if file_spec.source_data
+        else None
+    )
+    if expected and hashlib.sha256(decoded_inline or b"").hexdigest() != expected:
+        raise RuntimeError("Attested input content digest mismatch")
+    suffix = Path(original_filename).suffix.lower()
+    if expected:
+        # A generic ordinal (candidate_reference_1.png) can retain another
+        # job's pixels in ComfyUI's persistent input directory. Address the
+        # staged file by the full expected content digest instead.
+        staged_filename = f"sha256_{expected}{suffix or '.bin'}"
+    else:
+        staged_filename = original_filename
     if not staged_filename:
         raise ValueError(f"Invalid comfy input filename: {file_spec.filename!r}")
 
@@ -495,16 +857,42 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
     destination = _resolve_input_destination(file_spec, staged_filename)
     destination_dir = destination.parent
     destination_dir.mkdir(parents=True, exist_ok=True)
-    if _is_valid_staged_input(destination, file_spec):
+    if destination.is_symlink():
+        LOGGER.warning("Removing unsafe staged Comfy input symlink")
+        safe_unlink(destination)
+    valid_existing = _is_valid_staged_input(destination, file_spec)
+    has_explicit_source = bool(
+        file_spec.source_data or file_spec.source_path or file_spec.source_url
+    )
+    if valid_existing and (expected or not has_explicit_source):
         return staged_input_path
     if destination.exists():
-        LOGGER.warning("Replacing invalid staged Comfy input: %s", destination)
+        LOGGER.warning("Replacing invalid staged Comfy input")
         safe_unlink(destination)
 
     if file_spec.source_data:
-        import base64 as _base64
-        destination.write_bytes(_base64.b64decode(file_spec.source_data))
-        _ensure_valid_staged_input(destination, file_spec, "Decoded source_data")
+        assert decoded_inline is not None
+        temporary = None
+        handle = None
+        try:
+            temporary, handle = _open_private_staging_file(destination)
+            handle.write(decoded_inline)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            _ensure_valid_staged_input(temporary, file_spec, "Decoded source_data")
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+            if temporary is not None:
+                safe_unlink(temporary)
+        _ensure_valid_staged_input(destination, file_spec, "Staged source_data")
         return staged_input_path
 
     if file_spec.source_path:
@@ -517,11 +905,45 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
         return staged_input_path
 
     if file_spec.source_url:
-        _download_input_source(file_spec.source_url, destination)
+        _download_input_source(file_spec.source_url, destination, file_spec)
         _ensure_valid_staged_input(destination, file_spec, "Downloaded")
         return staged_input_path
 
     raise ValueError(f"Comfy input file has no usable source: {file_spec}")
+
+
+def observe_staged_input_receipts(
+    comfy_payload: dict[str, Any],
+    input_files: list[ComfyInputFile],
+) -> list[dict[str, str]]:
+    """Re-hash graph-bound staged files immediately before prompt submission."""
+
+    receipts: list[dict[str, str]] = []
+    input_root = comfy_input_dir()
+    for file_spec in input_files:
+        node = comfy_payload.get(file_spec.node_id)
+        inputs = node.get("inputs") if isinstance(node, dict) else None
+        staged_name = inputs.get(file_spec.input_name) if isinstance(inputs, dict) else None
+        if not isinstance(staged_name, str) or not staged_name:
+            raise RuntimeError("Staged Comfy input is missing from graph")
+        staged = (input_root / staged_name).resolve(strict=False)
+        try:
+            staged.relative_to(input_root)
+        except ValueError as exc:
+            raise RuntimeError("Staged Comfy input escapes input directory") from exc
+        _ensure_valid_staged_input(staged, file_spec, "Observed staged")
+        digest = hashlib.sha256(staged.read_bytes()).hexdigest()
+        expected = str(file_spec.expected_sha256 or "").strip().lower()
+        if expected and digest != expected:
+            raise RuntimeError("Observed staged input digest mismatch")
+        receipts.append(
+            {
+                "node_id": str(file_spec.node_id),
+                "input_name": str(file_spec.input_name),
+                "content_sha256": digest,
+            }
+        )
+    return receipts
 
 
 def apply_comfy_input_files(
