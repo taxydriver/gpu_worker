@@ -1,0 +1,27 @@
+name: GPU worker CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - production
+      - "codex/**"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install pinned runtime and test dependencies
+        run: python -m pip install -r requirements.lock pytest
+      - name: Run deployment gate
+        run: scripts/ci_gate.sh
