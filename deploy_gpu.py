@@ -3103,6 +3103,44 @@ dept_for_idx() {{
   fi
 }}
 
+# ── Reconcile restored systemd units to the requested physical topology ──────
+# These units live on the persistent OS volume.  Shrinking a previously
+# two-GPU deployment to one GPU used to leave gpu1 enabled at boot, where
+# CUDA_VISIBLE_DEVICES=1 crash-looped forever on a one-GPU A100.  Disable every
+# unit outside this deployment's GPU/department plan before any runtime starts.
+_disable_stale_gpu_unit() {{
+  unit="$1"
+  reason="$2"
+  echo "[verda] disabling stale $unit — $reason" >&2
+  systemctl disable --now "$unit" >/dev/null 2>&1 || true
+}}
+
+for unit_path in /etc/systemd/system/comfyui-gpu*.service; do
+  test -e "$unit_path" || continue
+  unit="$(basename "$unit_path")"
+  idx="${{unit#comfyui-gpu}}"
+  idx="${{idx%.service}}"
+  case "$idx" in ''|*[!0-9]*) continue ;; esac
+  if test "$idx" -ge "$GPU_COUNT"; then
+    _disable_stale_gpu_unit "$unit" "gpu index is outside requested GPU_COUNT=$GPU_COUNT"
+  elif test "$(dept_for_idx "$idx")" != "generation"; then
+    _disable_stale_gpu_unit "$unit" "gpu${{idx}} is not a generation department"
+  fi
+done
+
+for unit_path in /etc/systemd/system/filmforge-worker-gpu*.service; do
+  test -e "$unit_path" || continue
+  unit="$(basename "$unit_path")"
+  idx="${{unit#filmforge-worker-gpu}}"
+  idx="${{idx%.service}}"
+  case "$idx" in ''|*[!0-9]*) continue ;; esac
+  if test "$idx" -ge "$GPU_COUNT"; then
+    _disable_stale_gpu_unit "$unit" "gpu index is outside requested GPU_COUNT=$GPU_COUNT"
+  elif test "$(dept_for_idx "$idx")" = "none"; then
+    _disable_stale_gpu_unit "$unit" "gpu${{idx}} department is disabled"
+  fi
+done
+
 # Capabilities a GPU advertises, by department. Generation honors an explicit
 # WORKER_CAPABILITIES override (that's how the rent UI narrows a render box);
 # vision/audio are fixed sets — their capability IS their department.

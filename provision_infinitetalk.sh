@@ -47,7 +47,11 @@ node ComfyUI-VideoHelperSuite https://github.com/Kosinkadink/ComfyUI-VideoHelper
 # These back the wav2vec audio embedding path in the wrapper's talking nodes.
 # A partial install must fail provisioning; readiness otherwise withholds the
 # capability, but a successful provision must mean its dependency set exists.
-$PIP -q soundfile librosa transformers
+# Keep the ComfyUI-wide compatibility ceiling installed by deploy_gpu.py.
+# transformers 5.x stopped returning Wav2Vec2 encoder hidden states from the
+# API shape used by WanVideoWrapper's MultiTalk audio embed node, so an
+# unbounded install here makes every InfiniteTalk graph fail before sampling.
+$PIP -q soundfile librosa 'transformers<5'
 
 # --- two-speaker closure-staleness patch --------------------------------------
 # Any human_num==2 render (MultiTalk two-shot) dies at the first sampling step

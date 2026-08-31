@@ -18,11 +18,12 @@ PLAN = list(deploy_gpu.DEFAULT_4GPU_WORKER_PLAN)
 
 
 def _script(plan: list[str] | None = None, **kwargs) -> str:
+    worker_count = kwargs.pop("worker_count", 0)
     return deploy_gpu.verda_rehydrate_script(
         public_ip="203.0.113.9",
         worker_port=9000,
         comfy_port=8188,
-        worker_count=0,
+        worker_count=worker_count,
         remote_root="/opt/filmforge_gpu_worker",
         worker_plan=plan,
         **kwargs,
@@ -213,6 +214,20 @@ def test_stale_resident_services_are_stopped_before_comfyui_starts() -> None:
     assert '*,tts_dialogue,*|*,stable_audio3,*) _wants_audio=1 ;;' in script
 
 
+def test_topology_shrink_disables_surplus_gpu_units_before_comfyui_starts() -> None:
+    script = _script(None, worker_count=1)
+
+    guard = script.index("_disable_stale_gpu_unit")
+    comfy_start = script.index('systemctl enable --now "comfyui-gpu')
+    assert guard < comfy_start
+    assert "WORKER_COUNT_REQUESTED=1" in script
+    assert "/etc/systemd/system/comfyui-gpu*.service" in script
+    assert "/etc/systemd/system/filmforge-worker-gpu*.service" in script
+    assert 'test "$idx" -ge "$GPU_COUNT"' in script
+    assert 'test "$(dept_for_idx "$idx")" != "generation"' in script
+    assert 'test "$(dept_for_idx "$idx")" = "none"' in script
+
+
 def test_stale_resident_guard_is_present_without_a_plan() -> None:
     # The no-plan case is the one that bit: 4 generation workers with a live vLLM.
     assert "_stop_stale_resident filmforge-vllm" in _script(None)
@@ -274,6 +289,11 @@ def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> N
     # The mutating clone path is strictly after the lock acquisition, so both
     # rehydrate and asset-manager ensure calls use the same filesystem lock.
     assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
+    # Asset-group provisioning must not undo deploy_gpu.py's ComfyUI-wide
+    # compatibility ceiling: transformers 5.x removes the Wav2Vec2 hidden-state
+    # return shape consumed by WanVideoWrapper's InfiniteTalk audio node.
+    assert "$PIP -q soundfile librosa 'transformers<5'" in source
+    assert "$PIP -q soundfile librosa transformers\n" not in source
 
 
 def test_flux_ipadapter_provisioning_precedes_generation_comfy_restart() -> None:
