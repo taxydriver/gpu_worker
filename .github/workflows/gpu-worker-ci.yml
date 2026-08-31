@@ -21,6 +21,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Install ffmpeg runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg
       - name: Install pinned runtime and test dependencies
         run: python -m pip install -r requirements.lock pytest
       - name: Run deployment gate
