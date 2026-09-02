@@ -135,6 +135,51 @@ threading.Thread(
 ).start()
 
 _STILL_ASSET_GROUPS = {"flux_stills_v1"}
+
+
+def _assert_material_outputs(asset_group: str, outputs, output_files) -> None:
+    """Success means a real, readable artifact exists — never just history."""
+    if not outputs:
+        raise RuntimeError("artifact_missing: ComfyUI completed with no output paths")
+    if not output_files:
+        raise RuntimeError(
+            "artifact_missing: ComfyUI output paths resolved to no served files"
+        )
+    for output in output_files:
+        path = Path(str(output.path))
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise RuntimeError(
+                f"artifact_missing: output is absent or empty ({output.filename})"
+            )
+    if canonical_asset_group(asset_group) in _STILL_ASSET_GROUPS:
+        readable = False
+        for output in output_files:
+            try:
+                path = Path(str(output.path))
+                data = path.read_bytes()
+                # Dependency-free structural check: the worker API venv need
+                # not carry Comfy's Pillow install. PNG dimensions live in the
+                # fixed IHDR bytes; JPEG/WebP keep unambiguous bookends/magic.
+                if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+                    readable = int.from_bytes(data[16:20], "big") > 0 and int.from_bytes(
+                        data[20:24], "big"
+                    ) > 0
+                elif data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"):
+                    readable = True
+                elif (
+                    len(data) >= 12
+                    and data[:4] == b"RIFF"
+                    and data[8:12] == b"WEBP"
+                ):
+                    readable = True
+                if readable:
+                    break
+            except Exception:  # noqa: BLE001 — inspect every reported output
+                continue
+        if not readable:
+            raise RuntimeError(
+                "artifact_invalid: still workflow produced no readable image"
+            )
 _VIDEO_ASSET_GROUPS = {"wan_i2v_v1", "infinitetalk_v1"}
 _FINALIZATION_BUFFER_SEC = 10.0
 _BASE_STILL_SEC = 60.0
@@ -1644,6 +1689,7 @@ def _execute_run(request: RunRequest, progress: JobProgressResponse | None = Non
 
         outputs = collect_output_paths(history)
         output_files = build_output_files(outputs)
+        _assert_material_outputs(request.asset_group, outputs, output_files)
 
         # Extract observation keyframes here (the worker has the video on disk +
         # ffmpeg) so the backend never re-downloads + ffmpeg-decodes the clip.
