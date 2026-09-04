@@ -111,9 +111,22 @@ def test_rehydrate_requires_an_initialized_ext4_data_volume() -> None:
 def test_rehydrate_repairs_nvswitch_fabric_startup_race_once() -> None:
     script = _script(PLAN)
 
-    assert "test -e /dev/nvidia-nvswitchctl" in script
+    assert "nvidia-smi -q" in script
+    assert "grep -qi 'NVSwitch'" in script
+    assert "test -e /dev/nvidia-nvswitchctl" not in script
     assert "timeout 180 systemctl restart nvidia-fabricmanager.service" in script
     assert "provider-side GPU fabric fault" in script
+
+
+def test_rehydrate_selects_torch_wheel_from_gpu_generation_and_diagnoses_cuda() -> None:
+    script = _script(PLAN)
+
+    assert "--query-gpu=compute_cap" in script
+    assert '1[0-9]|[2-9][0-9]) _target_torch_cuda_major="13"' in script
+    assert '[0-9]) _target_torch_cuda_major="12"' in script
+    assert "PyTorch verification: wheel=" in script
+    assert "torch wheel has no usable CUDA on this non-NVSwitch GPU" in script
+    assert "nvidia-smi >&2 || true" in script
 
 
 def test_plan_reaches_the_script() -> None:

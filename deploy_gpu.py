@@ -3423,24 +3423,31 @@ nvidia-smi -pm 1 >/dev/null 2>&1 || true
 # load and ComfyUI crashes with "operator torchvision::nms does not exist".
 # Detect the mismatch and repair in both directions.
 _cuda_driver_major="$(nvidia-smi 2>/dev/null | grep -oE 'CUDA Version: [0-9]+' | grep -oE '[0-9]+$' | head -1 || echo '')"
+_gpu_compute_cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 2>/dev/null | head -1 | tr -d '[:space:]' || echo '')"
+_gpu_compute_major="${{_gpu_compute_cap%%.*}}"
 _torch_cuda_ver="$("$COMFY_ROOT/.venv/bin/python" -c \
   'import torch; v=getattr(torch.version,"cuda","") or ""; print(v.split(".")[0] if v else "")' \
   2>/dev/null || echo '')"
 _torch_cuda_ver="$(echo "$_torch_cuda_ver" | tr -d '[:space:]')"
 _cuda_driver_major="$(echo "$_cuda_driver_major" | tr -d '[:space:]')"
 
-case "$_cuda_driver_major" in
+# nvidia-smi's "CUDA Version" is the maximum the DRIVER supports, not the
+# wheel this GPU generation needs.  An Ampere A6000 under a CUDA-13 driver must
+# keep the stable cu128 wheel; treating it as Blackwell and forcing cu130 is the
+# G162 failure.  Compute capability is the hardware authority (Blackwell >=10).
+case "$_gpu_compute_major" in
+  1[0-9]|[2-9][0-9]) _target_torch_cuda_major="13" ;;
+  [0-9]) _target_torch_cuda_major="12" ;;
+  *) _target_torch_cuda_major="$_cuda_driver_major" ;;
+esac
+case "$_target_torch_cuda_major" in
   13) _pytorch_index="https://download.pytorch.org/whl/cu130" ;;
   12) _pytorch_index="https://download.pytorch.org/whl/cu128" ;;
   *)  _pytorch_index="" ;;
 esac
 
-if test "$_cuda_driver_major" = "13" && test "$_torch_cuda_ver" != "13"; then
-  echo "[verda] CUDA mismatch: driver=13, torch_cuda=$_torch_cuda_ver — repairing to cu130..." >&2
-  "$COMFY_ROOT/.venv/bin/python" -m pip install --force-reinstall --no-deps \
-    --index-url "$_pytorch_index" '{_TORCH_PIN}' '{_TORCHVISION_PIN}' '{_TORCHAUDIO_PIN}'
-elif test "$_cuda_driver_major" = "12" && test "$_torch_cuda_ver" = "13"; then
-  echo "[verda] CUDA mismatch: driver=12, torch_cuda=$_torch_cuda_ver — repairing to cu128..." >&2
+if test -n "$_pytorch_index" && test "$_torch_cuda_ver" != "$_target_torch_cuda_major"; then
+  echo "[verda] CUDA wheel mismatch: driver=$_cuda_driver_major compute_cap=$_gpu_compute_cap torch_cuda=$_torch_cuda_ver — repairing to cu${{_target_torch_cuda_major}}0..." >&2
   "$COMFY_ROOT/.venv/bin/python" -m pip install --force-reinstall --no-deps \
     --index-url "$_pytorch_index" '{_TORCH_PIN}' '{_TORCHVISION_PIN}' '{_TORCHAUDIO_PIN}'
 elif test -n "$_pytorch_index"; then
@@ -3460,7 +3467,25 @@ elif test -n "$_pytorch_index"; then
     echo "[verda] CUDA OK: driver=$_cuda_driver_major torch_cuda=$_torch_cuda_ver torchvision=$_tv_ver torchaudio=$_ta_ver" >&2
   fi
 else
-  echo "[verda] CUDA OK: driver=$_cuda_driver_major torch_cuda=$_torch_cuda_ver (no index available for repair)" >&2
+  echo "[verda] CUDA OK: driver=$_cuda_driver_major compute_cap=$_gpu_compute_cap torch_cuda=$_torch_cuda_ver (no index available for repair)" >&2
+fi
+
+# Re-read the exact ComfyUI venv after any repair.  This is the interpreter the
+# service will execute; checking a system Python can certify a wheel that the
+# worker never imports.  Keep the wheel tag in the log so a failed rehydrate is
+# diagnosable without another SSH session.
+_torch_wheel_tag="$("$COMFY_ROOT/.venv/bin/python" -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'not-importable')"
+_torch_cuda_ver="$("$COMFY_ROOT/.venv/bin/python" -c 'import torch; print(getattr(torch.version,"cuda","") or "")' 2>/dev/null || echo '')"
+_torch_cuda_available="$("$COMFY_ROOT/.venv/bin/python" -c 'import torch; print("yes" if torch.cuda.is_available() else "no")' 2>/dev/null || echo 'no')"
+echo "[verda] PyTorch verification: wheel=$_torch_wheel_tag cuda=$_torch_cuda_ver available=$_torch_cuda_available" >&2
+
+# Fabric Manager is relevant only when the GPU inventory actually reports an
+# NVSwitch topology.  /dev/nvidia-nvswitchctl may exist on a provider image used
+# for a plain PCIe A6000; that device-file proxy produced the false G162 fabric
+# diagnosis.
+_nvswitch_present=0
+if nvidia-smi -q 2>/dev/null | grep -qi 'NVSwitch'; then
+  _nvswitch_present=1
 fi
 
 # NVSwitch boxes (A100/H100 SXM) require Fabric Manager before CUDA can create
@@ -3468,7 +3493,7 @@ fi
 # one bounded restart repairs that race. A restart that fails or hangs indicates
 # a provider-side NVLink/NVSwitch fault, so keep the volume pair and replace the
 # VM instead of registering workers that will fail every job with CUDA error 802.
-if test -e /dev/nvidia-nvswitchctl \
+if test "$_nvswitch_present" = "1" \
    && ! "$COMFY_ROOT/.venv/bin/python" -c \
         "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" \
         >/dev/null 2>&1; then
@@ -3505,9 +3530,13 @@ if not torch.cuda.is_available():
 print("ComfyUI CUDA device=" + torch.cuda.get_device_name(0))
 PY
 then
-  if test -e /dev/nvidia-nvswitchctl; then
+  if test "$_nvswitch_present" = "1"; then
     echo "[verda] NVIDIA Fabric Manager state: $(systemctl is-active nvidia-fabricmanager.service 2>/dev/null || true)" >&2
     journalctl -u nvidia-fabricmanager.service -n 30 --no-pager >&2 || true
+  else
+    echo "[verda] ERROR: ComfyUI torch wheel has no usable CUDA on this non-NVSwitch GPU." >&2
+    echo "[verda] wheel=$_torch_wheel_tag torch_cuda=$_torch_cuda_ver driver_cuda=$_cuda_driver_major compute_cap=$_gpu_compute_cap" >&2
+    nvidia-smi >&2 || true
   fi
   echo "ComfyUI PyTorch CUDA validation failed; refusing to register an unusable worker" >&2
   exit 1
