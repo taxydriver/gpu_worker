@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ActiveJobSummary(BaseModel):
@@ -139,6 +139,22 @@ class OutputFile(BaseModel):
     storage_url: str | None = None
 
 
+class ComfyImageFit(BaseModel):
+    """Deterministic, aspect-preserving preprocessing before Comfy LoadImage."""
+
+    mode: Literal["contain"] = "contain"
+    width: int = Field(ge=16, le=8192)
+    height: int = Field(ge=16, le=8192)
+    fill_rgb: tuple[int, int, int] = (0, 0, 0)
+
+    @field_validator("fill_rgb")
+    @classmethod
+    def validate_fill_rgb(cls, value: tuple[int, int, int]) -> tuple[int, int, int]:
+        if any(channel < 0 or channel > 255 for channel in value):
+            raise ValueError("fill_rgb channels must be between 0 and 255")
+        return value
+
+
 class ComfyInputFile(BaseModel):
     """File the worker should stage into ComfyUI input before prompt submission."""
 
@@ -157,6 +173,7 @@ class ComfyInputFile(BaseModel):
     content_type: str | None = None
     type: str = "input"
     subfolder: str = ""
+    image_fit: ComfyImageFit | None = None
 
 
 class StagedInputReceipt(BaseModel):
@@ -165,6 +182,12 @@ class StagedInputReceipt(BaseModel):
     node_id: str
     input_name: str
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_content_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    transform: str | None = None
+    source_canvas: dict[str, int] | None = None
+    output_canvas: dict[str, int] | None = None
 
 
 class ClipKeyframe(BaseModel):

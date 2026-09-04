@@ -823,6 +823,76 @@ def _decode_inline_source_data(source_data: str) -> bytes:
     return decoded
 
 
+def _apply_image_fit(file_spec: ComfyInputFile, staged_input_path: str) -> str:
+    """Contain an image inside an exact canvas without cropping or stretching."""
+
+    fit = file_spec.image_fit
+    if fit is None:
+        return staged_input_path
+    if file_spec.expected_sha256:
+        raise RuntimeError("Attested input cannot be transformed by image_fit")
+    if not _requires_image_validation(file_spec):
+        raise RuntimeError("image_fit is only valid for image inputs")
+
+    from io import BytesIO
+    from PIL import Image, ImageOps
+
+    source = (comfy_input_dir() / staged_input_path).resolve(strict=False)
+    try:
+        source.relative_to(comfy_input_dir())
+    except ValueError as exc:
+        raise RuntimeError("Staged image_fit source escapes input directory") from exc
+    try:
+        with Image.open(source) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+            contained = ImageOps.contain(
+                image,
+                (int(fit.width), int(fit.height)),
+                method=Image.Resampling.LANCZOS,
+            )
+    except Exception as exc:
+        raise RuntimeError("Staged image could not be aspect-fitted") from exc
+
+    canvas = Image.new("RGB", (int(fit.width), int(fit.height)), tuple(fit.fill_rgb))
+    left = (int(fit.width) - contained.width) // 2
+    top = (int(fit.height) - contained.height) // 2
+    canvas.paste(contained, (left, top))
+    buffer = BytesIO()
+    canvas.save(buffer, format="PNG", optimize=False)
+    output = buffer.getvalue()
+    digest = hashlib.sha256(output).hexdigest()
+    fitted_filename = f"fit_contain_{fit.width}x{fit.height}_{digest}.png"
+    destination = _resolve_input_destination(file_spec, fitted_filename)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    valid_cached_fit = (
+        _is_supported_image_file(destination)
+        and hashlib.sha256(destination.read_bytes()).hexdigest() == digest
+    )
+    if not valid_cached_fit:
+        if destination.exists():
+            safe_unlink(destination)
+        temporary = None
+        handle = None
+        try:
+            temporary, handle = _open_private_staging_file(destination)
+            handle.write(output)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if handle is not None:
+                handle.close()
+            if temporary is not None:
+                safe_unlink(temporary)
+    if not _is_supported_image_file(destination):
+        raise RuntimeError("Aspect-fitted image is not a valid staged image")
+    subfolder = str(file_spec.subfolder or "").strip().strip("/")
+    return str(Path(subfolder) / fitted_filename) if subfolder else fitted_filename
+
+
 def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
     """Stage one file into ComfyUI input and return the LoadImage path."""
 
@@ -865,7 +935,7 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
         file_spec.source_data or file_spec.source_path or file_spec.source_url
     )
     if valid_existing and (expected or not has_explicit_source):
-        return staged_input_path
+        return _apply_image_fit(file_spec, staged_input_path)
     if destination.exists():
         LOGGER.warning("Replacing invalid staged Comfy input")
         safe_unlink(destination)
@@ -893,7 +963,7 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
             if temporary is not None:
                 safe_unlink(temporary)
         _ensure_valid_staged_input(destination, file_spec, "Staged source_data")
-        return staged_input_path
+        return _apply_image_fit(file_spec, staged_input_path)
 
     if file_spec.source_path:
         source = _resolve_local_input_source(file_spec.source_path)
@@ -902,12 +972,12 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
         if source.resolve(strict=False) != destination.resolve(strict=False):
             shutil.copyfile(source, destination)
         _ensure_valid_staged_input(destination, file_spec, "Copied")
-        return staged_input_path
+        return _apply_image_fit(file_spec, staged_input_path)
 
     if file_spec.source_url:
         _download_input_source(file_spec.source_url, destination, file_spec)
         _ensure_valid_staged_input(destination, file_spec, "Downloaded")
-        return staged_input_path
+        return _apply_image_fit(file_spec, staged_input_path)
 
     raise ValueError(f"Comfy input file has no usable source: {file_spec}")
 
@@ -915,7 +985,7 @@ def stage_comfy_input_file(file_spec: ComfyInputFile) -> str:
 def observe_staged_input_receipts(
     comfy_payload: dict[str, Any],
     input_files: list[ComfyInputFile],
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Re-hash graph-bound staged files immediately before prompt submission."""
 
     receipts: list[dict[str, str]] = []
@@ -936,13 +1006,37 @@ def observe_staged_input_receipts(
         expected = str(file_spec.expected_sha256 or "").strip().lower()
         if expected and digest != expected:
             raise RuntimeError("Observed staged input digest mismatch")
-        receipts.append(
-            {
-                "node_id": str(file_spec.node_id),
-                "input_name": str(file_spec.input_name),
-                "content_sha256": digest,
-            }
-        )
+        receipt: dict[str, Any] = {
+            "node_id": str(file_spec.node_id),
+            "input_name": str(file_spec.input_name),
+            "content_sha256": digest,
+        }
+        if file_spec.image_fit is not None:
+            from PIL import Image
+
+            original_name = Path(file_spec.filename).name
+            original = _resolve_input_destination(file_spec, original_name)
+            if not _is_supported_image_file(original):
+                raise RuntimeError("Aspect-fit source is not a valid staged image")
+            source_digest = hashlib.sha256(original.read_bytes()).hexdigest()
+            with Image.open(original) as source_image, Image.open(staged) as output_image:
+                source_canvas = {
+                    "width": int(source_image.width),
+                    "height": int(source_image.height),
+                }
+                output_canvas = {
+                    "width": int(output_image.width),
+                    "height": int(output_image.height),
+                }
+            receipt.update(
+                {
+                    "source_content_sha256": source_digest,
+                    "transform": "contain_letterbox",
+                    "source_canvas": source_canvas,
+                    "output_canvas": output_canvas,
+                }
+            )
+        receipts.append(receipt)
     return receipts
 
 

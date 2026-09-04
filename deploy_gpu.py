@@ -3771,6 +3771,18 @@ wait_comfy_healthy() {{
 wait_comfy_healthy
 
 # ── Comfy custom-node provisioners (GPU-stack work, NOT worker-start work) ────
+# Resolve resident department ownership before the provision-only gate. The
+# secure one-click's activate pass exits in the receipt gate above, so any
+# provisioning left below this point would never run on that path.
+VISION_GPU_IDX=""
+AUDIO_GPU_IDX=""
+for idx in $(seq 0 $((GPU_COUNT - 1))); do
+  case "$(dept_for_idx "$idx")" in
+    vision) VISION_GPU_IDX="$idx" ;;
+    audio)  AUDIO_GPU_IDX="$idx" ;;
+  esac
+done
+
 # These blocks MUST sit before the provision-only exit below. The secure
 # one-click runs this script twice: the provision-only pass exits at that gate,
 # and the cutover pass is answered by the security stage gate at the top of the
@@ -3819,6 +3831,88 @@ if test -n "$_provisioned_any"; then
   wait_comfy_healthy
 fi
 
+# Resident vLLM is also provision-only work. Leaving it below the gate made a
+# secure vision-card rent advertise a URL for a service that was never installed
+# or started. It is private/fallback-safe while staged and pinned to its plan GPU.
+(
+set +e
+if test -n "$VISION_GPU_IDX"; then
+  echo "[vision] gpu${{VISION_GPU_IDX}} → vLLM ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} on :${{VLLM_PORT}}"
+  VLLM_VENV=/mnt/data/vllm_venv
+  if ! test -x "$VLLM_VENV/bin/vllm"; then
+    python3 -m venv "$VLLM_VENV"
+    "$VLLM_VENV/bin/pip" install -q --upgrade pip
+    "$VLLM_VENV/bin/pip" install -q "vllm==0.11.2" || echo "[vision] WARN: vllm install failed" >&2
+  fi
+  if test -x "$VLLM_VENV/bin/vllm"; then
+    cat > /etc/systemd/system/filmforge-vllm.service <<UNIT
+[Unit]
+Description=FilmForge resident vLLM vision server (Qwen3-VL)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CUDA_VISIBLE_DEVICES=${{VISION_GPU_IDX}}
+Environment=HF_HOME=/mnt/data/hf_cache
+Environment=HF_HUB_ENABLE_HF_TRANSFER=0
+ExecStart=$VLLM_VENV/bin/vllm serve ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --served-model-name ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --host 0.0.0.0 --port ${{VLLM_PORT}} --trust-remote-code --max-model-len 16384 --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{{"image":4,"video":1}}'
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable -q filmforge-vllm
+    systemctl restart filmforge-vllm
+    VLLM_UP=""
+    for _ in $(seq 1 36); do
+      if curl -fsS "http://127.0.0.1:${{VLLM_PORT}}/health" >/dev/null 2>&1; then VLLM_UP=1; break; fi
+      sleep 5
+    done
+    if test -n "$VLLM_UP"; then
+      echo "[vision] vLLM healthy — QWEN_BASE_URL=http://${{PUBLIC_IP}}:${{VLLM_PORT}}/v1"
+    else
+      echo "[vision] WARN: vLLM not healthy after 3min (still downloading weights?) — journalctl -u filmforge-vllm" >&2
+    fi
+  fi
+fi
+)
+
+# The resident sound stage is provision-only work too. It used to sit below
+# this exit and was therefore dead on every secure Rent flow. The private
+# resident services may start while staged, but the deployment plan already
+# owns the worker unit and capabilities, so setup must never rewrite/restart it.
+(
+set +e
+_audio_wanted=""
+if test -n "$AUDIO_GPU_IDX"; then
+  _audio_wanted=1
+elif test "${{#WORKER_PLAN[@]}}" -eq 0; then
+  case ",${{WORKER_CAPABILITIES:-}}," in
+    *,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;
+  esac
+fi
+if test -n "$_audio_wanted"; then
+    echo "[audio] setting up the sound stage${{AUDIO_GPU_IDX:+ on gpu$AUDIO_GPU_IDX}}"
+    cd "$WORKER_ROOT"
+    export WORKSPACE=/mnt/data
+    export HF_HUB_ENABLE_HF_TRANSFER=0
+    if test -n "$AUDIO_GPU_IDX"; then
+      export AUDIO_GPU_INDEX="$AUDIO_GPU_IDX"
+    fi
+    export AUDIO_SKIP_WORKER_CAPS=1
+    if [ -n "${{HF_TOKEN:-}}" ]; then
+      bash provision_tts.sh || echo "[audio] WARN: provision_tts.sh failed" >&2
+      bash provision_sa3.sh || echo "[audio] WARN: provision_sa3.sh failed" >&2
+    else
+      echo "[audio] HF_TOKEN not set — skipping model downloads (volume assumed provisioned)"
+    fi
+    bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
+fi
+)
+
 if test "${{WORKER_SECURITY_CUTOVER_COMPLETE:-0}}" != "1"; then
   echo "WORKER_RELEASE_STAGED_ONLY=${{WORKER_CODE_RELEASE_ID}}"
   echo "Worker code/GPU stack staged; worker start waits for receipt-gated cutover." >&2
@@ -3860,111 +3954,6 @@ echo "WORKER_RELEASE_VERIFIED=${{WORKER_CODE_RELEASE_ID}}"
 
 echo "GPU_COUNT=${{GPU_COUNT}}"
 df -h /mnt/data
-
-# Which GPU (if any) the plan assigned to each resident department. Empty when
-# there is no plan — then the legacy WORKER_CAPABILITIES check below decides.
-VISION_GPU_IDX=""
-AUDIO_GPU_IDX=""
-for idx in $(seq 0 $((GPU_COUNT - 1))); do
-  case "$(dept_for_idx "$idx")" in
-    vision) VISION_GPU_IDX="$idx" ;;
-    audio)  AUDIO_GPU_IDX="$idx" ;;
-  esac
-done
-
-# ── Vision department (plan: a GPU assigned "vision") ─────────────────────────
-# Resident vLLM serving Qwen3-VL, pinned to its own card. The venv and the HF
-# cache live on /mnt/data so a rehydrate of the cached volume pair skips both the
-# ~2min vllm install and the ~17GB weight download. Guarded subshell: a vision
-# failure must never kill a render deploy — the LLM gateway falls back to OpenAI.
-(
-set +e
-if test -n "$VISION_GPU_IDX"; then
-  echo "[vision] gpu${{VISION_GPU_IDX}} → vLLM ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} on :${{VLLM_PORT}}"
-  VLLM_VENV=/mnt/data/vllm_venv
-  if ! test -x "$VLLM_VENV/bin/vllm"; then
-    python3 -m venv "$VLLM_VENV"
-    "$VLLM_VENV/bin/pip" install -q --upgrade pip
-    # 0.11.x = the Qwen3-VL support line incl. video input; pinned so a box
-    # rebuilt months later serves the same stack (matches ff_worker_vision_vast.yaml).
-    "$VLLM_VENV/bin/pip" install -q "vllm==0.11.2" || echo "[vision] WARN: vllm install failed" >&2
-  fi
-  if test -x "$VLLM_VENV/bin/vllm"; then
-    cat > /etc/systemd/system/filmforge-vllm.service <<UNIT
-[Unit]
-Description=FilmForge resident vLLM vision server (Qwen3-VL)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=CUDA_VISIBLE_DEVICES=${{VISION_GPU_IDX}}
-Environment=HF_HOME=/mnt/data/hf_cache
-Environment=HF_HUB_ENABLE_HF_TRANSFER=0
-ExecStart=$VLLM_VENV/bin/vllm serve ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --served-model-name ${{QWEN_VISION_MODEL:-Qwen/Qwen3-VL-8B-Instruct}} --host 0.0.0.0 --port ${{VLLM_PORT}} --trust-remote-code --max-model-len 16384 --gpu-memory-utilization 0.90 --limit-mm-per-prompt '{{"image":4,"video":1}}'
-Restart=always
-RestartSec=15
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-    systemctl daemon-reload
-    systemctl enable -q filmforge-vllm
-    systemctl restart filmforge-vllm
-    # Bounded wait: a warm volume is up in ~60s, a first-ever boot downloads
-    # ~17GB. Don't hold the deploy hostage for that — the worker already
-    # advertises the URL and the gateway falls back to OpenAI until it answers.
-    VLLM_UP=""
-    for _ in $(seq 1 36); do
-      if curl -fsS "http://127.0.0.1:${{VLLM_PORT}}/health" >/dev/null 2>&1; then VLLM_UP=1; break; fi
-      sleep 5
-    done
-    if test -n "$VLLM_UP"; then
-      echo "[vision] vLLM healthy — QWEN_BASE_URL=http://${{PUBLIC_IP}}:${{VLLM_PORT}}/v1"
-    else
-      echo "[vision] WARN: vLLM not healthy after 3min (still downloading weights?) — journalctl -u filmforge-vllm" >&2
-    fi
-  fi
-fi
-)
-
-# ── Audio department ──────────────────────────────────────────────────────────
-# The sound stage (resident Parler voice + SA3 music): provision the model
-# stacks (idempotent — instant when the /mnt/data volume already carries them)
-# and install the servers via setup_audio_services.sh. Selected either by the
-# per-GPU plan (AUDIO_GPU_IDX, which also pins the servers to that card) or, on
-# a homogeneous box, by tts_dialogue/stable_audio3 in WORKER_CAPABILITIES.
-# Guarded subshell: audio failures degrade to warnings, never kill a deploy.
-(
-set +e
-_audio_wanted=""
-if test -n "$AUDIO_GPU_IDX"; then
-  _audio_wanted=1
-elif test "${{#WORKER_PLAN[@]}}" -eq 0; then
-  case ",${{WORKER_CAPABILITIES:-}}," in
-    *,tts_dialogue,*|*,stable_audio3,*) _audio_wanted=1 ;;
-  esac
-fi
-if test -n "$_audio_wanted"; then
-    echo "[audio] setting up the sound stage${{AUDIO_GPU_IDX:+ on gpu$AUDIO_GPU_IDX}}"
-    cd "$WORKER_ROOT"
-    export WORKSPACE=/mnt/data
-    export HF_HUB_ENABLE_HF_TRANSFER=0
-    # Pin the resident servers to the plan's audio card, and leave the worker
-    # unit alone — the plan already wrote its capabilities.
-    if test -n "$AUDIO_GPU_IDX"; then
-      export AUDIO_GPU_INDEX="$AUDIO_GPU_IDX"
-      export AUDIO_SKIP_WORKER_CAPS=1
-    fi
-    if [ -n "${{HF_TOKEN:-}}" ]; then
-      bash provision_tts.sh || echo "[audio] WARN: provision_tts.sh failed" >&2
-      bash provision_sa3.sh || echo "[audio] WARN: provision_sa3.sh failed" >&2
-    else
-      echo "[audio] HF_TOKEN not set — skipping model downloads (volume assumed provisioned)"
-    fi
-    bash setup_audio_services.sh || echo "[audio] WARN: setup_audio_services.sh failed" >&2
-fi
-)
 
 # ── Re-assert the plan's capabilities (drift guard) ───────────────────────────
 # The provisioners above are shell scripts read from the box's git checkout of

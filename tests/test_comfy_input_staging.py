@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 from pathlib import Path
+from io import BytesIO
 import struct
 import zlib
 
@@ -111,6 +112,45 @@ def test_apply_comfy_input_files_replaces_invalid_cached_image(monkeypatch, tmp_
 
     assert cached.read_bytes() == PNG_BYTES
     assert patched["40"]["inputs"]["image"] == "characters/front.png"
+
+
+def test_portrait_input_is_contained_on_exact_landscape_canvas(monkeypatch, tmp_path: Path):
+    from PIL import Image
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    source = tmp_path / "portrait.png"
+    portrait = Image.new("RGB", (20, 40), (240, 20, 20))
+    portrait.save(source)
+    monkeypatch.setattr("gpu_worker.comfy_client.comfy_input_dir", lambda: input_dir)
+    monkeypatch.setattr(
+        "gpu_worker.comfy_client.served_file_roots",
+        lambda: {"input": input_dir, "output": tmp_path},
+    )
+
+    spec = ComfyInputFile(
+        node_id="97",
+        filename="portrait.png",
+        source_path=str(source),
+        image_fit={
+            "mode": "contain",
+            "width": 80,
+            "height": 40,
+            "fill_rgb": [0, 0, 0],
+        },
+    )
+    payload = {"97": {"class_type": "LoadImage", "inputs": {"image": "old.png"}}}
+    patched = apply_comfy_input_files(payload, [spec])
+    staged_name = patched["97"]["inputs"]["image"]
+    assert staged_name.startswith("fit_contain_80x40_")
+    with Image.open(input_dir / staged_name) as fitted:
+        assert fitted.size == (80, 40)
+        assert fitted.getpixel((0, 20)) == (0, 0, 0)
+        assert fitted.getpixel((40, 20))[0] > 200
+    receipt = observe_staged_input_receipts(patched, [spec])
+    assert receipt[0]["content_sha256"] == hashlib.sha256(
+        (input_dir / staged_name).read_bytes()
+    ).hexdigest()
 
 
 def test_protected_inputs_are_content_addressed_across_sequential_jobs(monkeypatch, tmp_path: Path):

@@ -268,7 +268,7 @@ def test_infinitetalk_provisioning_precedes_generation_comfy_restart() -> None:
         assert '*,infinitetalk,*|*,infinitetalk_v1,*' in script
 
 
-def test_comfy_provisioners_run_before_the_provision_only_exit() -> None:
+def test_all_selected_department_provisioners_run_before_the_provision_only_exit() -> None:
     # The secure one-click runs the rehydrate script twice: the provision-only
     # pass exits at the gate, and the cutover pass is answered by the security
     # stage gate before the body runs. Until 2026-08-22 both provisioner blocks
@@ -280,16 +280,25 @@ def test_comfy_provisioners_run_before_the_provision_only_exit() -> None:
         gate = _provision_only_exit(script)
         infinitetalk = script.index("bash provision_infinitetalk.sh")
         flux_ipadapter = script.index("bash provision_flux_ipadapter.sh")
+        vision = script.index("vllm==0.11.2")
+        audio_tts = script.index("bash provision_tts.sh")
+        audio_music = script.index("bash provision_sa3.sh")
+        audio_setup = script.index("bash setup_audio_services.sh")
         assert infinitetalk < gate and flux_ipadapter < gate
+        assert vision < gate
+        assert audio_tts < audio_music < audio_setup < gate
+        assert "export AUDIO_SKIP_WORKER_CAPS=1" in script[:gate]
         restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', flux_ipadapter)
         rewait = script.index("wait_comfy_healthy", restart)
         assert flux_ipadapter < restart < rewait < gate
-        # Neither Comfy-node provisioner survives after the gate. (The audio
-        # department block still does — provision_tts.sh / provision_sa3.sh —
-        # the same dead-code shape for an audio box on the secure path; logged,
-        # not moved here: it also installs resident systemd services.)
+        # No selected department provisioner survives after the gate: the
+        # activate pass is answered by the receipt gate before this body runs.
         assert "bash provision_infinitetalk.sh" not in script[gate:]
         assert "bash provision_flux_ipadapter.sh" not in script[gate:]
+        assert "vllm==0.11.2" not in script[gate:]
+        assert "bash provision_tts.sh" not in script[gate:]
+        assert "bash provision_sa3.sh" not in script[gate:]
+        assert "bash setup_audio_services.sh" not in script[gate:]
 
 
 def test_infinitetalk_provisioner_serializes_ensure_and_rehydrate_callers() -> None:
