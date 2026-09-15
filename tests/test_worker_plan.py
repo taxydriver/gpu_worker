@@ -280,11 +280,12 @@ def test_all_selected_department_provisioners_run_before_the_provision_only_exit
         gate = _provision_only_exit(script)
         infinitetalk = script.index("bash provision_infinitetalk.sh")
         flux_ipadapter = script.index("bash provision_flux_ipadapter.sh")
+        recammaster = script.index("bash provision_recammaster.sh")
         vision = script.index("vllm==0.11.2")
         audio_tts = script.index("bash provision_tts.sh")
         audio_music = script.index("bash provision_sa3.sh")
         audio_setup = script.index("bash setup_audio_services.sh")
-        assert infinitetalk < gate and flux_ipadapter < gate
+        assert infinitetalk < gate and flux_ipadapter < gate and recammaster < gate
         assert vision < gate
         assert audio_tts < audio_music < audio_setup < gate
         assert "export AUDIO_SKIP_WORKER_CAPS=1" in script[:gate]
@@ -295,6 +296,7 @@ def test_all_selected_department_provisioners_run_before_the_provision_only_exit
         # activate pass is answered by the receipt gate before this body runs.
         assert "bash provision_infinitetalk.sh" not in script[gate:]
         assert "bash provision_flux_ipadapter.sh" not in script[gate:]
+        assert "bash provision_recammaster.sh" not in script[gate:]
         assert "vllm==0.11.2" not in script[gate:]
         assert "bash provision_tts.sh" not in script[gate:]
         assert "bash provision_sa3.sh" not in script[gate:]
@@ -334,6 +336,27 @@ def test_flux_ipadapter_provisioner_is_lockstepped_and_lints() -> None:
     subprocess.run(["bash", "-n", str(provisioner)], check=True)
     assert 'LOCK_FILE="$COMFY/.filmforge_flux_ipadapter.provision.lock"' in source
     assert source.index("flock -w") < source.index("node x-flux-comfyui")
+
+
+def test_recammaster_provisioning_precedes_generation_comfy_restart() -> None:
+    # G410: deploy_gpu.py ran the infinitetalk and flux_ipadapter provisioners
+    # but had no block for recammaster, so a box could truthfully advertise
+    # recammaster_v1 in ready_asset_groups and still 400 on dispatch with
+    # missing_node_type: LoadWanVideoT5TextEncoder — measured on a clean-built
+    # box with the full asset download, so it was never a stale-cache issue.
+    for script in (_script(PLAN), _script(None)):
+        provision = script.index("bash provision_recammaster.sh")
+        restart = script.index('systemctl restart "comfyui-gpu${idx}.service"', provision)
+        assert provision < restart < _provision_only_exit(script)
+        assert "*,recammaster,*|*,recammaster_v1,*|*,reshoot_camera,*" in script
+
+
+def test_recammaster_provisioner_is_lockstepped_and_lints() -> None:
+    provisioner = Path(deploy_gpu.__file__).with_name("provision_recammaster.sh")
+    source = provisioner.read_text()
+    subprocess.run(["bash", "-n", str(provisioner)], check=True)
+    assert 'LOCK_FILE="$COMFY/.filmforge_recammaster.provision.lock"' in source
+    assert source.index("flock -w") < source.index("node ComfyUI-WanVideoWrapper")
 
 
 def test_hf_token_is_injected_for_a_plan_with_audio(monkeypatch, tmp_path: Path) -> None:

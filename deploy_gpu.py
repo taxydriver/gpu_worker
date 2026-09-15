@@ -3821,6 +3821,20 @@ if test -n "$_flux_ipadapter_wanted"; then
   _provisioned_any=1
 fi
 
+# ReCamMaster: weights ride the asset manager (recammaster_v1); this
+# provisioner installs Kijai's ComfyUI-WanVideoWrapper + VideoHelperSuite,
+# the node set the reshoot graph is built against.
+_recammaster_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,recammaster,*|*,recammaster_v1,*|*,reshoot_camera,*) _recammaster_wanted=1 ;;
+esac
+if test -n "$_recammaster_wanted"; then
+  echo "[recammaster] provisioning ReCamMaster node"
+  cd "$WORKER_ROOT"
+  bash provision_recammaster.sh
+  _provisioned_any=1
+fi
+
 if test -n "$_provisioned_any"; then
   for idx in $(seq 0 $((GPU_COUNT - 1))); do
     dept="$(dept_for_idx "$idx")"
