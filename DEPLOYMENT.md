@@ -270,6 +270,45 @@ Normal CUDA processes (PyTorch, ComfyUI) cannot run in CC mode without hardware 
 
 ---
 
+### `incomplete worker candidate is referenced by systemd; refusing cleanup` (2026-09-16)
+**Symptom:** a redeploy onto a reused OS volume dies at the worker-release install step with
+`candidate incomplete: writable paths present` followed by
+`incomplete worker candidate is referenced by systemd; refusing cleanup: <path>`.
+Before 2026-09-16 there was no way forward except destroying and recreating the OS volume.
+
+**What it means:** a *prior* failed deploy left a half-installed code release at that exact
+path (release ids are content-addressed, so the same commit always targets the same path), and
+something still names it. The named files are usually inert: stopped `filmforge-worker-gpu*.service`
+base units from that failed deploy, plus retired secure-profile receipts that merely *record* the
+path. A rolled-back profile's release directory is never deleted, and its
+`worker-secure-profile.conf` and `stage-receipt.json` both contain the code path — so even a
+cleanly retired box trips this check.
+
+**Recovery — explicit, never automatic:**
+```bash
+python3 deploy_gpu.py ... --reconcile-stale-candidate
+```
+or, on the box by hand:
+```bash
+python3 manage_worker_release.py reconcile-stale-candidate \
+  --release-id <release-id> --releases-root /opt/filmforge-worker-releases
+```
+Both run the same proof and **refuse** unless all of these hold: the candidate never finished
+installing (no 0444 `.ready`, writable paths, or a drifted dependency snapshot); it is not
+`current`; no process is running from it; no secure-profile drop-in referencing it is still
+linked into systemd; every `/etc/filmforge/worker-security` file naming it belongs to a profile
+that is neither `active/<unit>` nor `cutover_performed`; and every systemd file naming it is a
+stopped `filmforge-worker-gpu*.service`. Anything else — including a reference shape it does not
+recognise — is a refusal.
+
+On success it deletes **only** the dead candidate tree. It rewrites no unit, stops no service,
+unlinks no drop-in, retires no profile. It does not need to: the redeploy immediately reinstalls
+a valid tree at the same content-addressed path, which makes those stopped units correct again.
+If the refusal names a *live* profile, retire it first with
+`manage_worker_release.py retire-rehydrated --worker-unit <unit>`.
+
+---
+
 ### `vm delete` deletes volumes (CLI footgun)
 **Never run `verda --agent vm delete <id> --yes`** — it soft-deletes ALL attached volumes including the model data volume.
 

@@ -424,3 +424,96 @@ def test_remote_profile_rollback_prevalidates_and_uses_one_batch_lock(
     assert "from gpu_worker.worker_release import rollback_secure_profiles" in script
     assert "rollback_state" in script
     compile(script, "<remote-profile-rollback>", "exec")
+
+
+def _fake_bundle(release_id: str):
+    class _Bundle:
+        archive_path = "/tmp/worker.tar.gz"
+        archive_sha256 = "a" * 64
+        source_sha256 = "b" * 64
+        git_commit = None
+        tracked_manifest_sha256 = None
+
+    bundle = _Bundle()
+    bundle.release_id = release_id  # type: ignore[attr-defined]
+    return bundle
+
+
+def _record_stage(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    monkeypatch.setattr(deploy_gpu, "run", fake_run)
+    return commands
+
+
+def test_worker_release_staging_never_reconciles_unless_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dead-end recovery must never fire during an ordinary deploy."""
+
+    commands = _record_stage(monkeypatch)
+    release_id = "sha256-" + "f" * 24
+    deploy_gpu._stage_worker_release_over_ssh(
+        ssh_cmd=["ssh", "worker"],
+        scp_cmd=["scp"],
+        destination="root@worker",
+        releases_root="/opt/filmforge-worker-releases",
+        venv_path="/opt/runtime/.venv",
+        bundle=_fake_bundle(release_id),
+    )
+    assert not any("reconcile-stale-candidate" in " ".join(cmd) for cmd in commands)
+
+
+def test_worker_release_staging_reconciles_before_install_when_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = _record_stage(monkeypatch)
+    release_id = "sha256-" + "f" * 24
+    deploy_gpu._stage_worker_release_over_ssh(
+        ssh_cmd=["ssh", "worker"],
+        scp_cmd=["scp"],
+        destination="root@worker",
+        releases_root="/opt/filmforge-worker-releases",
+        venv_path="/opt/runtime/.venv",
+        bundle=_fake_bundle(release_id),
+        reconcile_stale_candidate=True,
+    )
+    joined = [" ".join(cmd) for cmd in commands]
+    reconcile_at = next(
+        index for index, cmd in enumerate(joined) if "reconcile-stale-candidate" in cmd
+    )
+    install_at = next(
+        index for index, cmd in enumerate(commands) if cmd[-1:] == ["-s"]
+    )
+    assert reconcile_at < install_at
+    # Both modules are shipped, and the operation runs under the box's own
+    # python3 because the candidate's .venv is exactly what may be missing.
+    assert any("worker_release.py" in cmd for cmd in joined)
+    assert any("manage_worker_release.py root@worker" in cmd for cmd in joined)
+    assert "python3 -B" in joined[reconcile_at]
+    assert ".venv/bin/python" not in joined[reconcile_at]
+    # The shipped modules are cleaned up before the install script runs.
+    cleanup_at = max(
+        index
+        for index, cmd in enumerate(joined)
+        if cmd.startswith("ssh worker rm -rf /tmp/filmforge-reconcile-")
+    )
+    assert reconcile_at < cleanup_at < install_at
+
+
+def test_worker_release_reconcile_refuses_an_unsafe_release_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _record_stage(monkeypatch)
+    with pytest.raises(RuntimeError, match="unsafe worker release id"):
+        deploy_gpu._reconcile_stale_candidate_over_ssh(
+            ssh_cmd=["ssh", "worker"],
+            scp_cmd=["scp"],
+            destination="root@worker",
+            releases_root="/opt/filmforge-worker-releases",
+            release_id="sha256-aaa; rm -rf /",
+        )

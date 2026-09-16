@@ -757,6 +757,61 @@ def stage_worker_tree(source_dir: Path) -> tempfile.TemporaryDirectory[str]:
     return temp_dir
 
 
+def _reconcile_stale_candidate_over_ssh(
+    *,
+    ssh_cmd: list[str],
+    scp_cmd: list[str],
+    destination: str,
+    releases_root: str,
+    release_id: str,
+) -> None:
+    """Explicitly clear a never-finished candidate before reinstalling it.
+
+    Only ever reached with --reconcile-stale-candidate.  The operation itself
+    proves the candidate never finished installing and that nothing live
+    references it, and removes nothing else; it refuses otherwise.  The two
+    modules are shipped to a fresh temp dir and run under the box's system
+    python3 because the candidate's own .venv is exactly what may be missing.
+    """
+
+    # ssh joins its argv into one remote shell command, so every value that
+    # reaches it is quoted here rather than trusted to be metacharacter-free.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", release_id):
+        raise RuntimeError("refusing to reconcile an unsafe worker release id")
+    remote_dir = f"/tmp/filmforge-reconcile-{release_id}"
+    quoted_dir = shlex.quote(remote_dir)
+    run([*ssh_cmd, "rm", "-rf", quoted_dir])
+    run([*ssh_cmd, "mkdir", "-m", "0700", "-p", quoted_dir])
+    try:
+        for module in ("worker_release.py", "manage_worker_release.py"):
+            run([*scp_cmd, str(SCRIPT_DIR / module), f"{destination}:{remote_dir}/{module}"])
+        result = run(
+            [
+                *ssh_cmd,
+                "python3",
+                "-B",
+                shlex.quote(f"{remote_dir}/manage_worker_release.py"),
+                "reconcile-stale-candidate",
+                "--release-id",
+                shlex.quote(release_id),
+                "--releases-root",
+                shlex.quote(releases_root),
+            ],
+            capture_output=True,
+            check=False,
+        )
+    finally:
+        run([*ssh_cmd, "rm", "-rf", quoted_dir], check=False)
+    summary = " ".join(str(result.stdout or "").split())
+    if result.returncode != 0:
+        stderr_tail = " ".join(str(result.stderr or "")[-400:].split())
+        raise RuntimeError(
+            "stale-candidate reconcile refused or failed "
+            f"(rc={result.returncode}; stdout: {summary!r}; stderr ends: {stderr_tail!r})"
+        )
+    log(f"stale-candidate reconcile: {summary}")
+
+
 def _stage_worker_release_over_ssh(
     *,
     ssh_cmd: list[str],
@@ -765,6 +820,7 @@ def _stage_worker_release_over_ssh(
     releases_root: str,
     venv_path: str,
     bundle: WorkerReleaseBundle | None = None,
+    reconcile_stale_candidate: bool = False,
 ) -> tuple[str, str]:
     """Upload and atomically activate a content-addressed worker package.
 
@@ -789,6 +845,7 @@ def _stage_worker_release_over_ssh(
                 releases_root=releases_root,
                 venv_path=venv_path,
                 bundle=local_bundle,
+                reconcile_stale_candidate=reconcile_stale_candidate,
             )
     else:
         remote_archive = f"/tmp/filmforge-worker-{bundle.release_id}.tar.gz"
@@ -799,6 +856,14 @@ def _stage_worker_release_over_ssh(
                 f"{destination}:{remote_archive}",
             ]
         )
+        if reconcile_stale_candidate:
+            _reconcile_stale_candidate_over_ssh(
+                ssh_cmd=ssh_cmd,
+                scp_cmd=scp_cmd,
+                destination=destination,
+                releases_root=releases_root,
+                release_id=bundle.release_id,
+            )
         install_script = worker_release_install_script(
             archive_path=remote_archive,
             archive_sha256=bundle.archive_sha256,
@@ -4728,6 +4793,9 @@ def verda_deploy(args: argparse.Namespace) -> int:
         releases_root=DEFAULT_WORKER_RELEASES_ROOT,
         venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
         bundle=getattr(args, "_prepared_worker_release_bundle", None),
+        reconcile_stale_candidate=bool(
+            getattr(args, "reconcile_stale_candidate", False)
+        ),
     )
     setattr(args, "_verda_active_instance_id", instance_id)
     setattr(args, "_verda_active_ip", ip)
@@ -4976,6 +5044,9 @@ def verda_fresh_deploy(args: argparse.Namespace) -> int:
         releases_root=DEFAULT_WORKER_RELEASES_ROOT,
         venv_path=f"{DEFAULT_WORKER_RUNTIME_ROOT}/.venv",
         bundle=getattr(args, "_prepared_worker_release_bundle", None),
+        reconcile_stale_candidate=bool(
+            getattr(args, "reconcile_stale_candidate", False)
+        ),
     )
     setattr(args, "_verda_active_instance_id", instance_id)
     setattr(args, "_verda_active_ip", ip)
@@ -5583,6 +5654,9 @@ def _do_deploy(args: argparse.Namespace, pod_id: str | None = None) -> tuple[int
         releases_root=releases_root,
         venv_path=f"{args.remote_root.rstrip('/')}/.venv",
         bundle=getattr(args, "_prepared_worker_release_bundle", None),
+        reconcile_stale_candidate=bool(
+            getattr(args, "reconcile_stale_candidate", False)
+        ),
     )
     env_vars.append(f"WORKER_CODE_RELEASE_ID={release_id}")
 
@@ -5968,6 +6042,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Internal secure-state-machine resume target. Later phases reuse "
             "this exact VM instead of creating a second paid instance."
+        ),
+    )
+    parser.add_argument(
+        "--reconcile-stale-candidate",
+        action="store_true",
+        help=(
+            "Before installing the worker code release, remove a never-finished "
+            "candidate of the same id that a prior failed deploy left behind. "
+            "Proves the candidate never completed and that nothing live "
+            "references it, then deletes only that tree; refuses otherwise and "
+            "never touches systemd state. Off unless asked for."
         ),
     )
     parser.add_argument(

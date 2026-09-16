@@ -16,6 +16,7 @@ from pathlib import Path
 
 try:
     from gpu_worker.worker_release import (
+        DEFAULT_WORKER_RELEASES_ROOT,
         SecureProfileLayout,
         SecureWorkerContract,
         StagedSecureProfile,
@@ -23,12 +24,14 @@ try:
         build_cutover_receipt_template,
         cutover_secure_profile,
         prepare_secure_profile,
+        reconcile_stale_candidate,
         retire_rehydrated_secure_profile,
         rollback_secure_profile,
         stage_secure_profile,
     )
 except ModuleNotFoundError:  # direct execution from the gpu_worker checkout
     from worker_release import (  # type: ignore[no-redef]
+        DEFAULT_WORKER_RELEASES_ROOT,
         SecureProfileLayout,
         SecureWorkerContract,
         StagedSecureProfile,
@@ -36,6 +39,7 @@ except ModuleNotFoundError:  # direct execution from the gpu_worker checkout
         build_cutover_receipt_template,
         cutover_secure_profile,
         prepare_secure_profile,
+        reconcile_stale_candidate,
         retire_rehydrated_secure_profile,
         rollback_secure_profile,
         stage_secure_profile,
@@ -214,6 +218,33 @@ def _retire_rehydrated(args: argparse.Namespace) -> int:
     )
     return 0
 
+def _reconcile_stale_candidate(args: argparse.Namespace) -> int:
+    outcome = reconcile_stale_candidate(
+        release_id=args.release_id,
+        releases_root=args.releases_root,
+        layout=_layout(args),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "operation": "reconcile-stale-candidate",
+                "release_id": outcome.release_id,
+                "candidate": outcome.candidate,
+                "removed": outcome.removed,
+                "incomplete_because": list(outcome.incomplete_because),
+                "inert_fossil_references": list(outcome.inert_fossil_references),
+                "stopped_base_unit_references": list(
+                    outcome.stopped_base_unit_references
+                ),
+                "systemd_unchanged": True,
+                "next_operation": "redeploy",
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -308,6 +339,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     retire.add_argument("--worker-unit", required=True)
     retire.set_defaults(handler=_retire_rehydrated)
+    reconcile = subparsers.add_parser(
+        "reconcile-stale-candidate",
+        help=(
+            "remove a never-finished worker code candidate after proving nothing "
+            "live references it; changes no systemd state"
+        ),
+    )
+    reconcile.add_argument(
+        "--release-id",
+        required=True,
+        help="the exact worker code release id the installer refused to clean",
+    )
+    reconcile.add_argument(
+        "--releases-root",
+        type=Path,
+        default=DEFAULT_WORKER_RELEASES_ROOT,
+        help="worker code releases root (contains releases/ and current)",
+    )
+    reconcile.set_defaults(handler=_reconcile_stale_candidate)
     return parser.parse_args(argv)
 
 

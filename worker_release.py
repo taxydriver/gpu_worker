@@ -32,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
@@ -40,6 +40,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 PROFILE_DROPIN_NAME = "20-filmforge-secure-profile.conf"
 STAGED_GUARD_DROPIN_NAME = "00-filmforge-staged-guard.conf"
 PUBLIC_OVERRIDE_NAME = "99-public-url-override.conf"
+DEFAULT_WORKER_RELEASES_ROOT = Path("/opt/filmforge-worker-releases")
 RECEIPT_SCHEMA = "filmforge.worker-secure-cutover.v1"
 STAGE_SCHEMA = "filmforge.worker-secure-stage.v1"
 BACKEND_PROBE_SCHEMA = "filmforge.worker-cutover-probe.v1"
@@ -892,6 +893,14 @@ if test "$candidate_incomplete" = "1"; then
     echo "incomplete worker candidate is referenced by systemd; refusing cleanup: $TARGET" >&2
     echo "referencing files:" >&2
     echo "$referencing_files" >&2
+    # Most of those matches are normally inert: stopped base units from a prior
+    # failed deploy, and retired profile receipts that merely record the path.
+    # Saying so, with the exact command that proves it, is the difference
+    # between a one-flag redeploy and destroying the OS volume.
+    echo "next: this usually means a prior failed deploy left stopped units and retired" >&2
+    echo "profile receipts naming this path. Prove nothing live references it and remove it:" >&2
+    echo "  manage_worker_release.py reconcile-stale-candidate --release-id $RELEASE_ID --releases-root $RELEASES_ROOT" >&2
+    echo "or re-run the deploy with --reconcile-stale-candidate. Both refuse if anything is live." >&2
     exit 1
   fi
   if grep -a -F -l "$TARGET" /proc/[0-9]*/cmdline >/dev/null 2>&1; then
@@ -3557,6 +3566,353 @@ def retire_rehydrated_secure_profile(
         controller=controller,
     )
     return active_release.name
+
+
+@dataclass(frozen=True)
+class StaleCandidateReconciliation:
+    """Exactly what one reconcile proved before removing a dead candidate."""
+
+    release_id: str
+    candidate: str
+    removed: bool
+    incomplete_because: tuple[str, ...]
+    inert_fossil_references: tuple[str, ...]
+    stopped_base_unit_references: tuple[str, ...]
+
+
+def _candidate_incompleteness(candidate: Path) -> tuple[str, ...]:
+    """Reasons this tree is self-evidently not a finished immutable release.
+
+    Only self-evident markers count.  Nothing here consults the expected
+    source or git digest, so reconcile can never be talked into deleting a
+    real release by being handed the wrong expectation: a complete,
+    ``.ready``-0444, internally consistent tree yields no reasons at all and
+    is therefore never a reconcile target.
+    """
+
+    reasons: list[str] = []
+    ready = candidate / ".ready"
+    if ready.is_symlink() or not ready.is_file():
+        reasons.append("readiness marker missing")
+    elif stat.S_IMODE(ready.stat().st_mode) != 0o444:
+        mode = oct(stat.S_IMODE(ready.stat().st_mode))[2:]
+        reasons.append(f"readiness marker mode drifted (mode={mode})")
+    writable = [
+        path
+        for path in (candidate, *candidate.rglob("*"))
+        if not path.is_symlink() and stat.S_IMODE(path.lstat().st_mode) & 0o222
+    ]
+    if writable:
+        sample = ", ".join(str(path) for path in writable[:5])
+        more = f" (+{len(writable) - 5} more)" if len(writable) > 5 else ""
+        reasons.append(f"writable paths present: {sample}{more}")
+    freeze = candidate / ".dependency-freeze.txt"
+    marker = candidate / ".dependency-freeze.sha256"
+    if (
+        freeze.is_symlink()
+        or not freeze.is_file()
+        or marker.is_symlink()
+        or not marker.is_file()
+        or marker.read_text().strip() != _sha256_file(freeze)
+    ):
+        reasons.append("dependency snapshot missing or drifted")
+    return tuple(reasons)
+
+
+def _file_contains(path: Path, needle: str) -> bool:
+    """Chunked substring search so a staged edge binary is never slurped."""
+
+    probe = needle.encode("utf-8")
+    overlap = len(probe) - 1
+    try:
+        with path.open("rb") as stream:
+            tail = b""
+            while True:
+                chunk = stream.read(1 << 20)
+                if not chunk:
+                    return False
+                if probe in tail + chunk:
+                    return True
+                tail = (tail + chunk)[-overlap:] if overlap else b""
+    except OSError:
+        return False
+
+
+def _owning_profile_release(path: Path, layout: SecureProfileLayout) -> Path | None:
+    """Resolve the secure-profile release directory that owns ``path``."""
+
+    releases_root = layout.releases_root.resolve()
+    for ancestor in path.resolve().parents:
+        if ancestor.parent == releases_root:
+            return ancestor if _SAFE_ID.fullmatch(ancestor.name) else None
+    return None
+
+
+def _live_profile_releases(layout: SecureProfileLayout) -> set[Path]:
+    """Release directories that are live for some worker unit.
+
+    Live means what ``deploy_gpu.py``'s worker-security gate means by it: an
+    ``active/<unit>`` pointer resolves to the release, or the release's own
+    stage receipt still records ``cutover_performed``.  A completed rollback
+    clears both — it unlinks the pointer and rewrites the receipt to
+    ``cutover_performed: false`` — so a properly retired profile is correctly
+    not live here, which is the whole reason reconcile can proceed at all.
+    """
+
+    live: set[Path] = set()
+    active_root = layout.state_root / "active"
+    if active_root.is_dir():
+        for pointer in sorted(active_root.iterdir()):
+            if pointer.is_symlink():
+                live.add(pointer.resolve())
+    if layout.releases_root.is_dir():
+        for release in sorted(layout.releases_root.iterdir()):
+            if release.is_symlink() or not release.is_dir():
+                continue
+            try:
+                data = _stage_data(release)
+            except WorkerReleaseError:
+                continue
+            if data.get("cutover_performed") is True:
+                live.add(release.resolve())
+    return live
+
+
+def _systemd_unit_is_running(unit: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", unit],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorkerReleaseError(
+            f"could not determine whether {unit} is running; refusing reconcile"
+        ) from exc
+    return result.stdout.strip() in {
+        "active",
+        "activating",
+        "deactivating",
+        "reloading",
+    }
+
+
+def _candidate_running_pid(candidate: Path, proc_root: Path) -> str | None:
+    probe = str(candidate).encode("utf-8")
+    if not proc_root.is_dir():
+        return None
+    for cmdline in sorted(proc_root.glob("[0-9]*/cmdline")):
+        try:
+            if probe in cmdline.read_bytes():
+                return cmdline.parent.name
+        except OSError:
+            continue
+    return None
+
+
+def _classify_candidate_references(
+    *,
+    candidate: Path,
+    layout: SecureProfileLayout,
+    live_releases: set[Path],
+    unit_is_running: Callable[[str], bool],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Partition every reference to ``candidate``, or refuse.
+
+    Returns ``(inert fossil references, stopped base unit references)``.  A
+    reference that is live, or that does not fall into one of those two
+    known-safe shapes, raises: reconcile fails closed on the unfamiliar.
+    """
+
+    needle = str(candidate)
+    managed_releases = layout.releases_root.resolve()
+    fossils: list[str] = []
+    stopped_units: list[str] = []
+
+    for root, directories, files in os.walk(layout.systemd_root, followlinks=False):
+        base = Path(root)
+        # os.walk does not descend a symlinked directory, so one pointing into
+        # managed state could hide a live reference.  Refuse rather than miss it.
+        for name in directories:
+            link = base / name
+            if not link.is_symlink():
+                continue
+            try:
+                target = link.resolve(strict=True)
+            except OSError:
+                continue
+            if managed_releases in (target, *target.parents) or candidate in (
+                target,
+                *target.parents,
+            ):
+                raise WorkerReleaseError(
+                    "systemd holds a symlinked directory into managed release state; "
+                    f"refusing reconcile: {link} -> {target}"
+                )
+        for name in files:
+            path = base / name
+            if path.is_symlink():
+                try:
+                    target = path.resolve(strict=True)
+                except OSError:
+                    continue  # a broken link references nothing
+                if not _file_contains(target, needle):
+                    continue
+                owner = _owning_profile_release(target, layout)
+                if owner is None:
+                    raise WorkerReleaseError(
+                        "an unmanaged systemd symlink references the candidate; "
+                        f"refusing reconcile: {path} -> {target}"
+                    )
+                # A drop-in linked into systemd is live configuration whatever
+                # its owning profile's receipt says; a finished rollback would
+                # have unlinked it.
+                raise WorkerReleaseError(
+                    "a secure-profile drop-in is still linked into systemd; retire "
+                    f"profile {owner.name} first, then reconcile: {path}"
+                )
+            if not path.is_file() or not _file_contains(path, needle):
+                continue
+            if base == layout.systemd_root and re.fullmatch(
+                r"filmforge-worker-gpu[0-9]+\.service", name
+            ):
+                if unit_is_running(name):
+                    raise WorkerReleaseError(
+                        f"{name} is running from the candidate; refusing reconcile: {path}"
+                    )
+                stopped_units.append(str(path))
+                continue
+            raise WorkerReleaseError(
+                "an unrecognised systemd file references the candidate; refusing "
+                f"reconcile: {path}"
+            )
+
+    for root, _directories, files in os.walk(layout.state_root, followlinks=False):
+        base = Path(root)
+        for name in files:
+            path = base / name
+            scanned = path
+            if path.is_symlink():
+                try:
+                    scanned = path.resolve(strict=True)
+                except OSError:
+                    continue
+                if scanned.is_dir():
+                    continue  # active/ and staged/ pointers name a directory
+            if not scanned.is_file() or not _file_contains(scanned, needle):
+                continue
+            owner = _owning_profile_release(scanned, layout)
+            if owner is None:
+                raise WorkerReleaseError(
+                    "an unmanaged worker-security file references the candidate; "
+                    f"refusing reconcile: {path}"
+                )
+            if owner.resolve() in live_releases:
+                raise WorkerReleaseError(
+                    f"secure profile {owner.name} is active or cut over and references "
+                    f"the candidate; retire it with retire-rehydrated first: {path}"
+                )
+            fossils.append(str(path))
+
+    return tuple(sorted(fossils)), tuple(sorted(set(stopped_units)))
+
+
+def _remove_candidate_tree(candidate: Path) -> None:
+    """Undo the installer's recursive read-only pass, then delete."""
+
+    for path in sorted(
+        (candidate, *candidate.rglob("*")),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        if path.is_symlink():
+            continue
+        try:
+            os.chmod(path, stat.S_IMODE(path.lstat().st_mode) | 0o200)
+        except OSError:
+            continue
+    shutil.rmtree(candidate)
+
+
+def reconcile_stale_candidate(
+    *,
+    release_id: str,
+    releases_root: Path,
+    layout: SecureProfileLayout = SecureProfileLayout(),
+    unit_is_running: Callable[[str], bool] | None = None,
+    proc_root: Path = Path("/proc"),
+) -> StaleCandidateReconciliation:
+    """Remove a never-finished code candidate nothing live still references.
+
+    ``worker_release_install_script`` refuses to clean an incomplete candidate
+    that anything under ``/etc/systemd/system`` or
+    ``/etc/filmforge/worker-security`` names.  That is correct, but it
+    dead-ends the operator: on a reused OS volume those matches are normally a
+    prior failed deploy's *stopped* base units plus retired profile receipts
+    that merely record the path.  This proves exactly that, then removes the
+    candidate and nothing else — no unit is rewritten or stopped, no drop-in is
+    unlinked, no profile is retired.  It does not need to: release ids are
+    content addressed, so the redeploy that follows reinstalls a valid tree at
+    the very path those stopped units already name.
+
+    Never part of a deploy unless the operator asks for it by flag.
+    """
+
+    if not _SAFE_ID.fullmatch(release_id):
+        raise WorkerReleaseError("invalid worker code release id")
+    resolved_unit_is_running = unit_is_running or _systemd_unit_is_running
+    candidate = releases_root / "releases" / release_id
+    with _profile_lock(layout), _code_release_transaction_lock(releases_root):
+        if candidate.is_symlink():
+            raise WorkerReleaseError(
+                f"worker candidate path is a symlink; refusing reconcile: {candidate}"
+            )
+        if not candidate.exists():
+            return StaleCandidateReconciliation(
+                release_id=release_id,
+                candidate=str(candidate),
+                removed=False,
+                incomplete_because=(),
+                inert_fossil_references=(),
+                stopped_base_unit_references=(),
+            )
+        if not candidate.is_dir():
+            raise WorkerReleaseError(
+                f"worker candidate path is not a directory: {candidate}"
+            )
+        reasons = _candidate_incompleteness(candidate)
+        if not reasons:
+            raise WorkerReleaseError(
+                "candidate is a complete immutable release; reconcile only removes a "
+                f"candidate that never finished installing: {candidate}"
+            )
+        current = releases_root / "current"
+        if current.is_symlink() and current.resolve() == candidate.resolve():
+            raise WorkerReleaseError(
+                f"candidate is the current worker release; refusing reconcile: {candidate}"
+            )
+        pid = _candidate_running_pid(candidate, proc_root)
+        if pid is not None:
+            raise WorkerReleaseError(
+                f"candidate is still running as pid {pid}; refusing reconcile: {candidate}"
+            )
+        fossils, stopped_units = _classify_candidate_references(
+            candidate=candidate,
+            layout=layout,
+            live_releases=_live_profile_releases(layout),
+            unit_is_running=resolved_unit_is_running,
+        )
+        _remove_candidate_tree(candidate)
+        return StaleCandidateReconciliation(
+            release_id=release_id,
+            candidate=str(candidate),
+            removed=True,
+            incomplete_because=reasons,
+            inert_fossil_references=fossils,
+            stopped_base_unit_references=stopped_units,
+        )
 
 
 @_locked_profile_operation

@@ -1940,3 +1940,369 @@ def test_tunnel_watchdog_rejects_redirect_and_unrelated_200_body(tmp_path: Path)
     # The launcher admits only an exact 200 before invoking the validator, so
     # Cloudflare Access 302 responses cannot reset the failure counter.
     assert 'test "$WATCHDOG_STATUS" = "200"' in source
+
+
+def _stale_candidate_world(tmp_path: Path) -> tuple[Path, SecureProfileLayout, str, Path]:
+    """The exact shape a failed+rolled-back deploy leaves on a reused volume.
+
+    An interrupted install (writable tree, no ``.ready``), a *stopped* base
+    unit still naming it, and a retired profile release whose receipt and
+    staged drop-in text merely record the path.
+    """
+
+    release_id = "sha256-" + "d" * 24
+    releases_root = tmp_path / "worker-releases"
+    candidate = releases_root / "releases" / release_id
+    (candidate / "gpu_worker").mkdir(parents=True)
+    (candidate / "gpu_worker/app.py").write_text("APP = 1\n")
+    (candidate / ".venv/bin").mkdir(parents=True)
+    (candidate / ".venv/bin/python").write_text("#!/bin/sh\n")
+
+    layout = SecureProfileLayout(
+        systemd_root=tmp_path / "systemd",
+        state_root=tmp_path / "worker-security",
+    )
+    layout.systemd_root.mkdir()
+    (layout.systemd_root / "filmforge-worker-gpu0.service").write_text(
+        "[Service]\n"
+        f"WorkingDirectory={candidate}/gpu_worker\n"
+        f"ExecStart={candidate}/.venv/bin/python -m uvicorn gpu_worker.app:app\n"
+    )
+    (layout.systemd_root / "unrelated.service").write_text("[Service]\nExecStart=/bin/true\n")
+
+    profile_id = "profile-" + "e" * 12
+    profile = layout.releases_root / profile_id
+    profile.mkdir(parents=True)
+    (profile / "worker-secure-profile.conf").write_text(
+        f"[Service]\nWorkingDirectory={candidate}/gpu_worker\n"
+    )
+    receipt = profile / "stage-receipt.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema": "filmforge.worker-secure-stage.v1",
+                "worker_unit": "filmforge-worker-gpu0.service",
+                "worker_module_dir": str(candidate / "gpu_worker"),
+                "cutover_performed": False,
+                "rollback_state": "complete",
+            }
+        )
+    )
+    os.chmod(receipt, 0o600)
+    return releases_root, layout, release_id, candidate
+
+
+def test_reconcile_removes_a_stale_candidate_and_touches_no_systemd_state(
+    tmp_path: Path,
+) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    base_unit = layout.systemd_root / "filmforge-worker-gpu0.service"
+    unit_before = base_unit.read_text()
+    fossil = layout.releases_root / ("profile-" + "e" * 12) / "worker-secure-profile.conf"
+    fossil_before = fossil.read_text()
+
+    outcome = worker_release.reconcile_stale_candidate(
+        release_id=release_id,
+        releases_root=releases_root,
+        layout=layout,
+        unit_is_running=lambda unit: False,
+        proc_root=tmp_path / "no-proc",
+    )
+
+    assert outcome.removed is True
+    assert not candidate.exists()
+    assert any("readiness marker missing" in reason for reason in outcome.incomplete_because)
+    assert str(base_unit) in outcome.stopped_base_unit_references
+    assert str(fossil) in outcome.inert_fossil_references
+    assert str(fossil.parent / "stage-receipt.json") in outcome.inert_fossil_references
+    # The whole point of the narrow semantics: nothing but the dead tree moved.
+    assert base_unit.read_text() == unit_before
+    assert fossil.read_text() == fossil_before
+    assert (layout.systemd_root / "unrelated.service").is_file()
+
+    # Idempotent: a second run has nothing to do and still refuses to invent work.
+    again = worker_release.reconcile_stale_candidate(
+        release_id=release_id,
+        releases_root=releases_root,
+        layout=layout,
+        unit_is_running=lambda unit: False,
+        proc_root=tmp_path / "no-proc",
+    )
+    assert again.removed is False
+
+
+def test_reconcile_refuses_a_candidate_a_live_profile_still_owns(tmp_path: Path) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    profile = layout.releases_root / ("profile-" + "e" * 12)
+    active = layout.state_root / "active"
+    active.mkdir(parents=True)
+    (active / "filmforge-worker-gpu0.service").symlink_to(profile)
+
+    with pytest.raises(WorkerReleaseError, match="retire-rehydrated"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=tmp_path / "no-proc",
+        )
+    assert candidate.is_dir()
+
+
+def test_reconcile_refuses_a_cutover_receipt_without_an_active_pointer(
+    tmp_path: Path,
+) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    receipt = layout.releases_root / ("profile-" + "e" * 12) / "stage-receipt.json"
+    data = json.loads(receipt.read_text())
+    data["cutover_performed"] = True
+    data.pop("rollback_state")
+    receipt.write_text(json.dumps(data))
+    os.chmod(receipt, 0o600)
+
+    with pytest.raises(WorkerReleaseError, match="active or cut over"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=tmp_path / "no-proc",
+        )
+    assert candidate.is_dir()
+
+
+def test_reconcile_refuses_a_drop_in_still_linked_into_systemd(tmp_path: Path) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    profile = layout.releases_root / ("profile-" + "e" * 12)
+    dropin_dir = layout.systemd_root / "filmforge-worker-gpu0.service.d"
+    dropin_dir.mkdir()
+    (dropin_dir / PROFILE_DROPIN_NAME).symlink_to(profile / "worker-secure-profile.conf")
+
+    with pytest.raises(WorkerReleaseError, match="still linked into systemd"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=tmp_path / "no-proc",
+        )
+    assert candidate.is_dir()
+
+
+def test_reconcile_refuses_a_running_unit_and_a_running_process(tmp_path: Path) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+
+    with pytest.raises(WorkerReleaseError, match="is running from the candidate"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: True,
+            proc_root=tmp_path / "no-proc",
+        )
+    assert candidate.is_dir()
+
+    proc_root = tmp_path / "proc"
+    (proc_root / "4242").mkdir(parents=True)
+    (proc_root / "4242/cmdline").write_bytes(
+        f"{candidate}/.venv/bin/python\0-m\0uvicorn\0".encode("utf-8")
+    )
+    with pytest.raises(WorkerReleaseError, match="still running as pid 4242"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=proc_root,
+        )
+    assert candidate.is_dir()
+
+
+def test_reconcile_refuses_an_unrecognised_reference_and_the_current_release(
+    tmp_path: Path,
+) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    (releases_root / "current").symlink_to(candidate)
+    with pytest.raises(WorkerReleaseError, match="is the current worker release"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=tmp_path / "no-proc",
+        )
+    (releases_root / "current").unlink()
+
+    # A hand-written unit naming the candidate is not one of the two known-safe
+    # shapes, so reconcile fails closed instead of guessing.
+    (layout.systemd_root / "operator-hack.service").write_text(
+        f"[Service]\nExecStart={candidate}/.venv/bin/python\n"
+    )
+    with pytest.raises(WorkerReleaseError, match="unrecognised systemd file"):
+        worker_release.reconcile_stale_candidate(
+            release_id=release_id,
+            releases_root=releases_root,
+            layout=layout,
+            unit_is_running=lambda unit: False,
+            proc_root=tmp_path / "no-proc",
+        )
+    assert candidate.is_dir()
+
+
+def test_reconcile_never_deletes_a_complete_immutable_release(tmp_path: Path) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    freeze = candidate / ".dependency-freeze.txt"
+    freeze.write_text("pip==1.0\n")
+    (candidate / ".dependency-freeze.sha256").write_text(
+        hashlib.sha256(freeze.read_bytes()).hexdigest() + "\n"
+    )
+    (candidate / ".ready").write_text("b" * 64 + "\n")
+    for path in sorted(candidate.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_symlink():
+            continue
+        os.chmod(path, 0o555 if path.is_dir() else 0o444)
+    os.chmod(candidate, 0o555)
+
+    try:
+        with pytest.raises(WorkerReleaseError, match="complete immutable release"):
+            worker_release.reconcile_stale_candidate(
+                release_id=release_id,
+                releases_root=releases_root,
+                layout=layout,
+                unit_is_running=lambda unit: False,
+                proc_root=tmp_path / "no-proc",
+            )
+        assert (candidate / "gpu_worker/app.py").is_file()
+    finally:
+        for path in sorted(candidate.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if not path.is_symlink():
+                os.chmod(path, 0o755)
+        os.chmod(candidate, 0o755)
+
+
+def test_installer_refusal_hands_the_operator_the_reconcile_command() -> None:
+    script = worker_release_install_script(
+        archive_path="/tmp/worker-release.tar.gz",
+        archive_sha256="a" * 64,
+        source_sha256="b" * 64,
+        release_id="sha256-" + "b" * 24,
+        releases_root="/opt/filmforge-worker-releases",
+        venv_path="/opt/filmforge-worker-runtime/.venv",
+    )
+    assert "incomplete worker candidate is referenced by systemd" in script
+    assert (
+        "manage_worker_release.py reconcile-stale-candidate --release-id "
+        "$RELEASE_ID --releases-root $RELEASES_ROOT" in script
+    )
+    assert "--reconcile-stale-candidate" in script
+    # The refusal itself must stay exactly as fail-closed as it was.
+    assert script.index("refusing cleanup: $TARGET") < script.index("reconcile-stale-candidate")
+    subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_reconcile_default_releases_root_matches_the_deploy_constant() -> None:
+    import deploy_gpu
+
+    assert deploy_gpu.DEFAULT_WORKER_RELEASES_ROOT == str(
+        worker_release.DEFAULT_WORKER_RELEASES_ROOT
+    )
+
+
+def _fake_systemctl(tmp_path: Path, *, state: str) -> dict[str, str]:
+    """A PATH with a systemctl that reports one fixed unit state."""
+
+    binaries = tmp_path / "bin"
+    binaries.mkdir(exist_ok=True)
+    systemctl = binaries / "systemctl"
+    systemctl.write_text(f"#!/bin/sh\necho {state}\n")
+    systemctl.chmod(0o755)
+    environment = dict(os.environ)
+    environment["PATH"] = f"{binaries}:{environment.get('PATH', '')}"
+    return environment
+
+
+def _run_manage_reconcile(
+    *,
+    releases_root: Path,
+    layout: SecureProfileLayout,
+    release_id: str,
+    env: dict[str, str] | None,
+) -> subprocess.CompletedProcess[str]:
+    manage = Path(worker_release.__file__).resolve().parent / "manage_worker_release.py"
+    return subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(manage),
+            "--systemd-root",
+            str(layout.systemd_root),
+            "--state-root",
+            str(layout.state_root),
+            "reconcile-stale-candidate",
+            "--release-id",
+            release_id,
+            "--releases-root",
+            str(releases_root),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+
+def test_manage_cli_reconciles_a_stale_candidate_end_to_end(tmp_path: Path) -> None:
+    """The exact command the installer's refusal now tells an operator to run."""
+
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    result = _run_manage_reconcile(
+        releases_root=releases_root,
+        layout=layout,
+        release_id=release_id,
+        env=_fake_systemctl(tmp_path, state="inactive"),
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert payload["operation"] == "reconcile-stale-candidate"
+    assert payload["removed"] is True
+    assert payload["systemd_unchanged"] is True
+    assert not candidate.exists()
+    assert (layout.systemd_root / "filmforge-worker-gpu0.service").is_file()
+
+
+def test_manage_cli_reports_a_refusal_as_structured_failure(tmp_path: Path) -> None:
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    active = layout.state_root / "active"
+    active.mkdir(parents=True)
+    (active / "filmforge-worker-gpu0.service").symlink_to(
+        layout.releases_root / ("profile-" + "e" * 12)
+    )
+    result = _run_manage_reconcile(
+        releases_root=releases_root,
+        layout=layout,
+        release_id=release_id,
+        env=_fake_systemctl(tmp_path, state="inactive"),
+    )
+    assert result.returncode == 2
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert "retire-rehydrated" in payload["error"]
+    assert candidate.is_dir()
+
+
+def test_manage_cli_refuses_when_it_cannot_read_unit_state(tmp_path: Path) -> None:
+    """No systemctl means no liveness proof, so reconcile must not proceed."""
+
+    releases_root, layout, release_id, candidate = _stale_candidate_world(tmp_path)
+    environment = dict(os.environ)
+    environment["PATH"] = str(tmp_path / "empty-bin")
+    result = _run_manage_reconcile(
+        releases_root=releases_root,
+        layout=layout,
+        release_id=release_id,
+        env=environment,
+    )
+    assert result.returncode == 2
+    assert "could not determine whether" in json.loads(result.stdout)["error"]
+    assert candidate.is_dir()
