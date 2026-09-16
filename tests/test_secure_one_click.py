@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 from argparse import Namespace
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -214,6 +215,45 @@ def test_one_click_runs_exact_secure_phase_order(
     assert "r" * 20 not in output
 
 
+def test_generation_audio_plan_waits_on_every_indexed_worker_by_label(
+    automatic_fakes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 2-GPU generation+audio plan (ADR-0009) must produce a readiness
+    contract the deploy can actually satisfy: one readiness wait per indexed
+    worker URL, each distinctly labeled. Regression for the 2026-09-16 FIN-03
+    deploy, whose gpu1 (audio) worker never answered and whose one-line
+    'status 502' error gave no way to tell gpu0 from gpu1."""
+
+    events, _caddy = automatic_fakes
+    api = _FakeDeployApi(events)
+    waited: list[dict] = []
+    monkeypatch.setattr(
+        one,
+        "_wait_for_authenticated_worker_ready",
+        lambda **kwargs: (waited.append(kwargs), events.append("worker-ready"))[-1],
+    )
+
+    args = _args(tmp_path, workers=2)
+    args.verda_worker_plan = "generation,audio"
+
+    result = one.run_secure_verda_first_install(
+        args,
+        deploy_api=api,
+        runner=_UnusedRunner(),
+    )
+
+    assert result == 0
+    assert [call["worker_label"] for call in waited] == ["gpu0", "gpu1"]
+    assert [call["public_url"] for call in waited] == [
+        "https://gpu-worker.anapana.ai",
+        "https://gpu-worker.anapana.ai/gpu1",
+    ]
+    # Both waits still ran (not short-circuited) before finalization.
+    assert events.count("worker-ready") == 2
+
+
 def test_interrupted_resume_verifies_fly_contract_without_secret_mutation(
     automatic_fakes,
     tmp_path: Path,
@@ -312,6 +352,95 @@ def test_worker_readiness_wait_requires_authenticated_exact_release(
         expected_release_id=release_id,
         timeout=1,
     )
+
+
+def test_worker_readiness_timeout_names_the_offending_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the 2026-09-16 FIN-03 2-GPU deploy: a timeout used to say
+    only 'Worker did not become ready ... (status 502)', with no way to tell
+    which of N worker URLs behind the one shared edge (ADR-0009) was dead."""
+
+    class Opener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 500, "boom", None, None)
+
+    monkeypatch.setattr(one, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(one.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        one.OneClickDeploymentError,
+        match=r"gpu1 \(https://gpu-worker\.example/gpu1\) did not become ready .*status 500",
+    ):
+        one._wait_for_authenticated_worker_ready(
+            public_url="https://gpu-worker.example/gpu1",
+            worker_api_token="worker-secret",
+            expected_release_id="sha256-" + "a" * 24,
+            timeout=1,
+            worker_label="gpu1",
+        )
+
+
+def test_worker_readiness_fast_fails_when_never_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A worker port Caddy can never reach only ever produces a 502/503/504 —
+    that is a connection failure wearing an HTTP status, not a worker process
+    that is up and merely not ready yet. All heavy provisioning already ran
+    before cutover restarts the worker units, so this must fail within the
+    short fast-fail window instead of the full per-worker timeout (the FIN-03
+    box burned a silent hour on exactly this)."""
+
+    attempts = {"count": 0}
+
+    class Opener:
+        def open(self, request, timeout):
+            attempts["count"] += 1
+            raise HTTPError(request.full_url, 502, "Bad Gateway", None, None)
+
+    monkeypatch.setattr(one, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(one.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        one.OneClickDeploymentError,
+        match=r"gpu1 \(https://gpu-worker\.example/gpu1\) never answered a single request",
+    ):
+        one._wait_for_authenticated_worker_ready(
+            public_url="https://gpu-worker.example/gpu1",
+            worker_api_token="worker-secret",
+            expected_release_id="sha256-" + "a" * 24,
+            timeout=3600,
+            never_answered_timeout=0,
+            worker_label="gpu1",
+        )
+    assert attempts["count"] >= 1
+
+
+def test_worker_readiness_keeps_full_timeout_once_it_has_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fast-fail path must never trigger once the worker has answered at
+    least one non-Caddy-gateway response (e.g. a 500 mid-startup) — only a
+    worker that has NEVER been reachable should give up early."""
+
+    class Opener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 500, "boom", None, None)
+
+    monkeypatch.setattr(one, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(one.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        one.OneClickDeploymentError,
+        match=r"did not become ready before immutable-code finalization \(status 500\)",
+    ):
+        one._wait_for_authenticated_worker_ready(
+            public_url="https://gpu-worker.example",
+            worker_api_token="worker-secret",
+            expected_release_id="sha256-" + "a" * 24,
+            timeout=1,
+            never_answered_timeout=0,
+        )
 
 
 def test_fly_secret_updates_detach_before_explicit_health_poll(

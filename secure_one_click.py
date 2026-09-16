@@ -960,12 +960,29 @@ def _wait_for_tls_hostname(hostname: str, expected_ip: str, timeout: int = 240) 
     )
 
 
+# A worker port sitting behind Caddy that has never once answered — not even
+# with a non-ready body, only connection failures or Caddy's own 502/503/504
+# ("nothing is listening upstream") — will not start answering later in the
+# hour: every heavy provisioning step (model downloads, pip installs) already
+# ran and finished before cutover restarts the worker units. Judgment call
+# (2026-09-16, see gpu_worker/docs discovery on the FIN-03 2-GPU deploy): a
+# dead worker should fail loud in minutes on a metered spot box, not silently
+# burn its full hour. Only a worker that has answered at least once — and is
+# merely still short of the ok/worker_ok/release-match bar — gets the full
+# ``timeout`` budget.
+_NEVER_ANSWERED_TIMEOUT_SEC = 300
+_PROGRESS_INTERVAL_SEC = 60
+
+
 def _wait_for_authenticated_worker_ready(
     *,
     public_url: str,
     worker_api_token: str,
     expected_release_id: str,
     timeout: int = 3600,
+    worker_label: str = "worker",
+    never_answered_timeout: int = _NEVER_ANSWERED_TIMEOUT_SEC,
+    progress_interval: int = _PROGRESS_INTERVAL_SEC,
 ) -> None:
     """Wait for model preflight before immutable-code finalization.
 
@@ -973,13 +990,22 @@ def _wait_for_authenticated_worker_ready(
     download large model assets in the background.  Finalization deliberately
     requires ``worker_ok=true``; polling that same authenticated health contract
     here prevents an otherwise deterministic cutover/rollback race.
+
+    On a multi-worker box each worker is waited on in turn (ADR-0009), so every
+    error and progress line names ``worker_label``/``public_url`` — otherwise a
+    2+ worker deploy that fails leaves no way to tell which URL was the
+    offender. See ``_NEVER_ANSWERED_TIMEOUT_SEC`` for the fast-fail rule.
     """
 
     if not expected_release_id:
         raise OneClickDeploymentError("Worker release id is unavailable before readiness wait")
     opener = build_opener(ProxyHandler({}), _NoRedirect())
-    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    deadline = start + timeout
+    fast_fail_deadline = start + min(never_answered_timeout, timeout)
     last_error = "not ready"
+    ever_answered = False
+    next_progress_at = start + progress_interval
     health_url = public_url.rstrip("/") + "/health"
     while time.monotonic() < deadline:
         request = Request(
@@ -989,6 +1015,7 @@ def _wait_for_authenticated_worker_ready(
         )
         try:
             with opener.open(request, timeout=15) as response:
+                ever_answered = True
                 if response.status != 200:
                     last_error = f"status {response.status}"
                 else:
@@ -1009,11 +1036,30 @@ def _wait_for_authenticated_worker_ready(
                         last_error = "worker or release not ready"
         except HTTPError as exc:
             last_error = f"status {exc.code}"
+            # Caddy itself emits 502/503/504 when it cannot reach the loopback
+            # worker port at all — that is a connection failure wearing an
+            # HTTP status, not proof the worker process answered.
+            if exc.code not in (502, 503, 504):
+                ever_answered = True
         except Exception as exc:
             last_error = type(exc).__name__
+        now = time.monotonic()
+        if not ever_answered and now >= fast_fail_deadline:
+            raise OneClickDeploymentError(
+                f"{worker_label} ({public_url}) never answered a single request "
+                f"in {int(now - start)}s (last error: {last_error}) — its worker "
+                "process is not listening; the remaining wait would not help"
+            )
+        if now >= next_progress_at:
+            print(
+                f"[one-click] still waiting on {worker_label} ({public_url}): "
+                f"{int(now - start)}s elapsed, last error: {last_error}"
+            )
+            next_progress_at = now + progress_interval
         time.sleep(5)
     raise OneClickDeploymentError(
-        f"Worker did not become ready before immutable-code finalization ({last_error})"
+        f"{worker_label} ({public_url}) did not become ready before "
+        f"immutable-code finalization ({last_error})"
     )
 
 
@@ -1225,12 +1271,13 @@ def run_secure_verda_first_install(
         # Every worker behind the edge must prove the authenticated health
         # contract before finalization — a 4-GPU box with one dead sibling is
         # not a completed deployment (ADR-0009).
-        for _worker_url in indexed_public_urls:
+        for _idx, _worker_url in enumerate(indexed_public_urls):
             _wait_for_authenticated_worker_ready(
                 public_url=_worker_url,
                 worker_api_token=secrets_value.worker_api_token,
                 expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
                 timeout=int(getattr(args, "verda_install_timeout", 3600)),
+                worker_label=f"gpu{_idx}",
             )
 
         print("[one-click] Authenticated cutover passed; activating immutable code")
