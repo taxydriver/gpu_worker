@@ -1473,6 +1473,58 @@ def test_first_install_cutover_enables_boot_units_and_rollback_disables_them(
     ]
 
 
+def test_first_install_cutover_enables_and_starts_every_indexed_sibling(
+    tmp_path: Path,
+) -> None:
+    """Regression, corrected: the 2026-09-16 FIN-03 finding was never about
+    audio. A live 2-GPU generation-only deploy left gpu1 disabled, inactive,
+    with an empty journal and its staged guard never lifted. Root cause:
+    stage_secure_profile computed everything correctly from the in-memory
+    contract (gpu1's guard symlink and drop-in did get written), but never
+    persisted worker_count into the stage receipt written to disk. prepare
+    and cutover are separate SSH round-trips that reload that receipt fresh,
+    so _stage_indexed_units(stage_data) always read worker_count as the
+    default of 1 and treated every sibling as nonexistent — enable(), restart()
+    and assert_loopback_only() for gpu1 were simply never reached."""
+    base_contract, layout = _fixture(
+        tmp_path,
+        with_override=False,
+        profile_mode="first-install",
+    )
+    contract = replace(base_contract, worker_count=2)
+    staged = stage_secure_profile(contract, layout)
+
+    indexed_unit = "filmforge-worker-gpu1.service"
+    # Staging itself worked off the in-memory contract — this part was never
+    # broken, which is exactly what made the bug easy to miss.
+    assert (
+        layout.systemd_root / f"{indexed_unit}.d" / worker_release.STAGED_GUARD_DROPIN_NAME
+    ).is_symlink()
+
+    override = layout.systemd_root / f"{contract.worker_unit}.d" / PUBLIC_OVERRIDE_NAME
+    controller = _Controller(override)
+    now = 1_800_000_000
+    _prepare(staged, contract, layout, controller, now=now)
+
+    cutover_secure_profile(
+        release_id=contract.release_id,
+        receipt_path=_first_install_receipt(staged, tmp_path / "receipt.json", now=now),
+        layout=layout,
+        controller=controller,
+        now_epoch=now,
+    )
+
+    # Pre-fix this set was {worker_unit, tunnel_unit} only — gpu1 never got
+    # enabled because the receipt-reloaded worker_count read as 1.
+    assert controller.enabled_units == {
+        contract.worker_unit,
+        contract.tunnel_unit,
+        indexed_unit,
+    }
+    assert ("restart", indexed_unit, False) in controller.events
+    assert ("loopback-only", 9001, False) in controller.events
+
+
 def test_first_install_post_start_probe_failure_rolls_back_and_stops(tmp_path: Path) -> None:
     contract, layout = _fixture(tmp_path, with_override=False, profile_mode="first-install")
     staged = stage_secure_profile(contract, layout)

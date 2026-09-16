@@ -1988,6 +1988,22 @@ def stage_secure_profile(
         "worker_code_release_id": contract.worker_code_release_id,
         "worker_unit": contract.worker_unit,
         "tunnel_unit": contract.tunnel_unit,
+        # ADR-0009 (2026-08-17): every reader of the PERSISTED stage-receipt
+        # that decides how many indexed sibling workers exist —
+        # _stage_worker_count / _stage_indexed_units, used by
+        # prepare_secure_profile and cutover_secure_profile — falls back to 1
+        # when this key is absent. It was absent here from day one: staging
+        # itself used contract.worker_count in-memory (correctly writing every
+        # indexed guard symlink and drop-in), but never wrote it to disk, so
+        # every worker beyond gpu0 silently read back as "doesn't exist" the
+        # moment stage/prepare/cutover became separate SSH round-trips. Found
+        # 2026-09-16: a live 2-GPU generation-only deploy left gpu1 disabled,
+        # inactive, with an empty journal and its staged guard never lifted —
+        # cutover's indexed-unit loop was a no-op because
+        # indexed_units_by_dropin came from _stage_indexed_units(stage_data)
+        # reading worker_count=1. See backend/docs/discoveries/secure-deploy-
+        # multiworker-readiness-silent-and-unlabeled-2026-09-16.md.
+        "worker_count": contract.worker_count,
         "worker_port": contract.worker_port,
         "worker_public_url": contract.worker_public_url.rstrip("/"),
         "tunnel_local_url": contract.tunnel_local_url.rstrip("/"),
