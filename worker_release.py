@@ -45,6 +45,12 @@ STAGE_SCHEMA = "filmforge.worker-secure-stage.v1"
 BACKEND_PROBE_SCHEMA = "filmforge.worker-cutover-probe.v1"
 MAX_RECEIPT_AGE_SECONDS = 15 * 60
 MAX_BACKEND_PROBE_RESPONSE_BYTES = 64 * 1024
+# assert_loopback_only found a real gpu1 worker that bound its port during
+# cutover's startup window, then crash-looped (Restart=always, RestartSec=5)
+# forever after — cutover recorded success while nothing ever answered a
+# request (2026-09-16, FIN-03 2-GPU generation+audio deploy). One settle
+# check after the first sighting is enough to tell "bound" from "still up".
+_LOOPBACK_STABILITY_CHECK_SEC = 1.0
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
 _SAFE_UNIT = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.@-]*\.service$")
@@ -173,7 +179,7 @@ class ServiceController(Protocol):
 
     def stop(self, unit: str) -> None: ...
 
-    def assert_loopback_only(self, port: int) -> None: ...
+    def assert_loopback_only(self, port: int, *, unit: str | None = None) -> None: ...
 
     def assert_public_listener(self, port: int) -> None: ...
 
@@ -321,8 +327,50 @@ class SystemdServiceController:
                 raise WorkerReleaseError("systemd did not load the exact managed drop-ins")
             unmatched.remove(match)
 
-    def assert_loopback_only(self, port: int) -> None:
+    def _unit_diagnostics_suffix(self, unit: str | None) -> str:
+        """Best-effort systemctl+journalctl for a unit assert_loopback_only is
+        about to fail on. Never raises — a diagnostics failure must not mask
+        the real error, and must never block on secrets or timeouts."""
+        if not unit:
+            return ""
+        try:
+            status = subprocess.run(
+                ["systemctl", "status", unit, "--no-pager", "-l"],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            logs = subprocess.run(
+                ["journalctl", "-u", unit, "-n", "100", "--no-pager"],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+        except Exception as exc:
+            return f" (diagnostics for {unit} unavailable: {exc})"
+        parts = [
+            "",
+            f"--- systemctl status {unit} ---",
+            status.stdout.strip() or "(empty)",
+            f"--- journalctl -u {unit} (last 100 lines) ---",
+            logs.stdout.strip() or "(empty)",
+        ]
+        return "\n".join(parts)
+
+    def assert_loopback_only(self, port: int, *, unit: str | None = None) -> None:
         public_hosts = {"0.0.0.0", "*", "::", "[::]"}
+
+        def _has_listener(output: str) -> bool:
+            for line in output.splitlines():
+                fields = line.split()
+                if len(fields) < 4:
+                    continue
+                if fields[3].rsplit(":", 1)[-1] == str(port):
+                    return True
+            return False
+
         # uvicorn imports and completes its lifespan after systemd reports the
         # service started.  Wait for that bounded startup window, while still
         # rejecting a public or unexpected bind immediately if one appears.
@@ -347,11 +395,27 @@ class SystemdServiceController:
                         raise WorkerReleaseError(
                             f"worker port {port} is bound to unexpected address"
                         )
+                # A crash-looping unit (Restart=always, RestartSec=5) can bind
+                # this port for a moment and be gone again before the next
+                # caller reaches it — exactly what let a dead gpu1 clear
+                # cutover on 2026-09-16 (see backend/docs/discoveries/
+                # secure-deploy-multiworker-readiness-silent-and-unlabeled-
+                # 2026-09-16.md). One settle check tells "bound" from "still
+                # up" before cutover calls it proven.
+                time.sleep(_LOOPBACK_STABILITY_CHECK_SEC)
+                settle = self._run(["ss", "-H", "-ltn"], capture_output=True)
+                if not _has_listener(settle.stdout):
+                    raise WorkerReleaseError(
+                        f"worker port {port} bound then stopped listening "
+                        "within a second of cutover (crash-looping unit?)"
+                        + self._unit_diagnostics_suffix(unit)
+                    )
                 return
             if attempt < 149:
                 time.sleep(0.1)
         raise WorkerReleaseError(
             f"worker port {port} has no listener after secure cutover"
+            + self._unit_diagnostics_suffix(unit)
         )
 
     def assert_public_listener(self, port: int) -> None:
@@ -764,14 +828,20 @@ import stat
 import sys
 
 root = pathlib.Path(sys.argv[1])
-raise SystemExit(
-    0
-    if any(
-        not path.is_symlink() and stat.S_IMODE(path.lstat().st_mode) & 0o222
-        for path in (root, *root.rglob("*"))
-    )
-    else 1
-)
+offenders = [
+    path
+    for path in (root, *root.rglob("*"))
+    if not path.is_symlink() and stat.S_IMODE(path.lstat().st_mode) & 0o222
+]
+if offenders:
+    # Named, not just counted: an operator staring at "writable paths present"
+    # with no filenames cannot tell an interrupted install from a process that
+    # wrote into a supposedly-immutable release after the fact.
+    sample = ", ".join(str(p) for p in offenders[:5])
+    more = f" (+{{len(offenders) - 5}} more)" if len(offenders) > 5 else ""
+    print(f"writable paths: {{sample}}{{more}}", file=sys.stderr)
+    raise SystemExit(0)
+raise SystemExit(1)
 PY
 }}
 candidate_incomplete=0
@@ -782,7 +852,7 @@ if test -d "$TARGET"; then
     candidate_incomplete=1
   fi
   if candidate_has_writable_paths "$TARGET"; then
-    echo "candidate incomplete: writable paths present" >&2
+    echo "candidate incomplete: writable paths present: $TARGET" >&2
     candidate_incomplete=1
   fi
   if ! test -f "$TARGET/.dependency-freeze.txt" || \
@@ -809,17 +879,23 @@ if test -d "$TARGET"; then
 fi
 if test "$candidate_incomplete" = "1"; then
   if test -L "$RELEASES_ROOT/current" && test "$(readlink "$RELEASES_ROOT/current")" = "$TARGET"; then
-    echo "incomplete worker candidate is current; refusing cleanup" >&2
+    echo "incomplete worker candidate is current; refusing cleanup: $TARGET" >&2
     exit 1
   fi
-  if grep -R -F -l "$TARGET" \
+  # -l alone only proves *that* something referenced $TARGET, never *what* — an
+  # operator staring at a dead rented box could not even go look. Name the
+  # matching unit/drop-in files so the next deploy's failure is actionable.
+  referencing_files="$(grep -R -F -l "$TARGET" \
       /etc/systemd/system \
-      /etc/filmforge/worker-security >/dev/null 2>&1; then
-    echo "incomplete worker candidate is referenced by systemd; refusing cleanup" >&2
+      /etc/filmforge/worker-security 2>/dev/null || true)"
+  if test -n "$referencing_files"; then
+    echo "incomplete worker candidate is referenced by systemd; refusing cleanup: $TARGET" >&2
+    echo "referencing files:" >&2
+    echo "$referencing_files" >&2
     exit 1
   fi
   if grep -a -F -l "$TARGET" /proc/[0-9]*/cmdline >/dev/null 2>&1; then
-    echo "incomplete worker candidate is still running; refusing cleanup" >&2
+    echo "incomplete worker candidate is still running; refusing cleanup: $TARGET" >&2
     exit 1
   fi
   chmod -R u+w "$TARGET" 2>/dev/null || true
@@ -2902,7 +2978,7 @@ def cutover_secure_profile(
         service_controller.restart(worker_unit)
         # Public port closure is checked only after the loopback profile has
         # restarted, never before the verified receipt and override removal.
-        service_controller.assert_loopback_only(worker_port)
+        service_controller.assert_loopback_only(worker_port, unit=worker_unit)
         for _offset, (_indexed_dropin, _unit) in enumerate(
             indexed_units_by_dropin.items(), start=1
         ):
@@ -2917,7 +2993,7 @@ def cutover_secure_profile(
                 dropin_paths=_indexed_allowed,
             )
             service_controller.restart(_unit)
-            service_controller.assert_loopback_only(worker_port + _offset)
+            service_controller.assert_loopback_only(worker_port + _offset, unit=_unit)
         probe_env = _strict_secret_env(release_dir / "backend-cutover-probe.env")
         service_controller.assert_authenticated_backend_route(
             probe_url=probe_env["FILMFORGE_BACKEND_CUTOVER_PROBE_URL"],

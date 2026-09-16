@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from gpu_worker import worker_release
 from gpu_worker.worker_release import (
     PROFILE_DROPIN_NAME,
     PUBLIC_OVERRIDE_NAME,
@@ -140,7 +141,16 @@ def test_systemd_loopback_listener_waits_for_uvicorn_bind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     controller = SystemdServiceController()
-    outputs = iter(["", "LISTEN 0 4096 127.0.0.1:9000 0.0.0.0:*\n"])
+    # Third output is the post-bind settle recheck: still listening, so the
+    # call succeeds. (See test_systemd_loopback_listener_settle_check_catches_
+    # crash_after_bind below for the case where it has already vanished.)
+    outputs = iter(
+        [
+            "",
+            "LISTEN 0 4096 127.0.0.1:9000 0.0.0.0:*\n",
+            "LISTEN 0 4096 127.0.0.1:9000 0.0.0.0:*\n",
+        ]
+    )
     sleeps: list[float] = []
     monkeypatch.setattr(
         controller,
@@ -153,7 +163,63 @@ def test_systemd_loopback_listener_waits_for_uvicorn_bind(
 
     controller.assert_loopback_only(9000)
 
-    assert sleeps == [0.1]
+    assert sleeps == [0.1, worker_release._LOOPBACK_STABILITY_CHECK_SEC]
+
+
+def test_systemd_loopback_listener_settle_check_catches_crash_after_bind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unit that binds once and is gone by the settle recheck (the shape of
+    a Restart=always/RestartSec=5 crash loop) must not clear cutover — that is
+    exactly how gpu1 passed cutover silent and dead on 2026-09-16 (see
+    backend/docs/discoveries/secure-deploy-multiworker-readiness-silent-and-
+    unlabeled-2026-09-16.md)."""
+    controller = SystemdServiceController()
+    outputs = iter(["LISTEN 0 4096 127.0.0.1:9001 0.0.0.0:*\n", ""])
+    monkeypatch.setattr(
+        controller,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout=next(outputs), stderr=""
+        ),
+    )
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        controller,
+        "_unit_diagnostics_suffix",
+        lambda unit: f" [diagnostics for {unit}]" if unit else "",
+    )
+
+    with pytest.raises(WorkerReleaseError, match="stopped listening"):
+        controller.assert_loopback_only(9001, unit="filmforge-worker-gpu1.service")
+
+
+def test_systemd_loopback_listener_no_listener_names_the_unit_in_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final "has no listener" error is the one line an operator sees when
+    a worker never binds at all; it must carry the unit's diagnostics, not
+    just a bare port number nobody can act on."""
+    controller = SystemdServiceController()
+    monkeypatch.setattr(
+        controller,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout="", stderr=""
+        ),
+    )
+    monkeypatch.setattr("gpu_worker.worker_release.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        controller,
+        "_unit_diagnostics_suffix",
+        lambda unit: f" [diagnostics for {unit}]" if unit else "",
+    )
+
+    with pytest.raises(
+        WorkerReleaseError,
+        match=r"has no listener after secure cutover \[diagnostics for filmforge-worker-gpu1\.service\]",
+    ):
+        controller.assert_loopback_only(9001, unit="filmforge-worker-gpu1.service")
 
 
 def test_systemd_loopback_listener_rejects_public_bind_immediately(
@@ -451,7 +517,7 @@ class _Controller:
             self.fail_stop_once = False
             raise RuntimeError("fixture interrupted rollback stop")
 
-    def assert_loopback_only(self, port: int) -> None:
+    def assert_loopback_only(self, port: int, *, unit: str | None = None) -> None:
         self.events.append(("loopback-only", port, self.override.exists()))
         if self.fail_loopback:
             raise RuntimeError("fixture public listener remains")

@@ -1064,6 +1064,43 @@ def _wait_for_authenticated_worker_ready(
     )
 
 
+# Cutover's own listener assertion (worker_release.assert_loopback_only) can
+# observe a unit bind briefly and pass, seconds before it crash-loops — so a
+# worker that never answers here can still have cleared cutover clean. Until
+# now nothing on this path ever ran journalctl: deploy_gpu.py's own
+# systemctl-enable + journalctl-on-failure block (the "activate" phase) never
+# executes, because this readiness wait raises and sends the run straight to
+# rollback first. This is the one SSH round-trip left to see the crash before
+# the box is torn down. Best-effort only — a diagnostics failure must never
+# mask or replace the real error that triggered it.
+def _dump_worker_unit_diagnostics(
+    *,
+    runner: CommandRunner,
+    ssh_cmd: Sequence[str],
+    unit: str,
+) -> None:
+    try:
+        result = runner.run(
+            [
+                *ssh_cmd,
+                "bash",
+                "-c",
+                f'echo "=== systemctl status {unit} ==="; '
+                f"systemctl status {unit} --no-pager -l || true; "
+                f'echo "=== journalctl -u {unit} (last 100 lines) ==="; '
+                f"journalctl -u {unit} -n 100 --no-pager || true",
+            ],
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        print(f"[one-click] could not capture diagnostics for {unit}: {exc}")
+        return
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+    print(f"[one-click] diagnostics for {unit} (never became ready):")
+    print(output.strip() or "(no output captured)")
+
+
 def _authorize_cutover_receipt(
     *,
     args: Any,
@@ -1273,13 +1310,21 @@ def run_secure_verda_first_install(
         # contract before finalization — a 4-GPU box with one dead sibling is
         # not a completed deployment (ADR-0009).
         for _idx, _worker_url in enumerate(indexed_public_urls):
-            _wait_for_authenticated_worker_ready(
-                public_url=_worker_url,
-                worker_api_token=secrets_value.worker_api_token,
-                expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
-                timeout=int(getattr(args, "verda_install_timeout", 3600)),
-                worker_label=f"gpu{_idx}",
-            )
+            try:
+                _wait_for_authenticated_worker_ready(
+                    public_url=_worker_url,
+                    worker_api_token=secrets_value.worker_api_token,
+                    expected_release_id=str(getattr(args, "_verda_worker_release_id", "")),
+                    timeout=int(getattr(args, "verda_install_timeout", 3600)),
+                    worker_label=f"gpu{_idx}",
+                )
+            except Exception:
+                _dump_worker_unit_diagnostics(
+                    runner=command_runner,
+                    ssh_cmd=list(getattr(args, "_verda_ssh_cmd")),
+                    unit=f"filmforge-worker-gpu{_idx}.service",
+                )
+                raise
 
         print("[one-click] Authenticated cutover passed; activating immutable code")
         _phase(args, "activate")

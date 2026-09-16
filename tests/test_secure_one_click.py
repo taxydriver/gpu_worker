@@ -254,6 +254,69 @@ def test_generation_audio_plan_waits_on_every_indexed_worker_by_label(
     assert events.count("worker-ready") == 2
 
 
+def test_worker_readiness_failure_captures_diagnostics_for_the_dead_unit(
+    automatic_fakes,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Regression for the 2026-09-16 FIN-03 deploy: cutover's own listener
+    check can pass while a crash-looping worker never answers a single
+    request, and nothing on this path ever ran journalctl before rollback
+    tore the box down — 'no one has ever seen that journal'. When the
+    readiness wait gives up on a worker, the deploy must SSH in and print
+    that worker's systemctl status + journalctl before rolling back."""
+
+    events, _caddy = automatic_fakes
+    api = _FakeDeployApi(events)
+
+    def _wait(**kwargs):
+        if kwargs["worker_label"] == "gpu1":
+            raise one.OneClickDeploymentError(
+                "gpu1 (https://gpu-worker.anapana.ai/gpu1) never answered a "
+                "single request in 302s (last error: status 502) — its "
+                "worker process is not listening"
+            )
+        events.append("worker-ready")
+
+    monkeypatch.setattr(one, "_wait_for_authenticated_worker_ready", _wait)
+
+    class _DiagnosticRunner(one.CommandRunner):
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def run(self, command, *, input_text=None, timeout=120, check=True):
+            self.calls.append(list(command))
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=0,
+                stdout=(
+                    "Active: activating (auto-restart) (Result: exit-code)\n"
+                    "Traceback (most recent call last): "
+                    "ImportError: no module named stable_audio3\n"
+                ),
+                stderr="",
+            )
+
+    runner = _DiagnosticRunner()
+    args = _args(tmp_path, workers=2)
+    args.verda_worker_plan = "generation,audio"
+
+    with pytest.raises(one.OneClickDeploymentError, match="never answered"):
+        one.run_secure_verda_first_install(args, deploy_api=api, runner=runner)
+
+    assert "rollback" in events
+    assert len(runner.calls) == 1
+    diagnostic_command = " ".join(runner.calls[0])
+    assert "filmforge-worker-gpu1.service" in diagnostic_command
+    assert "journalctl" in diagnostic_command
+    assert "systemctl" in diagnostic_command
+
+    output = capsys.readouterr().out
+    assert "diagnostics for filmforge-worker-gpu1.service" in output
+    assert "ImportError: no module named stable_audio3" in output
+
+
 def test_interrupted_resume_verifies_fly_contract_without_secret_mutation(
     automatic_fakes,
     tmp_path: Path,
