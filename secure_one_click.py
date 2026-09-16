@@ -965,7 +965,8 @@ def _wait_for_tls_hostname(hostname: str, expected_ip: str, timeout: int = 240) 
 # ("nothing is listening upstream") — will not start answering later in the
 # hour: every heavy provisioning step (model downloads, pip installs) already
 # ran and finished before cutover restarts the worker units. Judgment call
-# (2026-09-16, see gpu_worker/docs discovery on the FIN-03 2-GPU deploy): a
+# (2026-09-16, see backend/docs/discoveries/secure-deploy-multiworker-readiness-
+# silent-and-unlabeled-2026-09-16.md on the FIN-03 2-GPU deploy): a
 # dead worker should fail loud in minutes on a metered spot box, not silently
 # burn its full hour. Only a worker that has answered at least once — and is
 # merely still short of the ok/worker_ok/release-match bar — gets the full
