@@ -66,7 +66,10 @@ DEFAULT_VAST_COUNTRIES = [
 DEFAULT_VERDA_CLI = Path.home() / ".verda" / "bin" / "verda"
 DEFAULT_VERDA_LOCATION = "FIN-01"
 DEFAULT_VERDA_INSTANCE_TYPE = "2A100.44V"
-DEFAULT_VERDA_OS_IMAGE = "ubuntu-24.04-cuda-12.8-open-docker"
+# Verda's current image catalog uses compact image slugs (for example,
+# ``24.04.cuda12.9.docker``), rather than the former ubuntu-prefixed names.
+# Keep this default compatible with the current RTX Pro 6000 catalog.
+DEFAULT_VERDA_OS_IMAGE = "24.04.cuda12.9.docker"
 DEFAULT_VERDA_OS_VOLUME_ID = "34ec939d-a8c1-4ee2-9637-533e324dfe39"
 DEFAULT_VERDA_DATA_VOLUME_ID = "4ea18b04-564f-4218-ab79-e90d1ccc839b"
 DEFAULT_VERDA_SSH_KEY_ID = "11ee08a4-858a-4ee7-98c8-250aad99eb37"
