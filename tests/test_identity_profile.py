@@ -245,3 +245,25 @@ def test_root_sync_copies_every_code_file_and_excludes_only_root_dirs(tmp_path: 
 def test_provisioner_verifies_tracked_files_byte_for_byte() -> None:
     text = (ROOT / "provision_identity.sh").read_text()
     assert "git ls-files -z" in text and 'cmp -s "$COMFY/{}" "$ID_ROOT/{}"' in text
+
+
+def test_root_sync_repairs_an_existing_broken_identity_root(tmp_path: Path) -> None:
+    # The re-rent reuses the data volume, so the root stage must repair the broken copy
+    # left by the first rent (missing app/user_manager.py), keep its venv and nodes, and
+    # drop stale code that production no longer has.
+    prod, ident = tmp_path / "ComfyUI", tmp_path / "ComfyUI_identity"
+    (prod / "app").mkdir(parents=True)
+    (prod / "app/user_manager.py").write_text("u")
+    (prod / "main.py").write_text("m2")
+    (ident / "app").mkdir(parents=True)
+    (ident / "main.py").write_text("m1-stale")
+    (ident / "app/removed_upstream.py").write_text("stale")
+    (ident / ".venv/bin").mkdir(parents=True)
+    (ident / ".venv/bin/python").write_text("identity venv")
+    (ident / "custom_nodes/ComfyUI_InfiniteYou").mkdir(parents=True)
+    subprocess.run(["bash", "-c", f'COMFY="{prod}"; ID_ROOT="{ident}"\n' + _code_sync_block()], check=True)
+    assert (ident / "app/user_manager.py").read_text() == "u"
+    assert (ident / "main.py").read_text() == "m2"
+    assert not (ident / "app/removed_upstream.py").exists()
+    assert (ident / ".venv/bin/python").read_text() == "identity venv"
+    assert (ident / "custom_nodes/ComfyUI_InfiniteYou").is_dir()
