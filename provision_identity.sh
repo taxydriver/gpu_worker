@@ -58,10 +58,24 @@ prepare_root () {
   mkdir -p "$ID_ROOT"
   # Same ComfyUI code as production, so graphs behave identically. The identity
   # root's own venv, nodes, models link and I/O dirs are excluded, hence protected.
+  # Every exclude is ANCHORED to the root ("/..."): an unanchored 'user*' also matched
+  # app/user_manager.py and the identity ComfyUI crash-looped on import (2026-09-22).
+  # --BEGIN-CODE-SYNC--
   rsync -a --delete \
-    --exclude .venv --exclude models --exclude custom_nodes --exclude input \
-    --exclude output --exclude temp --exclude 'user*' --exclude '.filmforge_*' \
+    --exclude /.venv --exclude /models --exclude /custom_nodes --exclude /input \
+    --exclude /output --exclude /temp --exclude '/user*' --exclude '/.filmforge_*' \
     "$COMFY/" "$ID_ROOT/"
+  # --END-CODE-SYNC--
+  # Byte-for-byte check against production's tracked files: fail here, not in a
+  # ComfyUI import at boot.
+  if git -C "$COMFY" rev-parse --git-dir >/dev/null 2>&1; then
+    if ! (cd "$COMFY" && git ls-files -z \
+          | grep -zvE '^(custom_nodes|models|input|output|temp|user[^/]*)/' \
+          | xargs -0 -I{} cmp -s "$COMFY/{}" "$ID_ROOT/{}"); then
+      echo "[identity] FATAL: identity root is not a byte-for-byte copy of production's tracked files" >&2
+      exit 1
+    fi
+  fi
   mkdir -p "$ID_ROOT/custom_nodes" "$ID_ROOT/input" "$ID_ROOT/output" "$ID_ROOT/temp"
   # FilmForge's own CUDA patch node is part of the runtime, not the identity kit.
   if [ -d "$COMFY/custom_nodes/filmforge_cuda_patch" ]; then

@@ -206,3 +206,42 @@ def test_score_batches_a_whole_take_in_one_runner_call(tmp_path: Path, monkeypat
     )
     assert len(calls) == 1 and calls[0]["mode"] == "score" and calls[0]["video"].endswith("take.mp4")
     assert fetched == [("https://x/t.png", "image"), ("https://x/v.mp4", "video")]
+
+
+def _code_sync_block() -> str:
+    text = (ROOT / "provision_identity.sh").read_text()
+    return text.split("# --BEGIN-CODE-SYNC--\n", 1)[1].split("  # --END-CODE-SYNC--", 1)[0]
+
+
+def test_root_sync_copies_every_code_file_and_excludes_only_root_dirs(tmp_path: Path) -> None:
+    # 2026-09-22 first rent: an unanchored --exclude 'user*' dropped app/user_manager.py and
+    # the identity ComfyUI crash-looped on import. Excludes must match ROOT entries only.
+    prod, ident = tmp_path / "ComfyUI", tmp_path / "ComfyUI_identity"
+    files = {
+        "main.py": "m", "app/user_manager.py": "u", "app/model_manager.py": "mm",
+        "comfy/ldm/models/autoencoder.py": "nested models dir", "app/temp/x.py": "nested temp",
+        "comfy_extras/nodes_input/input.py": "i", "user_settings.py": "root user file",
+    }
+    for rel, body in files.items():
+        (prod / rel).parent.mkdir(parents=True, exist_ok=True)
+        (prod / rel).write_text(body)
+    for root_dir in (".venv/bin", "models/checkpoints", "custom_nodes/prod_only_node", "user/default", "output", "temp"):
+        (prod / root_dir).mkdir(parents=True, exist_ok=True)
+        (prod / root_dir / "marker").write_text("prod")
+    ident.mkdir()
+    (ident / "custom_nodes/ComfyUI-PuLID-Flux").mkdir(parents=True)
+    (ident / "custom_nodes/ComfyUI-PuLID-Flux/pulidflux.py").write_text("identity node")
+    subprocess.run(["bash", "-c", f'COMFY="{prod}"; ID_ROOT="{ident}"\n' + _code_sync_block()], check=True)
+    for rel, body in files.items():
+        if rel == "user_settings.py":
+            continue  # a ROOT-level user* entry is excluded by design
+        assert (ident / rel).read_text() == body, rel
+    for root_dir in ("models", "custom_nodes/prod_only_node", "user", "output", "temp", ".venv"):
+        assert not (ident / root_dir / "marker").exists(), root_dir
+    # the identity root's own nodes survive --delete
+    assert (ident / "custom_nodes/ComfyUI-PuLID-Flux/pulidflux.py").read_text() == "identity node"
+
+
+def test_provisioner_verifies_tracked_files_byte_for_byte() -> None:
+    text = (ROOT / "provision_identity.sh").read_text()
+    assert "git ls-files -z" in text and 'cmp -s "$COMFY/{}" "$ID_ROOT/{}"' in text
