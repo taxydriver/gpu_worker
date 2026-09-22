@@ -2320,3 +2320,38 @@ def test_indexed_worker_public_url_survives_the_shared_env_file(tmp_path: Path) 
     expected = f"WORKER_PUBLIC_URL={contract.worker_public_url.rstrip('/')}/gpu1"
     assert len(exec_lines) == 1 and exec_lines[0].startswith(f"ExecStart=/usr/bin/env {expected} ")
     assert f"--port {contract.worker_port + 1}" in exec_lines[0]
+
+
+def test_backend_probe_failure_names_the_backend_status_and_body() -> None:
+    """4th identity-box rent (2026-09-22) failed as a bare "backend cutover probe failed";
+    the backend's own refusal (status + detail) must reach the cause."""
+    import http.server
+    import threading
+
+    class _Refuse(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            body = b'{"detail":"Worker registration is not fresh at verified URL"}'
+            self.send_response(409)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Refuse)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        controller = worker_release.SystemdServiceController()
+        with pytest.raises(WorkerReleaseError, match=r"HTTP 409 .*not fresh at verified URL"):
+            controller.assert_authenticated_backend_route(
+                probe_url=f"http://127.0.0.1:{server.server_port}/api/internal/worker-cutover-probe",
+                probe_token="t",
+                release_id="r",
+                worker_code_release_id="c",
+                worker_dependency_freeze_sha256="0" * 64,
+                worker_public_url="https://w.example",
+            )
+    finally:
+        server.shutdown()

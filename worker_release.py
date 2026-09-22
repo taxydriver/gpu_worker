@@ -34,6 +34,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
 from urllib.parse import urlsplit
+from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -480,8 +481,20 @@ class SystemdServiceController:
                 value = json.loads(raw)
         except WorkerReleaseError:
             raise
+        except HTTPError as exc:
+            # Name the backend's own refusal (409 registration not fresh, 502 worker identity,
+            # ...): the 4th identity-box rent (2026-09-22) failed here as a bare "probe failed".
+            try:
+                body = exc.read(2048).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            raise WorkerReleaseError(
+                f"backend cutover probe failed: HTTP {exc.code} {body.strip()[:1500]}"
+            ) from exc
         except Exception as exc:
-            raise WorkerReleaseError("backend cutover probe failed") from exc
+            raise WorkerReleaseError(
+                f"backend cutover probe failed: {type(exc).__name__}: {str(exc)[:500]}"
+            ) from exc
         expected = {
             "schema": BACKEND_PROBE_SCHEMA,
             "ok": True,
@@ -494,8 +507,13 @@ class SystemdServiceController:
             "registration_ready": True,
         }
         if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+            mismatched = sorted(
+                key for key, item in expected.items()
+                if not isinstance(value, dict) or value.get(key) != item
+            )
             raise WorkerReleaseError(
-                "backend cutover probe did not prove the authenticated route"
+                "backend cutover probe did not prove the authenticated route "
+                f"(mismatched: {', '.join(mismatched)})"
             )
 
 
