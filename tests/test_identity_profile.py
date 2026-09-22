@@ -267,3 +267,29 @@ def test_root_sync_repairs_an_existing_broken_identity_root(tmp_path: Path) -> N
     assert not (ident / "app/removed_upstream.py").exists()
     assert (ident / ".venv/bin/python").read_text() == "identity venv"
     assert (ident / "custom_nodes/ComfyUI_InfiniteYou").is_dir()
+
+
+def test_identity_deps_never_run_the_resolver() -> None:
+    # Second rent (2026-09-22): resolving facexlib -> torch re-applied torch's declared CUDA
+    # pins (cuda-toolkit 13.0.2 -> 12.8.1 + a full nvidia-*-cu12 set). Nothing may resolve.
+    text = (ROOT / "provision_identity.sh").read_text()
+    assert 'PIPN="$PIP --no-deps -c $FREEZE"' in text
+    assert "pip list --format=freeze" in text  # constraints = the FULL freeze, not a hand list
+    installs = [l for l in text.splitlines() if re.search(r"\$PIP[A-Z]* ", l) and not l.strip().startswith(("#", "PIPN="))]
+    assert installs and all("$PIPN" in l for l in installs), installs
+    assert "onnxruntime-gpu" not in text.split("IDENTITY_PKGS=", 1)[1].split('"', 2)[1]
+    assert "-r " not in text  # node requirements.txt files are never fed to pip
+
+
+def test_guard_compares_every_pre_existing_package(tmp_path: Path) -> None:
+    text = (ROOT / "provision_identity.sh").read_text()
+    guard = text[text.index("moved=$("):text.index('echo "[identity] added:')]
+    before = tmp_path / "f.before"
+    after = tmp_path / "f.after"
+    before.write_text("cuda-toolkit==13.0.2\nml_dtypes==0.3.2\ntorch==2.11.0+cu128\n")
+    prelude = f'FREEZE="{tmp_path}/f"; OWNED="^(ml_dtypes)=="\n'
+    after.write_text("cuda-toolkit==13.0.2\nml_dtypes==0.6.0\nprotobuf==7.36.2\ntorch==2.11.0+cu128\n")
+    assert subprocess.run(["bash", "-c", prelude + guard], capture_output=True).returncode == 0  # new + owned OK
+    after.write_text("cuda-toolkit==12.8.1\nml_dtypes==0.6.0\ntorch==2.11.0+cu128\n")
+    r = subprocess.run(["bash", "-c", prelude + guard], capture_output=True, text=True)
+    assert r.returncode == 1 and "cuda-toolkit==13.0.2" in r.stderr

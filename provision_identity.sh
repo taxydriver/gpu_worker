@@ -107,21 +107,23 @@ if [ "$STAGE" = "root" ]; then
   exit 0
 fi
 
-# --- freeze the torch stack before touching anything ---------------------------
-# The identity venv starts as a copy of production's, so this keeps the identity
-# ComfyUI on the exact torch/numpy the production graphs were validated on.
-CONSTRAINTS="$ID_ROOT/.filmforge_identity.constraints.txt"
-"$PY" -m pip freeze 2>/dev/null \
-  | grep -iE '^(torch|torchvision|torchaudio|numpy|protobuf|transformers|safetensors)==' \
-  > "$CONSTRAINTS" || true
-if ! grep -qi '^torch==' "$CONSTRAINTS"; then
-  echo "[identity] FATAL: could not freeze torch from $PY -- refusing to install unguarded" >&2
-  exit 1
-fi
-echo "[identity] pinned generation stack:"; sed 's/^/[identity]   /' "$CONSTRAINTS"
-PIPC="$PIP -c $CONSTRAINTS"
+# --- dependency install: NO resolver ------------------------------------------
+# Second rent (2026-09-22): letting pip resolve facexlib -> torch re-applied torch's
+# DECLARED CUDA pins and swapped cuda-toolkit 13.0.2 -> 12.8.1, cuda-bindings, and a full
+# nvidia-*-cu12 set into the venv. So nothing here is resolved: every package is named
+# explicitly and installed --no-deps, against a constraints file that is the FULL freeze of
+# the venv (every package, CUDA wheels included), and the before/after freezes must agree on
+# every pre-existing package. The list is the measured runtime closure (imports + a real
+# score and segment run in a clean venv, 2026-09-22) over what ComfyUI already ships.
+FREEZE="$ID_ROOT/.filmforge_identity.freeze.txt"
+OWNED='^(ml_dtypes)=='   # packages this kit deliberately owns in the identity venv
+"$PY" -m pip list --format=freeze 2>/dev/null | sort > "$FREEZE.before"
+grep -qi '^torch==' "$FREEZE.before" || { echo "[identity] FATAL: could not freeze $PY -- refusing to install unguarded" >&2; exit 1; }
+grep -viE "$OWNED" "$FREEZE.before" > "$FREEZE"
+echo "[identity] constraints = full freeze of the identity venv ($(wc -l < "$FREEZE") packages)"
+PIPN="$PIP --no-deps -c $FREEZE"
 
-node () {  # node <dir-name> <git-url> <commit>
+node () {  # node <dir-name> <git-url> <commit>  (clone only: its requirements are covered below)
   local d="$ID_ROOT/custom_nodes/$1"
   if [ ! -d "$d/.git" ]; then
     echo "[identity] cloning $1"
@@ -131,31 +133,32 @@ node () {  # node <dir-name> <git-url> <commit>
   git -C "$d" fetch --quiet origin "$3" 2>/dev/null || git -C "$d" fetch --quiet origin
   git -C "$d" checkout --quiet --force "$3"
   echo "[identity] $1 @ $(git -C "$d" rev-parse --short HEAD)"
-  if [ -f "$d/requirements.txt" ]; then
-    # requirements pins such as ml_dtypes==0.3.2 break under numpy 2 -- drop exact pins
-    # of numpy-coupled packages and let the constraints file decide.
-    # Also drop plain onnxruntime: PuLID lists it beside onnxruntime-gpu, and the two
-    # conflict in one venv (we install -gpu only).
-    grep -viE '^(torch|torchvision|numpy|ml_dtypes|protobuf|transformers|safetensors)\b' \
-      "$d/requirements.txt" | grep -viE '^onnxruntime([<>=!~ ]|$)' \
-      > "$d/.filmforge_requirements.txt" || true
-    $PIPC -r "$d/.filmforge_requirements.txt" || {
-      echo "[identity] FATAL: $1 requirements cannot install without moving the pinned torch stack" >&2
-      exit 1
-    }
-  fi
 }
 
 node ComfyUI_InfiniteYou "$INFU_REPO" "$INFU_SHA"
 node ComfyUI-PuLID-Flux "$PULID_REPO" "$PULID_SHA"
 
-# insightface: ArcFace scorer + face analysis for both modules. onnxruntime-gpu for the
-# detectors. ml_dtypes>=0.5 because 0.3.x fails to import under numpy 2. ultralytics for
-# YOLOv8x-seg lead masks. facexlib for PuLID's face parsing.
-$PIPC "ml_dtypes>=0.5" insightface onnxruntime-gpu facexlib ultralytics ftfy timm || {
-  echo "[identity] FATAL: identity deps cannot install without moving the pinned torch stack" >&2
+# insightface (ArcFace + the modules' face analysis), onnxruntime CPU for its detectors (as on
+# the box where this kit was proven; no CUDA wheels), facexlib + filterpy (PuLID face parsing),
+# ultralytics (YOLOv8-seg), ftfy + timm (PuLID's EVA-CLIP), and their measured runtime deps.
+IDENTITY_PKGS="insightface facexlib filterpy ultralytics onnx onnxruntime flatbuffers protobuf \
+  ml_dtypes>=0.5 scikit-image lazy_loader tifffile imageio packaging ftfy wcwidth timm"
+$PIPN $IDENTITY_PKGS || {
+  echo "[identity] FATAL: identity packages cannot install --no-deps under the full-freeze constraints" >&2
   exit 1
 }
+"$PY" -c "import cv2" 2>/dev/null || $PIPN opencv-python-headless || {
+  echo "[identity] FATAL: no cv2 and opencv-python-headless cannot install" >&2; exit 1; }
+
+"$PY" -m pip list --format=freeze 2>/dev/null | sort > "$FREEZE.after"
+# Every package present before must be present after at the SAME version (new ones are fine).
+moved=$(grep -viE "$OWNED" "$FREEZE.before" | comm -23 - "$FREEZE.after")
+if [ -n "$moved" ]; then
+  echo "[identity] FATAL: pre-existing packages changed during identity provisioning:" >&2
+  echo "$moved" | sed 's/^/[identity]   /' >&2
+  exit 1
+fi
+echo "[identity] added: $(comm -13 "$FREEZE.before" "$FREEZE.after" | tr '\n' ' ')"
 
 # --- PuLID forward_orig patch --------------------------------------------------
 # Edits ONLY the custom node's own file (custom_nodes/ComfyUI-PuLID-Flux/pulidflux.py),
@@ -181,15 +184,10 @@ PYEOF
 
 # --- verify -------------------------------------------------------------------
 # Cloning is not installing: fail HERE with the cause rather than at prompt time with
-# a missing_node_type 400.
-"$PY" -c "import insightface, onnxruntime, ultralytics, facexlib, ml_dtypes" || {
+# a missing_node_type 400. Deep imports, as the runner and the nodes use them.
+YOLO_OFFLINE=1 "$PY" -c "from insightface.app import FaceAnalysis; import facexlib.utils.face_restoration_helper, facexlib.parsing; from ultralytics import YOLO; import timm, ftfy, onnx, onnxruntime, cv2, ml_dtypes, skimage.transform" || {
   echo "[identity] FATAL: identity Python deps do not import" >&2
   exit 1
 }
-if ! "$PY" -m pip freeze 2>/dev/null | grep -iE '^(torch|torchvision|torchaudio|numpy|protobuf|transformers|safetensors)==' \
-     | diff -q - "$CONSTRAINTS" >/dev/null; then
-  echo "[identity] FATAL: the torch stack moved during identity provisioning" >&2
-  exit 1
-fi
 
 echo "[identity] provisioned -- restart ComfyUI for InfiniteYou / PuLID nodes to load"

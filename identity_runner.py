@@ -150,7 +150,7 @@ def segment(req: dict) -> dict:
             for mk, box in zip(r.masks.data.cpu().numpy(), r.boxes.xyxy.cpu().numpy()):
                 cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
                 if x0 <= cx <= x1 and y0 <= cy <= y1:
-                    cands.append((mk.sum(), mk))
+                    cands.append((float(mk.sum()), mk))
         cands.sort(key=lambda t: -t[0])
         for _, mk in cands[:n]:
             mask |= (cv2.resize(mk, (w, h)) > 0.5).astype(np.uint8) * 255
