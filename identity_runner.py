@@ -68,6 +68,16 @@ def _frames(req: dict):
         k += 1
 
 
+def _yaw_proxy(kps) -> float:
+    """Signed head-turn proxy from the detector's 5 landmarks (eyes, nose, mouth corners):
+    the nose's horizontal offset from the eye midpoint over the inter-eye distance.
+    ~0 = frontal; |x| grows as the head turns (~0.5+ is a strong three-quarter). Not an
+    angle -- compare it within a take (a jump vs the first frame = a turn to/away from camera)."""
+    (lx, ly), (rx, ry), (nx, ny) = kps[0], kps[1], kps[2]
+    eye_dist = max(abs(rx - lx), 1e-6)
+    return round(float((nx - (lx + rx) / 2) / eye_dist), 3)
+
+
 def _unit(v):
     import numpy as np
 
@@ -93,7 +103,8 @@ def score(req: dict) -> dict:
         for f in app.get(img):
             px = int(round(f.bbox[2] - f.bbox[0]))
             faces.append({"bbox": [round(float(x), 1) for x in f.bbox], "det_score": round(float(f.det_score), 3),
-                          "face_px": px,
+                          "face_px": px, "kps": [[round(float(a), 1), round(float(b), 1)] for a, b in f.kps],
+                          "yaw_proxy": _yaw_proxy(f.kps),
                           "cosine": round(float(np.dot(anchor, _unit(f.embedding))), 4) if px >= min_px else None})
         scorable = [f["cosine"] for f in faces if f["cosine"] is not None]
         reason = None if scorable else ("too_small" if faces else "not_detected")
