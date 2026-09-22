@@ -102,6 +102,21 @@ def _service_env() -> dict[str, str]:
     return env
 
 
+def _remote_failure_cause(stdout: str) -> str:
+    """The remote manage_worker_release CLI prints {"ok": false, "error", "cause"}; the stdout
+    tail above keeps only 160 chars, which cut the cause (the dead worker's journal) off the
+    2026-09-22 cutover failure. Surface it in full (bounded) when present."""
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and value.get("cause"):
+            return f"\n[remote cause]\n{str(value['cause'])[:8000]}"
+        break
+    return ""
+
+
 class CommandRunner:
     """Small injectable subprocess boundary used by provider-free tests."""
 
@@ -132,6 +147,7 @@ class CommandRunner:
             raise OneClickDeploymentError(
                 f"Command failed rc={exc.returncode}: {Path(str(command[0])).name} "
                 f"(stderr ends: {stderr_tail!r}; stdout ends: {stdout_tail!r})"
+                + _remote_failure_cause(str(exc.stdout or ""))
             ) from None
 
 

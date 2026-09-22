@@ -302,3 +302,20 @@ def test_root_stage_recopies_a_drifted_venv_from_a_reused_volume() -> None:
     assert 'rm -rf "$ID_ROOT/.venv"' in block
     # the drift check runs BEFORE the copy-if-missing step, so a drifted copy is replaced
     assert text.index("local drift") < text.index('cp -a "$COMFY/.venv" "$ID_ROOT/.venv"')
+
+
+def test_secure_cutover_enumerates_both_workers_for_generation_identity() -> None:
+    # The cutover is department-agnostic: it enumerates workers by COUNT. A generation,identity
+    # plan must yield 2 workers, gpu1 as the one indexed sibling, whose unit is exactly the one
+    # the deploy writes for the identity card.
+    from types import SimpleNamespace
+
+    from gpu_worker import secure_one_click, worker_release
+
+    args = SimpleNamespace(verda_worker_plan="generation,identity", verda_worker_count=0)
+    assert secure_one_click._validated_worker_count(args) == 2
+    assert worker_release._indexed_worker_units("filmforge-worker-gpu0.service", 2) == ["filmforge-worker-gpu1.service"]
+    assert worker_release._indexed_public_url("https://w.example", 1) == "https://w.example/gpu1"
+    assert worker_release._indexed_local_url("http://127.0.0.1:9000", 1) == "http://127.0.0.1:9001"
+    script = _script(["generation", "identity"])
+    assert 'cat > "/etc/systemd/system/filmforge-worker-gpu${idx}.service" <<UNIT' in script

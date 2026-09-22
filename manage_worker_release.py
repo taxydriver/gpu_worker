@@ -366,7 +366,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.handler(args))
     except WorkerReleaseError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+        payload = {"ok": False, "error": str(exc)}
+        # The outer error is a stable contract ("secure cutover failed; the prior safe state
+        # was restored"), but the CAUSE carries the actual failure -- e.g. assert_loopback_only's
+        # systemctl status + journalctl of the dead worker unit. Dropping it made the 2026-09-22
+        # identity-box cutover failure undiagnosable after the VM was cleaned up.
+        cause = exc.__cause__ or exc.__context__
+        if cause is not None and str(cause) and str(cause) != str(exc):
+            payload["cause"] = f"{type(cause).__name__}: {cause}"[:12000]
+        print(json.dumps(payload, sort_keys=True))
         return 2
 
 
