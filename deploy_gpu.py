@@ -3056,7 +3056,11 @@ def _wait_for_verda_ssh(ip: str, identity: Path, timeout_sec: int) -> None:
 # Departments a single GPU slot can serve on a multi-GPU box. One GPU = one
 # department stays the law (the resident co-tenants starved WAN); a 4-GPU box
 # just gets to run several departments side by side, one per card.
-WORKER_PLAN_DEPARTMENTS = ("generation", "vision", "audio", "none")
+# "identity" (2026-09-22) is a ComfyUI department like generation, but it advertises only
+# identity_v1 (InfiniteYou/PuLID/ArcFace/YOLO-seg + Fun-VACE replace), so plain FLUX/WAN
+# jobs never route to it. It exists so the identity stack gets its own card: on a shared
+# card its VACE runs OOMed the production chain twice (Endayya, ledger M24).
+WORKER_PLAN_DEPARTMENTS = ("generation", "identity", "vision", "audio", "none")
 
 # Vamsee's 4-GPU Verda layout (2026-07-26): two generation workers (FLUX/WAN
 # share the ComfyUI process and evict between phases), one vision worker
@@ -3129,6 +3133,10 @@ WORKER_PLAN_SPEC={shlex.quote(",".join(worker_plan or []))}
 VLLM_PORT={vllm_port}
 REMOTE_ROOT={shlex.quote(remote_root)}
 COMFY_ROOT="/workspace/ComfyUI"
+# The identity department runs a SEPARATE ComfyUI (own venv, own custom_nodes, models/
+# symlinked to COMFY_ROOT/models) so GPU0's production ComfyUI never imports the identity
+# nodes or their deps (Director ruling 2026-09-22: full isolation).
+IDENTITY_COMFY_ROOT="/workspace/ComfyUI_identity"
 WORKER_ROOT={shlex.quote(worker_source_root)}
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
@@ -3171,6 +3179,41 @@ dept_for_idx() {{
   fi
 }}
 
+comfy_root_for_dept() {{
+  if test "$1" = "identity"; then echo "$IDENTITY_COMFY_ROOT"; else echo "$COMFY_ROOT"; fi
+}}
+
+# Per-GPU memory + ownership report (lead ruling 2026-09-22). Every compute process on
+# GPU i must belong to a systemd unit for index i (comfyui-gpu<i> / filmforge-worker-gpu<i>
+# / a resident unit pinned there); anything else is the second-tenant OOM (ledger M24)
+# waiting to happen, so it fails the deploy.
+assert_gpu_ownership() {{
+  echo "[gpu] per-GPU memory after smoke:"
+  nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | sed 's/^/[gpu]   gpu/'
+  _bad=""
+  while IFS=, read -r _uuid _pid _mem; do
+    _pid="$(echo "$_pid" | tr -d ' ')"
+    test -n "$_pid" || continue
+    _gi="$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader | awk -F', ' -v u="$(echo "$_uuid" | tr -d ' ')" '$2==u {{print $1}}')"
+    _unit="$(sed -n 's#.*/\\([^/]*\\.service\\)$#\\1#p' "/proc/$_pid/cgroup" 2>/dev/null | head -1)"
+    echo "[gpu]   gpu${{_gi}} pid ${{_pid}} ${{_mem}} unit=${{_unit:-?}}"
+    case "$_unit" in
+      comfyui-gpu${{_gi}}.service|filmforge-worker-gpu${{_gi}}.service) ;;
+      filmforge-vllm.service|filmforge-parler.service|filmforge-sa3.service) ;;
+      *) _bad=1; echo "[gpu] FATAL: pid ${{_pid}} on gpu${{_gi}} belongs to ${{_unit:-an unknown unit}}" >&2 ;;
+    esac
+  done < <(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null)
+  test -z "$_bad" || exit 1
+}}
+
+# Departments that run their own pinned ComfyUI process.
+runs_comfy() {{
+  case "$1" in
+    generation|identity) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
+
 # ── Reconcile restored systemd units to the requested physical topology ──────
 # These units live on the persistent OS volume.  Shrinking a previously
 # two-GPU deployment to one GPU used to leave gpu1 enabled at boot, where
@@ -3191,8 +3234,8 @@ for unit_path in /etc/systemd/system/comfyui-gpu*.service; do
   case "$idx" in ''|*[!0-9]*) continue ;; esac
   if test "$idx" -ge "$GPU_COUNT"; then
     _disable_stale_gpu_unit "$unit" "gpu index is outside requested GPU_COUNT=$GPU_COUNT"
-  elif test "$(dept_for_idx "$idx")" != "generation"; then
-    _disable_stale_gpu_unit "$unit" "gpu${{idx}} is not a generation department"
+  elif ! runs_comfy "$(dept_for_idx "$idx")"; then
+    _disable_stale_gpu_unit "$unit" "gpu${{idx}} is not a ComfyUI department"
   fi
 done
 
@@ -3214,11 +3257,13 @@ done
 # vision/audio are fixed sets — their capability IS their department.
 caps_for_dept() {{
   case "$1" in
-    vision) echo "qwen_vision" ;;
-    audio)  echo "tts_dialogue,stable_audio3" ;;
-    *)      echo "${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}" ;;
+    vision)   echo "qwen_vision" ;;
+    audio)    echo "tts_dialogue,stable_audio3" ;;
+    identity) echo "identity_v1" ;;
+    *)        echo "${{WORKER_CAPABILITIES:-flux2_stills,wan_i2v,ltx_i2v,character_loras}}" ;;
   esac
 }}
+
 
 if test "$GPU_COUNT" -lt 1; then
   echo "[verda] ERROR: No GPUs detected by nvidia-smi" >&2
@@ -3676,11 +3721,23 @@ echo "VRAM: ${{VRAM_GB}} GB → ComfyUI flag: ${{COMFY_VRAM_FLAG:-'(none, dynami
 # Blackwell (B300/SM 10.x) and future architectures where cuDNN has no plan.
 {_rehydrate_patch_block}
 
+# The identity ComfyUI root must exist before its unit starts (the unit would crash-loop
+# and fail the health gate). Stage "root" only clones ComfyUI + copies the venv; the nodes
+# and deps come from the full provisioner below, followed by a restart.
+for _d in ${{WORKER_PLAN[@]+"${{WORKER_PLAN[@]}}"}}; do
+  if test "$_d" = "identity"; then
+    echo "[identity] preparing separate ComfyUI root $IDENTITY_COMFY_ROOT"
+    (cd "$WORKER_ROOT" && IDENTITY_STAGE=root bash provision_identity.sh)
+    break
+  fi
+done
+
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
   dept="$(dept_for_idx "$idx")"
   comfy_port=$((COMFY_PORT_BASE + idx))
   worker_port=$((WORKER_PORT_BASE + idx))
-  comfy_user_dir="$COMFY_ROOT/user_gpu${{idx}}"
+  dept_comfy_root="$(comfy_root_for_dept "$dept")"
+  comfy_user_dir="$dept_comfy_root/user_gpu${{idx}}"
   worker_public_url="$(public_url_for_idx "$idx")"
 
   if test "$dept" = "none"; then
@@ -3704,9 +3761,9 @@ for idx in $(seq 0 $((GPU_COUNT - 1))); do
   # ComfyUI is the generation runtime only. A vision/audio GPU runs a resident
   # server instead (vLLM / Parler+SA3), and a second ComfyUI process on that card
   # would just hold VRAM the resident model needs — the co-tenancy that caused
-  # the WAN OOMs in the first place.
-  if test "$dept" = "generation"; then
-    mkdir -p "$comfy_user_dir" "$COMFY_ROOT/temp/gpu${{idx}}"
+  # the WAN OOMs in the first place. The identity department runs its own.
+  if runs_comfy "$dept"; then
+    mkdir -p "$comfy_user_dir" "$dept_comfy_root/temp/gpu${{idx}}"
     cat > "/etc/systemd/system/comfyui-gpu${{idx}}.service" <<UNIT
 [Unit]
 Description=ComfyUI GPU ${{idx}}
@@ -3715,9 +3772,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$COMFY_ROOT
+WorkingDirectory=$dept_comfy_root
 Environment=CUDA_VISIBLE_DEVICES=${{idx}}
-ExecStart=$COMFY_ROOT/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --use-pytorch-cross-attention ${{COMFY_VRAM_FLAG}} --user-directory ${{comfy_user_dir}} --database-url sqlite:///${{comfy_user_dir}}/comfyui.db --temp-directory $COMFY_ROOT/temp/gpu${{idx}}
+ExecStart=$dept_comfy_root/.venv/bin/python main.py --listen 127.0.0.1 --port ${{comfy_port}} --enable-cors-header --use-pytorch-cross-attention ${{COMFY_VRAM_FLAG}} --user-directory ${{comfy_user_dir}} --database-url sqlite:///${{comfy_user_dir}}/comfyui.db --temp-directory $dept_comfy_root/temp/gpu${{idx}}
 Restart=always
 RestartSec=5
 
@@ -3758,12 +3815,12 @@ Environment=WORKER_HEARTBEAT_SECONDS=30
 Environment=RENDER_BROKER_HEARTBEAT_SEC=30
 UNIT
 
-  if test "$dept" = "generation"; then
+  if runs_comfy "$dept"; then
     cat >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service" <<UNIT
 Environment=COMFY_BASE_URL=http://127.0.0.1:${{comfy_port}}
-Environment=COMFY_OUTPUT_DIR=$COMFY_ROOT/output
-Environment=COMFY_TEMP_DIR=$COMFY_ROOT/temp
-Environment=COMFY_INPUT_DIR=$COMFY_ROOT/input
+Environment=COMFY_OUTPUT_DIR=$dept_comfy_root/output
+Environment=COMFY_TEMP_DIR=$dept_comfy_root/temp
+Environment=COMFY_INPUT_DIR=$dept_comfy_root/input
 Environment=COMFY_HEALTH_TIMEOUT_SEC=180
 Environment="COMFY_STOP_CMD=systemctl stop comfyui-gpu${{idx}}.service"
 Environment="COMFY_START_CMD=systemctl start comfyui-gpu${{idx}}.service"
@@ -3783,7 +3840,7 @@ UNIT
   # (:8188) is gpu0's ComfyUI, so leaving it unset would make an audio/vision
   # worker report comfy_reachable=true and — if a render ever slipped past the
   # capability gate — execute it on somebody else's GPU.
-  if test "$dept" != "generation"; then
+  if ! runs_comfy "$dept"; then
     echo "Environment=COMFY_BASE_URL=http://127.0.0.1:1" \
       >> "/etc/systemd/system/filmforge-worker-gpu${{idx}}.service"
   fi
@@ -3813,13 +3870,13 @@ done
 
 systemctl daemon-reload
 for idx in $(seq 0 $((GPU_COUNT - 1))); do
-  test "$(dept_for_idx "$idx")" = "generation" || continue
+  runs_comfy "$(dept_for_idx "$idx")" || continue
   systemctl enable --now "comfyui-gpu${{idx}}.service"
 done
 
 wait_comfy_healthy() {{
   for idx in $(seq 0 $((GPU_COUNT - 1))); do
-    test "$(dept_for_idx "$idx")" = "generation" || continue
+    runs_comfy "$(dept_for_idx "$idx")" || continue
     port=$((COMFY_PORT_BASE + idx))
     stats_file="/tmp/comfyui_gpu${{idx}}_stats.json"
     rm -f "$stats_file"
@@ -3889,6 +3946,27 @@ if test -n "$_flux_ipadapter_wanted"; then
   _provisioned_any=1
 fi
 
+# Identity kit (InfiniteYou, PuLID-FLUX, insightface, YOLOv8-seg): weights ride the asset
+# manager (identity_v1 + wan_vace_v1); this provisioner installs the pinned nodes, the
+# PuLID forward_orig patch and the Python deps. It fires for an explicit capability OR an
+# identity department in the worker plan (a plan box's box-level WORKER_CAPABILITIES is
+# the generation default and never names identity).
+_identity_wanted=""
+case ",${{WORKER_CAPABILITIES:-}}," in
+  *,identity,*|*,identity_v1,*) _identity_wanted=1 ;;
+esac
+for _d in ${{WORKER_PLAN[@]+"${{WORKER_PLAN[@]}}"}}; do
+  if test "$_d" = "identity"; then _identity_wanted=1; fi
+done
+# Node classes the identity graphs are built against (checked after the restart).
+IDENTITY_REQUIRED_NODE_CLASSES="InfuseNetLoader InfuseNetApply IDEmbeddingModelLoader ExtractIDEmbedding ExtractFacePoseImage PulidFluxModelLoader PulidFluxInsightFaceLoader PulidFluxEvaClipLoader ApplyPulidFlux WanVaceToVideo"
+if test -n "$_identity_wanted"; then
+  echo "[identity] provisioning identity kit"
+  cd "$WORKER_ROOT"
+  bash provision_identity.sh
+  _provisioned_any=1
+fi
+
 # ReCamMaster: weights ride the asset manager (recammaster_v1); this
 # provisioner installs Kijai's ComfyUI-WanVideoWrapper + VideoHelperSuite,
 # the node set the reshoot graph is built against.
@@ -3906,11 +3984,44 @@ fi
 if test -n "$_provisioned_any"; then
   for idx in $(seq 0 $((GPU_COUNT - 1))); do
     dept="$(dept_for_idx "$idx")"
-    test "$dept" = "generation" || continue
-    echo "[provision] restarting ComfyUI on generation gpu$idx so new node classes load"
+    runs_comfy "$dept" || continue
+    echo "[provision] restarting ComfyUI on $dept gpu$idx so new node classes load"
     systemctl restart "comfyui-gpu${{idx}}.service"
   done
   wait_comfy_healthy
+
+  # Health smoke (lead ruling 2026-09-22): after ANY provisioner every ComfyUI must
+  # still load its node classes with no import failures; an identity card must expose
+  # the identity nodes and a generation card must NOT (isolation). A regression fails
+  # the deploy instead of surfacing as a 400 mid-render.
+  for idx in $(seq 0 $((GPU_COUNT - 1))); do
+    dept="$(dept_for_idx "$idx")"
+    runs_comfy "$dept" || continue
+    port=$((COMFY_PORT_BASE + idx))
+    info="/tmp/comfyui_gpu${{idx}}_object_info.json"
+    if ! curl -fsS "http://127.0.0.1:${{port}}/object_info" >"$info" 2>/dev/null \
+       || ! grep -q '"KSampler"' "$info"; then
+      echo "[provision] FATAL: gpu${{idx}} ($dept) ComfyUI object_info did not load after provisioning" >&2
+      exit 1
+    fi
+    if journalctl -u "comfyui-gpu${{idx}}.service" --since "-10 min" --no-pager 2>/dev/null | grep -q "IMPORT FAILED"; then
+      echo "[provision] FATAL: gpu${{idx}} ($dept) ComfyUI reports custom-node IMPORT FAILED" >&2
+      journalctl -u "comfyui-gpu${{idx}}.service" --since "-10 min" --no-pager | grep "IMPORT FAILED" >&2 || true
+      exit 1
+    fi
+    if test "$dept" = "identity"; then
+      for cls in $IDENTITY_REQUIRED_NODE_CLASSES; do
+        grep -q "\"$cls\"" "$info" || {{
+          echo "[provision] FATAL: identity gpu${{idx}} is missing node class $cls" >&2
+          exit 1
+        }}
+      done
+    elif grep -qE '"(InfuseNetApply|ApplyPulidFlux)"' "$info"; then
+      echo "[provision] FATAL: gpu${{idx}} ($dept) ComfyUI imported identity nodes -- isolation broken" >&2
+      exit 1
+    fi
+  done
+  assert_gpu_ownership
 fi
 
 # Resident vLLM is also provision-only work. Leaving it below the gate made a

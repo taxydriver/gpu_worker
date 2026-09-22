@@ -148,16 +148,19 @@ def test_worker_units_honor_deploy_concurrency_environment() -> None:
 
 def test_capabilities_are_per_department() -> None:
     script = _script(PLAN)
-    assert 'vision) echo "qwen_vision" ;;' in script
-    assert 'audio)  echo "tts_dialogue,stable_audio3" ;;' in script
+    assert 'vision)   echo "qwen_vision" ;;' in script
+    assert 'audio)    echo "tts_dialogue,stable_audio3" ;;' in script
+    assert 'identity) echo "identity_v1" ;;' in script
 
 
 def test_comfyui_only_starts_on_generation_cards() -> None:
     script = _script(PLAN)
     # Unit creation and both enable/health loops are gated on the department —
     # a second ComfyUI on the vision card would hold VRAM the resident vLLM needs.
-    assert script.count('test "$(dept_for_idx "$idx")" = "generation" || continue') == 2
-    assert 'if test "$dept" = "generation"; then' in script
+    # (identity is the other ComfyUI department; see test_identity_profile.py.)
+    assert script.count('runs_comfy "$(dept_for_idx "$idx")" || continue') == 2
+    assert 'if runs_comfy "$dept"; then' in script
+    assert "generation|identity) return 0 ;;" in script
 
 
 def test_comfyui_uses_a_per_gpu_database() -> None:
@@ -237,7 +240,7 @@ def test_topology_shrink_disables_surplus_gpu_units_before_comfyui_starts() -> N
     assert "/etc/systemd/system/comfyui-gpu*.service" in script
     assert "/etc/systemd/system/filmforge-worker-gpu*.service" in script
     assert 'test "$idx" -ge "$GPU_COUNT"' in script
-    assert 'test "$(dept_for_idx "$idx")" != "generation"' in script
+    assert '! runs_comfy "$(dept_for_idx "$idx")"' in script
     assert 'test "$(dept_for_idx "$idx")" = "none"' in script
 
 

@@ -56,6 +56,7 @@ from gpu_worker.flux_ipadapter import (
     FLUX_IPADAPTER_ASSET_GROUP,
     check_flux_ipadapter_readiness,
 )
+from gpu_worker import identity_service
 from gpu_worker.infinitetalk import (
     INFINITETALK_ASSET_GROUP,
     check_infinitetalk_readiness,
@@ -299,7 +300,9 @@ def _preload_asset_groups() -> list[str]:
 
     declared = _declared_capabilities()
     if not declared:
-        return sorted(ASSET_REGISTRY)
+        # identity_v1 is never implied: ~30 GB of weights served only by the identity
+        # department, which always declares it.
+        return sorted(g for g in ASSET_REGISTRY if g != identity_service.IDENTITY_ASSET_GROUP)
     return asset_groups_for_capabilities(declared)
 
 
@@ -345,6 +348,11 @@ def _advertised_capabilities() -> tuple[list[str], dict | None, dict | None]:
         flux_ipadapter_readiness = readiness.as_dict()
         if not readiness.ready:
             capabilities.remove(FLUX_IPADAPTER_ASSET_GROUP)
+    if identity_service.IDENTITY_ASSET_GROUP in capabilities:
+        # Only a worker that DECLARES identity_v1 and has the separate identity ComfyUI
+        # installed may claim it; a homogeneous worker would otherwise advertise it.
+        if not identity_service.identity_readiness(_declared_capabilities())["ready"]:
+            capabilities.remove(identity_service.IDENTITY_ASSET_GROUP)
     return capabilities, infinitetalk_readiness, flux_ipadapter_readiness
 
 
@@ -1914,6 +1922,55 @@ def get_job_progress(
         if record.progress is None:
             raise HTTPException(status_code=404, detail=f"No progress tracked for job_id: {job_id}")
         return record.progress
+
+
+def _identity_fetch(url: str, dest: Path, kind: str) -> None:
+    """Stage one allowlisted input for the identity runner (same guards as Comfy inputs)."""
+    from gpu_worker.comfy_client import _download_input_source
+    from gpu_worker.schemas import ComfyInputFile
+
+    spec = ComfyInputFile(
+        node_id="identity",
+        filename=dest.name,
+        input_name="image" if kind == "image" else "video",
+    )
+    _download_input_source(url, dest, spec)
+
+
+def _require_identity_ready() -> None:
+    readiness = identity_service.identity_readiness(_declared_capabilities())
+    if not readiness["ready"]:
+        raise HTTPException(status_code=409, detail={"reason": "identity_not_ready", **readiness})
+
+
+@app.post("/identity/score")
+def identity_score(
+    request: identity_service.IdentityScoreRequest,
+    _: None = Depends(_require_worker_api_token),
+) -> dict:
+    """ArcFace (buffalo_l) score of a take against a truth face. Score ALL frames of a take in
+    one call -- the runner reloads ArcFace per request. Non-commercial models: private films."""
+    _require_identity_ready()
+    try:
+        return identity_service.score(request, _identity_fetch)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/identity/segment_people")
+def identity_segment_people(
+    request: identity_service.SegmentPeopleRequest,
+    _: None = Depends(_require_worker_api_token),
+) -> dict:
+    """YOLOv8x-seg masks of the N largest people in the roi, as a mask video served under
+    /files/output/. AGPL-3.0 model: private films only."""
+    _require_identity_ready()
+    try:
+        return identity_service.segment_people(
+            request, _identity_fetch, Path(get_settings().comfy_output_dir), uuid.uuid4().hex[:12]
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/files/{root_name}/{relative_path:path}")

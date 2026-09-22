@@ -124,6 +124,129 @@ ASSET_REGISTRY: dict[str, list[dict[str, str]]] = {
             "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/diffusion_models/wan2.2_fun_vace_low_noise_14B_fp8_scaled.safetensors",
         },
     ],
+    # Identity kit (2026-09-22) -- the stack that held a real family face on our own A100
+    # (Endayya; backend/docs/discoveries/endayya-grandfather-identity-benchmark-own-a100-2026-09-21.md):
+    # FLUX.1-dev fp8 for the identity stills, InfiniteYou sim_stage1 (bf16, the benchmarked
+    # variant) + PuLID v0.9.1, insightface antelopev2 (the modules' face analysis) and
+    # buffalo_l (the ArcFace SCORER -- deliberately a different net from the one the modules
+    # condition on), YOLOv8x-seg person masks, and the WAN base files Fun-VACE replace needs.
+    # OPT-IN via the `identity` capability / worker-plan department; served only by the
+    # identity GPU. Every URL was HEAD-checked tokenless on 2026-09-22 (ae via the ffxvs mirror:
+    # BFL's own is gated). EVA02-CLIP (PuLID) and facexlib weights self-download on first use.
+    # LICENCES: insightface models NON-COMMERCIAL; FLUX.1-dev non-commercial; YOLOv8 AGPL-3.0;
+    # InfiniteYou weights CC-BY-NC-4.0. Private family films only -- not the product.
+    "identity_v1": [
+        {
+            "name": "identity_flux1_dev_fp8",
+            "path": "/workspace/ComfyUI/models/diffusion_models/flux1-dev-fp8-e4m3fn.safetensors",
+            "url": "https://huggingface.co/Kijai/flux-fp8/resolve/main/flux1-dev-fp8-e4m3fn.safetensors",
+        },
+        {
+            "name": "identity_t5xxl_fp8",
+            "path": "/workspace/ComfyUI/models/text_encoders/t5xxl_fp8_e4m3fn.safetensors",
+            "url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors",
+        },
+        {
+            "name": "identity_clip_l",
+            "path": "/workspace/ComfyUI/models/text_encoders/clip_l.safetensors",
+            "url": "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors",
+        },
+        {
+            "name": "identity_flux1_ae",
+            "path": "/workspace/ComfyUI/models/vae/ae.safetensors",
+            "url": "https://huggingface.co/ffxvs/vae-flux/resolve/main/ae.safetensors",
+        },
+        {
+            "name": "infu_sim_stage1_image_proj",
+            "path": "/workspace/ComfyUI/models/infinite_you/sim_stage1/image_proj_model.bin",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/infu_flux_v1.0/sim_stage1/image_proj_model.bin",
+        },
+        {
+            "name": "infu_sim_stage1_infusenet_bf16",
+            "path": "/workspace/ComfyUI/models/infinite_you/sim_stage1/infusenet_sim_bf16.safetensors",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/infu_flux_v1.0/sim_stage1/infusenet_sim_bf16.safetensors",
+        },
+        {
+            "name": "pulid_flux_v0_9_1",
+            "path": "/workspace/ComfyUI/models/pulid/pulid_flux_v0.9.1.safetensors",
+            "url": "https://huggingface.co/guozinan/PuLID/resolve/main/pulid_flux_v0.9.1.safetensors",
+        },
+        {
+            "name": "antelopev2_1k3d68",
+            "path": "/workspace/ComfyUI/models/insightface/models/antelopev2/1k3d68.onnx",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/1k3d68.onnx",
+        },
+        {
+            "name": "antelopev2_2d106det",
+            "path": "/workspace/ComfyUI/models/insightface/models/antelopev2/2d106det.onnx",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/2d106det.onnx",
+        },
+        {
+            "name": "antelopev2_genderage",
+            "path": "/workspace/ComfyUI/models/insightface/models/antelopev2/genderage.onnx",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/genderage.onnx",
+        },
+        {
+            "name": "antelopev2_glintr100",
+            "path": "/workspace/ComfyUI/models/insightface/models/antelopev2/glintr100.onnx",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/glintr100.onnx",
+        },
+        {
+            "name": "antelopev2_scrfd_10g_bnkps",
+            "path": "/workspace/ComfyUI/models/insightface/models/antelopev2/scrfd_10g_bnkps.onnx",
+            "url": "https://huggingface.co/ByteDance/InfiniteYou/resolve/main/supports/insightface/models/antelopev2/scrfd_10g_bnkps.onnx",
+        },
+        {
+            "name": "buffalo_l_1k3d68",
+            "path": "/workspace/ComfyUI/models/insightface/models/buffalo_l/1k3d68.onnx",
+            "url": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/1k3d68.onnx",
+        },
+        {
+            "name": "buffalo_l_2d106det",
+            "path": "/workspace/ComfyUI/models/insightface/models/buffalo_l/2d106det.onnx",
+            "url": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/2d106det.onnx",
+        },
+        {
+            "name": "buffalo_l_det_10g",
+            "path": "/workspace/ComfyUI/models/insightface/models/buffalo_l/det_10g.onnx",
+            "url": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/det_10g.onnx",
+        },
+        {
+            "name": "buffalo_l_genderage",
+            "path": "/workspace/ComfyUI/models/insightface/models/buffalo_l/genderage.onnx",
+            "url": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/genderage.onnx",
+        },
+        {
+            "name": "buffalo_l_w600k_r50",
+            "path": "/workspace/ComfyUI/models/insightface/models/buffalo_l/w600k_r50.onnx",
+            "url": "https://huggingface.co/public-data/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx",
+        },
+        {
+            "name": "yolov8x_seg",
+            "path": "/workspace/ComfyUI/models/ultralytics/segm/yolov8x-seg.pt",
+            "url": "https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8x-seg.pt",
+        },
+        {
+            "name": "wan_text_encoder",
+            "path": "/workspace/ComfyUI/models/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+        },
+        {
+            "name": "wan_vae",
+            "path": "/workspace/ComfyUI/models/vae/wan_2.1_vae.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors",
+        },
+        {
+            "name": "wan_i2v_high_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+        },
+        {
+            "name": "wan_i2v_low_noise_lora",
+            "path": "/workspace/ComfyUI/models/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+        },
+    ],
     # ESRGAN upscaler for the identity-quality FINISHING pass (4x then downscale to
     # net 2x → film clarity, identity-safe — no diffusion). OPT-IN via `finishing` cap.
     # The finish workflow (render.py finish_clip) loads it by filename through native
@@ -282,6 +405,9 @@ PROVISIONERS: dict[str, str] = {
     "recammaster_v1": "gpu_worker/provision_recammaster.sh",
     # Weights above + the XLabs custom node that provides LoadFluxIPAdapter.
     "flux_ipadapter_v1": "gpu_worker/provision_flux_ipadapter.sh",
+    # Weights above + the pinned InfiniteYou / PuLID nodes, the PuLID signature patch and the
+    # insightface/ultralytics deps, all inside the SEPARATE identity ComfyUI root.
+    "identity_v1": "gpu_worker/provision_identity.sh",
 }
 
 
@@ -328,6 +454,10 @@ CAPABILITY_ASSET_GROUPS: dict[str, list[str]] = {
     "recammaster": ["recammaster_v1"],
     "reshoot_camera": ["recammaster_v1"],
     "recammaster_v1": ["recammaster_v1"],
+    # Opt-in: identity kit (InfiniteYou/PuLID stills, ArcFace scoring, YOLO-seg masks,
+    # Fun-VACE lead replacement). Served by the identity worker-plan department only.
+    "identity": ["identity_v1", "wan_vace_v1"],
+    "identity_v1": ["identity_v1", "wan_vace_v1"],
     # Opt-in: XLabs Flux IPAdapter (reference conditioning on a FACE).
     # Deliberately NOT implied by flux2_stills — separate weights plus a custom
     # node. This alias row is load-bearing: the worker canonicalises
