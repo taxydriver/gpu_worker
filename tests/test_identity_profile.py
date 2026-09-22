@@ -293,3 +293,12 @@ def test_guard_compares_every_pre_existing_package(tmp_path: Path) -> None:
     after.write_text("cuda-toolkit==12.8.1\nml_dtypes==0.6.0\ntorch==2.11.0+cu128\n")
     r = subprocess.run(["bash", "-c", prelude + guard], capture_output=True, text=True)
     assert r.returncode == 1 and "cuda-toolkit==13.0.2" in r.stderr
+
+
+def test_root_stage_recopies_a_drifted_venv_from_a_reused_volume() -> None:
+    text = (ROOT / "provision_identity.sh").read_text()
+    block = text[text.index("  if [ -x \"$PY\" ]; then\n    local drift"):text.index("  if [ ! -x \"$PY\" ]; then")]
+    assert '"$COMFY/.venv/bin/python" -m pip list --format=freeze' in block
+    assert 'rm -rf "$ID_ROOT/.venv"' in block
+    # the drift check runs BEFORE the copy-if-missing step, so a drifted copy is replaced
+    assert text.index("local drift") < text.index('cp -a "$COMFY/.venv" "$ID_ROOT/.venv"')

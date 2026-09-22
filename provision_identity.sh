@@ -87,6 +87,19 @@ prepare_root () {
     exit 1
   fi
   ln -sfn "$COMFY/models" "$ID_ROOT/models"
+  # A venv left on a REUSED data volume may have drifted from production (the second rent
+  # swapped its CUDA wheels before failing). The identity venv must start as production's
+  # exact package set, so any production package missing or at another version in the copy
+  # means: throw the copy away and copy again.
+  if [ -x "$PY" ]; then
+    local drift
+    drift=$(comm -23 <("$COMFY/.venv/bin/python" -m pip list --format=freeze 2>/dev/null | sort) \
+                     <("$PY" -m pip list --format=freeze 2>/dev/null | sort))
+    if [ -n "$drift" ]; then
+      echo "[identity] existing identity venv drifted from production ($(echo "$drift" | wc -l) packages) -- re-copying"
+      rm -rf "$ID_ROOT/.venv"
+    fi
+  fi
   if [ ! -x "$PY" ]; then
     local need_kb have_kb
     need_kb=$(du -sk "$COMFY/.venv" | cut -f1)
