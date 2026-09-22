@@ -2194,7 +2194,12 @@ def stage_secure_profile(
                     f"Environment=WORKER_CODE_RELEASE_ID={contract.worker_code_release_id}\n"
                     f"WorkingDirectory={contract.worker_module_dir}\n"
                     "ExecStart=\n"
-                    f"ExecStart={contract.worker_exec} -m uvicorn gpu_worker.app:app "
+                    # systemd lets EnvironmentFile= OVERRIDE Environment=, and the shared
+                    # worker env carries worker 0's bare WORKER_PUBLIC_URL -- so the line above
+                    # alone left every indexed worker registering worker 0's URL (2026-09-22:
+                    # identity jobs would route to the generation card). Set it on the process.
+                    f"ExecStart=/usr/bin/env WORKER_PUBLIC_URL={_indexed_public_url(contract.worker_public_url, _idx)} "
+                    f"{contract.worker_exec} -m uvicorn gpu_worker.app:app "
                     f"--host 127.0.0.1 --port {contract.worker_port + _idx}\n"
                 )
                 _write_text(

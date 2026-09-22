@@ -2306,3 +2306,17 @@ def test_manage_cli_refuses_when_it_cannot_read_unit_state(tmp_path: Path) -> No
     assert result.returncode == 2
     assert "could not determine whether" in json.loads(result.stdout)["error"]
     assert candidate.is_dir()
+
+
+def test_indexed_worker_public_url_survives_the_shared_env_file(tmp_path: Path) -> None:
+    """systemd lets EnvironmentFile= override Environment=, and the shared worker env
+    carries worker 0's bare WORKER_PUBLIC_URL. The indexed drop-in must therefore set its
+    own URL on the process (ExecStart env), or gpu1 registers gpu0's URL (2026-09-22)."""
+    base_contract, layout = _fixture(tmp_path, with_override=False, profile_mode="first-install")
+    contract = replace(base_contract, worker_count=2)
+    staged = stage_secure_profile(contract, layout)
+    dropin = (staged.release_dir / "worker-secure-profile-gpu1.conf").read_text()
+    exec_lines = [l for l in dropin.splitlines() if l.startswith("ExecStart=") and l != "ExecStart="]
+    expected = f"WORKER_PUBLIC_URL={contract.worker_public_url.rstrip('/')}/gpu1"
+    assert len(exec_lines) == 1 and exec_lines[0].startswith(f"ExecStart=/usr/bin/env {expected} ")
+    assert f"--port {contract.worker_port + 1}" in exec_lines[0]
