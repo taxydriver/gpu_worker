@@ -1311,6 +1311,14 @@ def _run_tts_dialogue(request: RunRequest, total_started: float) -> RunResponse:
             request=request, timings=timings, downloaded_assets=[],
             restart_performed=False, comfy_prompt_id=None, history_found=False, error=exc,
         )
+    finally:
+        # G573: the slot was taken and never given back, so a VM stopped taking work
+        # after N TTS jobs. Released exactly as _run_sa3_audio releases it.
+        with _ACTIVE_JOBS_LOCK:
+            _ACTIVE_JOBS = max(0, _ACTIVE_JOBS - 1)
+        _note_job_completed()
+        _EXECUTION_SEMAPHORE.release()
+        threading.Thread(target=_send_heartbeat_now, daemon=True).start()
 
 
 @app.post("/tts")
